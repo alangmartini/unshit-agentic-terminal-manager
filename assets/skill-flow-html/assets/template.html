@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__FLOW_TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+/* Flow Explorer, standalone. Warm amber dark theme; every surface is mono. */
+:root {
+  --bg-void: #14110c; --bg-base: #1c1812; --bg-subtle: #221d16; --bg-elevated: #29231a;
+  --bg-hover: #342c20; --bg-selected: #3e3425;
+  --border-hair: #241e15; --border-soft: #342b1e; --border-default: #4a3e2a; --border-strong: #6a5939; --border-focus: #d4a348;
+  --fg-primary: #ebdcb6; --fg-secondary: #b8a275; --fg-tertiary: #857149; --fg-muted: #4e422b; --fg-ghost: #2f2819;
+  --amber-100: #f6d988; --amber-300: #d4a348; --amber-400: #b8852c;
+  --ember: #d06e2c; --sage: #8ba85c; --rust: #c9553a; --azure: #6aa2ad; --violet: #a88bb8;
+  --r-sm: 2px; --r-md: 3px;
+  --font-mono: 'JetBrains Mono', 'Berkeley Mono', 'SF Mono', Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg-base); color: var(--fg-primary);
+  font: 400 12px/1.5 var(--font-mono);
+  font-feature-settings: 'calt' 1, 'liga' 1, 'zero' 1;
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; }
+.flow-pane { display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: var(--bg-base); color: var(--fg-primary); outline: none; }
+
+.flow-header { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+.flow-title { font-size: 13px; color: var(--fg-primary); }
+.flow-meta { font-size: 10px; color: var(--fg-tertiary); }
+.flow-range-chip { align-self: flex-start; padding: 0 6px; font-size: 10px; color: var(--fg-tertiary); background: transparent; border: 1px solid var(--border-soft); border-radius: var(--r-sm); }
+
+.flow-toolbar { display: flex; flex-direction: column; gap: 4px; padding: 6px 14px; border-bottom: 1px solid var(--border-hair); font-size: 11px; color: var(--fg-tertiary); overflow: hidden; }
+.flow-toolbar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; white-space: nowrap; }
+.flow-toolbar-label { color: var(--fg-tertiary); margin-right: 2px; }
+.flow-toolbar-spacer { flex: 1; }
+.flow-tab, .flow-tool { padding: 2px 8px; font-size: 11px; color: var(--fg-secondary); background: transparent; border: 1px solid transparent; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap; }
+.flow-tool { border-color: var(--border-soft); }
+.flow-tab:hover, .flow-tool:hover { color: var(--fg-primary); background: var(--bg-hover); }
+.flow-tab.active { color: var(--fg-primary); background: var(--bg-elevated); border-color: var(--border-soft); }
+.flow-keys { margin-left: auto; font-size: 10px; color: var(--fg-muted); }
+
+/* Call stack. */
+.flow-tree { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 6px 0; }
+.flow-row { display: flex; align-items: center; gap: 5px; padding: 2px 14px 2px 12px; font-size: 11px; white-space: nowrap; overflow: hidden; cursor: pointer; border-left: 2px solid transparent; }
+.flow-row:hover { background: var(--bg-hover); }
+.flow-row.selected { background: var(--bg-selected); }
+.flow-row.diff-added { border-left-color: var(--sage); }
+.flow-row.diff-removed { border-left-color: var(--rust); }
+.flow-row.diff-modified { border-left-color: var(--azure); }
+.flow-indent { width: 18px; flex-shrink: 0; }
+.flow-connector { color: var(--fg-muted); flex-shrink: 0; }
+.flow-diff-marker { width: 8px; flex-shrink: 0; color: var(--fg-tertiary); }
+.flow-row.diff-added .flow-diff-marker { color: var(--sage); }
+.flow-row.diff-removed .flow-diff-marker { color: var(--rust); }
+.flow-row.diff-modified .flow-diff-marker { color: var(--azure); }
+.flow-name { flex: 0 0 auto; color: var(--fg-primary); white-space: nowrap; }
+.flow-proc-0 { color: var(--azure); }
+.flow-proc-1 { color: var(--amber-300); }
+.flow-proc-2 { color: var(--violet); }
+.flow-proc-3 { color: var(--ember); }
+.flow-proc-4 { color: var(--sage); }
+.flow-proc-5 { color: var(--rust); }
+.flow-carrier, .flow-tag { flex: 0 0 auto; max-width: 180px; font-size: 9px; line-height: 1.6; padding: 0 5px; border: 1px solid var(--border-soft); border-radius: var(--r-sm); color: var(--fg-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-badge { color: var(--violet); flex-shrink: 0; }
+/* The description takes only what is left (basis 0), so chips and the
+   location keep their natural width and the sentence ellipsizes instead. */
+.flow-desc { flex: 1 1 0%; min-width: 48px; color: var(--fg-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-loc { flex: 0 1 auto; min-width: 40px; max-width: 220px; color: var(--fg-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-placeholder { display: block; padding: 12px 14px; font-size: 11px; color: var(--fg-tertiary); }
+
+/* Source excerpt inside the source dialog. */
+.flow-snippet { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 6px 0; border: 1px solid var(--border-soft); border-radius: var(--r-sm); background: var(--bg-subtle); overflow-x: auto; overflow-y: hidden; }
+.flow-snippet-path { padding: 0 10px 4px 10px; font-size: 10px; color: var(--fg-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Skill text has long lines; the block scrolls sideways instead of clipping. */
+.flow-snippet-line { display: flex; align-items: center; padding: 0 10px; font-size: 11px; line-height: 1.5; white-space: pre; min-width: max-content; }
+.flow-snippet-line.hl { background: var(--bg-hover); }
+.flow-gutter { color: var(--fg-muted); padding-right: 12px; flex-shrink: 0; text-align: right; }
+.flow-snippet-line.hl .flow-gutter { color: var(--fg-tertiary); }
+.tok-keyword { color: var(--rust); } .tok-str { color: var(--sage); } .tok-number { color: var(--azure); }
+.tok-comment { color: var(--fg-tertiary); } .tok-ident { color: var(--fg-primary); } .tok-punct { color: var(--fg-secondary); }
+.flow-snippet-error { padding: 0 10px; font-size: 11px; color: var(--fg-tertiary); }
+
+/* Legend. */
+.flow-legend { display: flex; flex-direction: column; gap: 4px; padding: 6px 14px; border-top: 1px solid var(--border-hair); font-size: 10px; color: var(--fg-tertiary); overflow: hidden; }
+.flow-legend-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; white-space: nowrap; }
+.flow-legend-label { color: var(--fg-tertiary); margin-left: 10px; }
+.flow-legend-label.first { margin-left: 0; }
+.flow-chip { display: flex; align-items: center; gap: 4px; padding: 1px 6px; border: 1px solid var(--border-soft); border-radius: var(--r-sm); color: var(--fg-secondary); background: var(--bg-subtle); flex-shrink: 0; }
+.flow-chip-icon { width: 11px; height: 11px; flex-shrink: 0; }
+.flow-chip.flow-chip-state { color: var(--amber-300); border-color: var(--amber-300); }
+.flow-chip.flow-chip-diff-added { color: var(--sage); border-color: var(--sage); }
+.flow-chip.flow-chip-diff-removed { color: var(--rust); border-color: var(--rust); }
+.flow-chip.flow-chip-diff-modified { color: var(--azure); border-color: var(--azure); }
+
+/* Panes: Miller columns. */
+.flow-panes { flex: 1; min-height: 0; display: flex; align-items: stretch; overflow-x: auto; overflow-y: hidden; }
+.flow-col { flex: 1 1 0px; min-width: 200px; max-width: 480px; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-right: 1px solid var(--border-soft); overflow-y: auto; overflow-x: hidden; font-size: 11px; }
+.flow-col.focused { background: var(--bg-subtle); }
+.flow-col.collapsed { flex: 0 0 auto; width: 28px; min-width: 28px; padding: 0; position: relative; overflow: hidden; cursor: pointer; }
+.flow-col.collapsed:hover { background: var(--bg-hover); }
+.flow-col-vlabel { position: absolute; left: 50%; top: 16px; transform: translateX(-50%) rotate(180deg); writing-mode: vertical-rl; font-size: 11px; color: var(--fg-secondary); white-space: nowrap; max-height: calc(100% - 32px); overflow: hidden; text-overflow: ellipsis; }
+.flow-col-head { flex-shrink: 0; display: flex; flex-direction: column; gap: 5px; padding-bottom: 8px; border-bottom: 1px solid var(--border-hair); border-left: 2px solid transparent; }
+.flow-col-head.diff-added, .flow-col-head.diff-removed, .flow-col-head.diff-modified { padding-left: 6px; }
+.flow-col-head.diff-added { border-left-color: var(--sage); }
+.flow-col-head.diff-removed { border-left-color: var(--rust); }
+.flow-col-head.diff-modified { border-left-color: var(--azure); }
+.flow-col-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.flow-col-title { font-size: 12px; color: var(--fg-primary); }
+.flow-col-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.flow-col-desc { color: var(--fg-secondary); }
+.flow-col-payload, .flow-col-next { font-size: 10px; color: var(--fg-tertiary); }
+.flow-section { flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; }
+.flow-section-label { font-size: 9px; letter-spacing: 0.08em; color: var(--fg-tertiary); margin-bottom: 2px; }
+.flow-item { display: flex; align-items: center; gap: 6px; padding: 3px 8px; font-size: 11px; color: var(--fg-primary); background: transparent; border: 1px solid transparent; border-left: 2px solid transparent; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap; overflow: hidden; text-align: left; width: 100%; }
+.flow-item:hover { background: var(--bg-hover); }
+.flow-item.active { background: var(--bg-elevated); border-color: var(--border-soft); }
+.flow-item.cursor { border-color: var(--amber-300); }
+.flow-item.diff-added { border-left-color: var(--sage); }
+.flow-item.diff-removed { border-left-color: var(--rust); }
+.flow-item.diff-modified { border-left-color: var(--azure); }
+.flow-item-name { flex: 0 1 auto; min-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-col-loc { font-size: 10px; color: var(--fg-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Graph: swim lanes. */
+.flow-graph { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.flow-graph-bar { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 14px; border-bottom: 1px solid var(--border-hair); font-size: 11px; color: var(--fg-tertiary); }
+.flow-crumbs { flex: 1 1 auto; min-width: 120px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; white-space: nowrap; }
+.flow-crumb { padding: 1px 6px; font-size: 11px; color: var(--fg-secondary); background: transparent; border: 1px solid transparent; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap; }
+.flow-crumb:hover { color: var(--fg-primary); background: var(--bg-hover); }
+.flow-crumb.current, .flow-crumb.current:hover { color: var(--fg-primary); background: transparent; cursor: default; }
+.flow-crumb-sep { color: var(--fg-muted); }
+.flow-graph-tools { flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; white-space: nowrap; }
+.flow-graph-hint { color: var(--fg-tertiary); margin-right: 8px; white-space: normal; max-width: 360px; }
+.flow-depth-group { flex-shrink: 0; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.flow-graph-scroll { flex: 1; min-height: 0; overflow: auto; background: var(--bg-base); }
+.flow-graph-canvas { position: relative; flex-shrink: 0; }
+.flow-lane { position: absolute; border: 1px solid var(--border-hair); border-radius: var(--r-md); background: var(--bg-subtle); }
+.flow-lane-pill { position: absolute; left: 12px; top: 10px; padding: 2px 10px; font-size: 11px; border: 1px solid var(--border-soft); border-radius: 999px; background: var(--bg-elevated); white-space: nowrap; }
+.flow-graph-edges { position: absolute; left: 0; top: 0; color: var(--fg-muted); pointer-events: none; }
+.flow-graph-node { position: absolute; display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 7px 10px; border: 1px solid var(--border-soft); border-left: 2px solid var(--border-soft); border-radius: var(--r-sm); background: var(--bg-elevated); cursor: pointer; overflow: hidden; text-align: left; }
+.flow-graph-node:hover { background: var(--bg-hover); }
+.flow-graph-node.event { border-radius: 999px; padding-left: 16px; }
+.flow-graph-node.diff-added { border-left-color: var(--sage); }
+.flow-graph-node.diff-removed { border-left-color: var(--rust); }
+.flow-graph-node.diff-modified { border-left-color: var(--azure); }
+.flow-graph-node-name { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-graph-node-desc { font-size: 10px; color: var(--fg-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-graph-badge { position: absolute; display: flex; align-items: center; justify-content: center; padding: 0; font-size: 10px; color: var(--bg-base); background: var(--violet); border: 1px solid var(--violet); border-radius: 999px; cursor: pointer; }
+.flow-graph-badge:hover { background: var(--amber-300); border-color: var(--amber-300); }
+.flow-graph-edge-label { position: absolute; max-width: 150px; height: 16px; line-height: 16px; padding: 0 4px; font-size: 10px; color: var(--fg-secondary); background: var(--bg-base); border-radius: var(--r-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.flow-error { padding: 24px; color: var(--rust); font-size: 12px; white-space: pre-wrap; }
+.flow-journey { padding: 8px 14px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
+.flow-overview, .flow-crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.flow-overview .current, .flow-graph-node.focus { border-color: var(--amber-300); background: var(--bg-selected); }
+.flow-focus-summary { margin-top: 6px; max-width: 1000px; color: var(--fg-secondary); }
+.flow-context { position: fixed; z-index: 100; padding: 8px; background: var(--bg-elevated); border: 1px solid var(--amber-300); }
+.flow-source-dialog { width: min(900px, 90vw); max-height: 80vh; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-focus); }
+.flow-source-dialog::backdrop { background: #0009; }
+button:focus-visible, [role=button]:focus-visible { outline: 2px solid var(--amber-300); outline-offset: 2px; }
+
+/* Readable graph cards and predictable navigation at every depth. */
+body { font-size: 13px; }
+.flow-header { padding: 14px 20px; }
+.flow-title { font-size: 16px; }
+.flow-toolbar, .flow-journey, .flow-graph-bar { padding-left: 20px; padding-right: 20px; }
+.flow-tab, .flow-tool, .flow-crumb { font-size: 12px; padding: 5px 9px; }
+.flow-graph-node, .flow-graph-node.event { padding: 14px 16px; gap: 8px; border-radius: 8px; min-height: 90px; overflow: visible; border: 1px solid #665638; box-shadow: 0 3px 10px #0002; }
+.flow-graph-node-name { font-size: 14px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; font-weight: 500; }
+.flow-graph-node-desc { font-size: 12px; line-height: 1.55; white-space: normal; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; color: #c8b68e; }
+.flow-graph-edges { color: #8b7853; opacity: .7; }
+.flow-graph-node:hover { border-color: var(--amber-300); }
+.flow-graph-hint { max-width: none; color: #b8a275; }
+.flow-graph-stage { position: relative; margin: 0 auto; }
+.flow-tool:disabled { opacity: .4; cursor: default; }
+.flow-depth-group { flex-wrap: wrap; }
+.flow-graph-tools { width: 100%; justify-content: space-between; gap: 10px; }
+.flow-connections { flex-shrink: 0; max-height: 180px; overflow: auto; margin: 4px 20px; padding: 12px; max-width: 1000px; background: var(--bg-subtle); border: 1px solid var(--border-default); border-radius: 6px; }
+.flow-connections summary, .flow-legend-toggle summary { cursor: pointer; padding: 5px; color: var(--fg-secondary); }
+.flow-connection { display: block; background: transparent; border: 0; width: 100%; text-align: left; padding: 9px 4px; white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
+.flow-connection:hover { background: var(--bg-hover); }
+.flow-legend-toggle { padding: 4px 20px; border-top: 1px solid var(--border-default); }
+.flow-crumbs { flex-wrap: nowrap; overflow-x: auto; padding-top: 6px; }
+.flow-crumbs > * { flex-shrink: 0; }
+.flow-focus-summary { line-height: 1.6; max-height: 85px; overflow: auto; }
+.flow-row { white-space: normal; padding: 10px 20px; align-items: flex-start; flex-wrap: wrap; border-bottom: 1px solid var(--border-soft); }
+.flow-name, .flow-desc, .flow-item-name { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
+.flow-desc { flex-basis: 60%; font-size: 12px; }
+.flow-item { padding: 10px 8px; white-space: normal; }
+.flow-col { min-width: 280px; font-size: 12px; }
+@media (max-width: 700px) { .flow-keys { display: none; } .flow-overview { flex-wrap: nowrap; overflow-x: auto; } .flow-title { font-size: 13px; } }
+
+
+.flow-stage-map { flex: 1; overflow: auto; padding: 24px; }
+.flow-map-heading { font-size: 18px; color: var(--fg-primary); }
+.flow-map-intro { color: var(--fg-secondary); line-height: 1.6; margin: 8px 0 22px; }
+.flow-stage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.flow-stage-card { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 20px; text-align: left; border: 1px solid #665638; border-radius: 10px; background: var(--bg-elevated); cursor: pointer; min-width: 0; }
+.flow-stage-card:hover { border-color: var(--amber-300); background: var(--bg-hover); }
+.flow-step-index { color: var(--fg-secondary); font-size: 10px; letter-spacing: .1em; }
+.flow-stage-name { font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+.flow-stage-desc { color: #c8b68e; font-size: 12px; line-height: 1.65; }
+.flow-stage-follow { margin-top: auto; padding-top: 10px; color: var(--fg-primary); font-size: 11px; }
+.flow-outcome { display: flex; flex-direction: column; gap: 8px; padding: 16px 20px; margin-top: 22px; width: 100%; text-align: left; color: var(--fg-secondary); background: transparent; border: 1px solid var(--border-default); border-radius: 8px; cursor: pointer; line-height: 1.6; }
+.flow-scroll-hint { padding: 6px 20px; color: var(--fg-secondary); border-top: 1px solid var(--border-default); font-size: 11px; }
+.flow-keys { color: var(--fg-secondary); }
+@media (max-width: 1150px) { .flow-stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .flow-stage-map { padding: 16px; } .flow-stage-card { padding: 14px; gap: 8px; } }
+@media (max-width: 620px) { .flow-stage-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="flow-pane" id="flow" tabindex="0"></div>
+<script type="application/json" id="flow-data">__FLOW_JSON__</script>
+<script>
+(function () {
+  'use strict';
+  var SCHEMA_VERSION = 1;
+  var PROCESS_PALETTE = 6;
+  var VIEW_TABS = [['call stack', 'stack'], ['panes', 'panes'], ['graph', 'graph']];
+  var LEVELS = ['events', 'code'];
+  var DEPTHS = ['1', '2', '3', 'all'];
+  var CARRIERS = [
+    ['ui', 'UI', '<path d="M4 2L4 12L7 9.5L9 13.5L11 12.5L9 8.5L12.5 8Z"/>'],
+    ['ipc', 'IPC', '<path d="M2 5H12M10 3L12 5L10 7"/><path d="M14 11H4M6 9L4 11L6 13"/>'],
+    ['rpc', 'RPC', '<path d="M9 2L4 9H8L7 14L12 7H8Z"/>'],
+    ['http', 'HTTP', '<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8H13.5"/><path d="M8 2.5C6 5 6 11 8 13.5"/><path d="M8 2.5C10 5 10 11 8 13.5"/>'],
+    ['fs', 'FS', '<path d="M2 4H6.5L8 6H14V12.5H2Z"/>'],
+    ['process', 'process', '<rect x="2.5" y="2.5" width="11" height="11" rx="1.5"/><path d="M5.5 8H10.5"/><path d="M8 5.5V10.5"/>'],
+    ['network', 'network', '<circle cx="4" cy="4" r="1.8"/><circle cx="12" cy="4" r="1.8"/><circle cx="8" cy="12" r="1.8"/><line x1="5.8" y1="4" x2="10.2" y2="4"/><line x1="5" y1="5.5" x2="7" y2="10.4"/><line x1="11" y1="5.5" x2="9" y2="10.4"/>'],
+    ['in_memory', 'in-memory', '<rect x="4.5" y="4.5" width="7" height="7" rx="1"/><path d="M2 6.5H4.5M2 9.5H4.5M11.5 6.5H14M11.5 9.5H14"/><path d="M6.5 2V4.5M9.5 2V4.5M6.5 11.5V14M9.5 11.5V14"/>']
+  ];
+  var CARRIER_LABEL = {}; CARRIERS.forEach(function (c) { CARRIER_LABEL[c[0]] = c[1]; });
+  var DIFF_MARK = { added: '+', removed: '-', modified: '~' };
+  var LANE_WIDTH = 356, LANE_GAP = 56, LANE_HEADER = 48, NODE_WIDTH = 316, PADDING = 16, BADGE = 18;
+  var MAX_TREE_DEPTH = 64, MAX_TREE_ROWS = 10000;
+
+  // ---- DOM helpers -------------------------------------------------------
+  function h(tag, cls, text) {
+    var el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+  function add(parent) { for (var i = 1; i < arguments.length; i++) if (arguments[i]) parent.appendChild(arguments[i]); return parent; }
+  function on(el, fn) { el.addEventListener('click', function (e) { e.stopPropagation(); fn(); render(); }); return el; }
+  function place(el, r) { el.style.left = r.x + 'px'; el.style.top = r.y + 'px'; el.style.width = r.w + 'px'; el.style.height = r.h + 'px'; return el; }
+  function svgIcon(inner) {
+    var w = h('span', 'flow-chip-icon');
+    w.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+    return w;
+  }
+
+  // ---- Model ------------------------------------------------------------
+  var root = document.getElementById('flow');
+  var flow;
+  try {
+    var raw = document.getElementById('flow-data').textContent;
+    if (/^\s*__FLOW_JSON__\s*$/.test(raw)) throw new Error('no flow embedded: replace the __FLOW_JSON__ placeholder with the flow document (scripts/render.mjs does this)');
+    flow = JSON.parse(raw);
+  } catch (err) { root.appendChild(h('div', 'flow-error', 'flow could not be loaded\n' + err.message)); return; }
+  var problems = validate(flow);
+  if (problems.length) { root.appendChild(h('div', 'flow-error', 'flow failed validation:\n- ' + problems.join('\n- '))); return; }
+  flow.nodes.forEach(function (n) { if (n.location && n.location.file) n.location.file = n.location.file.replace(/\\/g, '/'); });
+  document.title = flow.title;
+
+  var nodeById = {}; flow.nodes.forEach(function (n) { nodeById[n.id] = n; });
+  var processIndex = {}; flow.processes.forEach(function (p, i) { processIndex[p.id] = i; });
+  var processById = {}; flow.processes.forEach(function (p) { processById[p.id] = p; });
+  function node(id) { return nodeById[id]; }
+  function outgoing(id) { return flow.edges.filter(function (e) { return e.from === id; }); }
+  function incoming(id) { return flow.edges.filter(function (e) { return e.to === id; }); }
+  function procClass(n) { var i = n && n.process != null ? processIndex[n.process] : undefined; return i == null ? '' : 'flow-proc-' + (i % PROCESS_PALETTE); }
+  function status(n) { return n && n.status ? n.status : 'same'; }
+  function review() { return flow.mode === 'review'; }
+  function locDisplay(l) { return l.end_line && l.end_line > l.line ? l.file + ':' + l.line + '-' + l.end_line : l.file + ':' + l.line; }
+
+  function validate(f) {
+    var errs = [];
+    if (!f || typeof f !== 'object') return ['document is not an object'];
+    if (f.error) return ['producer error: ' + f.error];
+    if (f.schema_version !== SCHEMA_VERSION) errs.push('unsupported schema_version ' + f.schema_version + ' (expected ' + SCHEMA_VERSION + ')');
+    var validId = function (id) { return typeof id === 'string' && id.trim() && !/[;\r\n]/.test(id); };
+    var pids = {}, nids = {};
+    (f.processes || []).forEach(function (p) { if (!validId(p.id)) errs.push('invalid process id ' + JSON.stringify(p.id)); else if (pids[p.id]) errs.push('duplicate process id ' + p.id); else pids[p.id] = 1; });
+    (f.nodes || []).forEach(function (n) {
+      if (!validId(n.id)) { errs.push('invalid node id ' + JSON.stringify(n.id)); return; }
+      if (nids[n.id]) errs.push('duplicate node id ' + n.id); else nids[n.id] = 1;
+      if (n.process != null && !pids[n.process]) errs.push('node ' + n.id + ' references unknown process ' + n.process);
+      if (n.location) { var file = String(n.location.file || '').replace(/\\/g, '/'); if (!file || file[0] === '/' || file[1] === ':' || file.split('/').indexOf('..') >= 0) errs.push('node ' + n.id + ' has an unsafe location path ' + JSON.stringify(n.location.file)); }
+    });
+    (f.edges || []).forEach(function (e) { [e.from, e.to].forEach(function (id) { if (!nids[id]) errs.push('edge references unknown node ' + id); }); });
+    if (!f.entries || !f.entries.length) errs.push('entries is empty');
+    (f.entries || []).forEach(function (id) { if (!nids[id]) errs.push('entries references unknown node ' + id); });
+    return errs;
+  }
+
+  // ---- Call-stack tree ---------------------------------------------------
+  function deriveTree() {
+    var children = {};
+    flow.edges.forEach(function (e) { if (node(e.from) && node(e.to)) (children[e.from] = children[e.from] || []).push([e.to, e.kind]); });
+    var rows = [], path = [], truncated = false;
+    function visit(id, depth, edgeKind, parent, isLast) {
+      if (rows.length >= MAX_TREE_ROWS) { if (!truncated) { truncated = true; rows.push({ nodeId: id, depth: depth, edgeKind: edgeKind, parent: parent, isLast: true, childCount: 0, marker: 'truncated' }); } return; }
+      var row = rows.length;
+      for (var i = 0; i < path.length; i++) if (path[i][0] === id) { rows.push({ nodeId: id, depth: depth, edgeKind: edgeKind, parent: parent, isLast: isLast, childCount: 0, marker: 'repeat', repeatRow: path[i][1] }); return; }
+      var kids = children[id] || [];
+      if (depth >= MAX_TREE_DEPTH && kids.length) { rows.push({ nodeId: id, depth: depth, edgeKind: edgeKind, parent: parent, isLast: isLast, childCount: 0, marker: 'truncated' }); return; }
+      rows.push({ nodeId: id, depth: depth, edgeKind: edgeKind, parent: parent, isLast: isLast, childCount: kids.length, marker: 'none' });
+      path.push([id, row]);
+      kids.forEach(function (k, j) { visit(k[0], depth + 1, k[1], row, j === kids.length - 1); });
+      path.pop();
+    }
+    var entries = flow.entries.filter(node);
+    entries.forEach(function (e, i) { visit(e, 0, null, null, i === entries.length - 1); });
+    return rows;
+  }
+  var rows = deriveTree();
+
+  var state = { view: 'graph', level: 'code', collapsed: {}, selectedRow: null, path: [], columnCursor: null, graphCrumbs: [], graphDepth: '2', resetScroll: false, zoom: 'fit' };
+  // `#view=graph&level=events&depth=2` opens the page in that state, so a
+  // screenshot script can show each view without clicking.
+  (function applyHash() {
+    var params = {};
+    location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) params[p[0]] = decodeURIComponent(p[1] || ''); });
+    if (['stack', 'panes', 'graph'].indexOf(params.view) >= 0) state.view = params.view;
+    if (LEVELS.indexOf(params.level) >= 0) setLevel(params.level);
+    if (DEPTHS.indexOf(params.depth) >= 0) state.graphDepth = params.depth;
+  })();
+
+  function visibleRows() {
+    var hidden = [], out = [];
+    rows.forEach(function (row, i) {
+      var under = row.parent != null && (hidden[row.parent] || state.collapsed[row.parent]);
+      hidden[i] = !!under;
+      if (!under) out.push(i);
+    });
+    return out;
+  }
+  function displayRows() {
+    var focus = state.graphCrumbs[state.graphCrumbs.length - 1];
+    var allowed = {}; graphLayout(graphRoots(), state.graphDepth).nodes.forEach(function (n) { allowed[n.nodeId] = true; });
+    var visible = visibleRows().filter(function (i) { return allowed[rows[i].nodeId]; });
+    if (state.level !== 'events') return visible.map(function (r) { return { row: r, depth: rows[r].depth }; });
+    var isEvent = function (r) { var n = node(rows[r].nodeId); return !!n && n.kind === 'event'; };
+    var keep = [];
+    rows.forEach(function (row, i) { if (isEvent(i)) { keep[i] = true; if (row.parent != null) keep[row.parent] = true; } });
+    rows.forEach(function (row, i) { if (row.parent != null && isEvent(row.parent)) keep[i] = true; });
+    var out = [];
+    visible.forEach(function (r) {
+      if (!keep[r]) return;
+      var depth = 0, cur = rows[r].parent;
+      while (cur != null) { if (keep[cur]) depth++; cur = rows[cur].parent; }
+      out.push({ row: r, depth: depth });
+    });
+    return out;
+  }
+  function displayIndex(d) { if (state.selectedRow == null) return -1; for (var i = 0; i < d.length; i++) if (d[i].row === state.selectedRow) return i; return -1; }
+  function selectRow(r) { if (r >= rows.length || state.selectedRow === r) return false; state.selectedRow = r; return true; }
+  function moveSelection(delta) {
+    var d = displayRows(); if (!d.length) return false;
+    var i = displayIndex(d), last = d.length - 1, next;
+    if (i < 0) next = delta >= 0 ? 0 : last; else next = Math.max(0, Math.min(last, i + delta));
+    return selectRow(d[next].row);
+  }
+  function selectEdge(end) { var d = displayRows(); if (!d.length) return false; return selectRow(end ? d[d.length - 1].row : d[0].row); }
+  function selectInto() {
+    if (state.selectedRow == null) return moveSelection(1);
+    if (state.collapsed[state.selectedRow]) { delete state.collapsed[state.selectedRow]; return true; }
+    var d = displayRows(), i = displayIndex(d); if (i < 0) return false;
+    var next = d[i + 1];
+    return next && next.depth > d[i].depth ? selectRow(next.row) : false;
+  }
+  function selectOut() {
+    var s = state.selectedRow; if (s == null) return false;
+    if (rows[s].childCount > 0 && !state.collapsed[s]) { state.collapsed[s] = true; return true; }
+    var d = displayRows(), i = displayIndex(d); if (i < 0) return false;
+    var depth = d[i].depth; if (depth === 0) return false;
+    for (var j = i - 1; j >= 0; j--) if (d[j].depth < depth) return selectRow(d[j].row);
+    return false;
+  }
+  function clampSelection() {
+    var s = state.selectedRow; if (s == null) return;
+    var d = displayRows(); var visible = function (r) { return d.some(function (x) { return x.row === r; }); };
+    if (visible(s)) return;
+    var cur = rows[s].parent;
+    while (cur != null) { if (visible(cur)) { state.selectedRow = cur; return; } cur = rows[cur].parent; }
+    state.selectedRow = d.length ? d[0].row : null;
+  }
+  function expandAll() { state.collapsed = {}; }
+  function collapseAll() { rows.forEach(function (row, i) { if (row.childCount > 0) state.collapsed[i] = true; }); clampSelection(); }
+  function setLevel(level) { state.level = level; clampSelection(); }
+
+  // ---- Panes --------------------------------------------------------------
+  function columnCount() { return state.path.length + 1; }
+  function columnNode(col) { return col === 0 ? null : node(state.path[col - 1]); }
+  function columnItems(col) {
+    if (col === 0) return flow.entries.filter(node).map(function (id) { return { section: 'entries', nodeId: id }; });
+    var n = columnNode(col); if (!n) return [];
+    var items = [];
+    outgoing(n.id).forEach(function (e) { if (node(e.to)) items.push({ section: e.kind === 'calls' ? 'calls' : e.kind === 'resolves' ? 'resolves' : 'handled by', nodeId: e.to }); });
+    incoming(n.id).forEach(function (e) { if (e.kind === 'handled_by' && node(e.from)) items.push({ section: 'handles', nodeId: e.from }); });
+    return items;
+  }
+  function selectColumn(col, id) {
+    if (col > state.path.length) return false;
+    if (!columnItems(col).some(function (i) { return i.nodeId === id; })) return false;
+    state.path = state.path.slice(0, col); state.path.push(id); state.columnCursor = null; graphZoom(id); return true;
+  }
+  function focusColumn(col) { if (col >= columnCount() || col === state.path.length) return false; if (!col) return graphCrumb(0); return graphZoom(state.path[col - 1]); }
+  function focusedItems() { return columnItems(state.path.length); }
+  function columnMove(delta) {
+    var items = focusedItems(); if (!items.length) return false;
+    var last = items.length - 1, next;
+    if (state.columnCursor == null) next = delta >= 0 ? 0 : last; else next = Math.max(0, Math.min(last, state.columnCursor + delta));
+    if (state.columnCursor === next) return false; state.columnCursor = next; return true;
+  }
+  function columnEnter() { var items = focusedItems(), item = items[state.columnCursor == null ? 0 : state.columnCursor]; if (!item) return false; return selectColumn(state.path.length, item.nodeId); }
+  function columnBack() { return graphCrumb(Math.max(0, state.graphCrumbs.length - 1)); }
+  function columnEdge(end) { var items = focusedItems(); if (!items.length) return false; state.columnCursor = end ? items.length - 1 : 0; return true; }
+
+  // ---- Graph layout -------------------------------------------------------
+  function graphRoots() { return state.graphCrumbs.length ? [state.graphCrumbs[state.graphCrumbs.length - 1]] : flow.entries.slice(); }
+  function graphLayout(roots, depthName) {
+    var limit = depthName === 'all' ? null : parseInt(depthName, 10);
+    var depthOf = {}, order = [], queue = [], links = [];
+    function visit(id, d) { if (!node(id) || depthOf[id] != null) return; depthOf[id] = d; order.push(id); queue.push(id); }
+    roots.forEach(function (r) { visit(r, 0); });
+    while (queue.length) {
+      var id = queue.shift(), next = depthOf[id] + 1;
+      if (limit != null && next > limit) continue;
+      var source = node(id);
+      outgoing(id).forEach(function (edge) {
+        var target = node(edge.to); if (!target) return;
+        var handlers = [];
+        if (target.kind === 'event' && target.carrier !== 'in_memory' && source.kind !== 'event') outgoing(target.id).forEach(function (e) { if (e.kind === 'handled_by' && node(e.to)) handlers.push(e.to); });
+        var dotted = edge.kind === 'resolves';
+        if (!handlers.length) { links.push({ from: source.id, to: target.id, eventId: source.kind === 'event' ? source.id : null, dotted: dotted }); visit(target.id, next); }
+        else handlers.forEach(function (hnd) { links.push({ from: source.id, to: hnd, eventId: target.id, dotted: dotted }); visit(hnd, next); });
+      });
+    }
+    var laneOf = function (id) { var n = node(id); return n && n.process != null && processById[n.process] ? n.process : n && n.carrier === 'in_memory' && processById.agent ? 'agent' : 'outside'; };
+    var lanes = [];
+    flow.processes.forEach(function (p, index) { if (order.some(function (id) { return laneOf(id) === p.id; })) lanes.push({ processId: p.id, label: p.label, palette: index }); });
+    if (order.some(function (id) { return !processById[laneOf(id)]; })) lanes.push({ processId: 'outside', label: 'outside', palette: flow.processes.length });
+    var laneIndex = function (id) { var p = laneOf(id); for (var i = 0; i < lanes.length; i++) if (lanes[i].processId === p) return i; return 0; };
+    var maxDepth = 0; order.forEach(function (id) { maxDepth = Math.max(maxDepth, depthOf[id]); });
+    var stackCounts = {}, placements = [];
+    order.forEach(function (id) { var lane = laneIndex(id), d = depthOf[id], key = lane + ':' + d; var slot = stackCounts[key] || 0; placements.push([id, lane, d, slot]); stackCounts[key] = slot + 1; });
+    // Measure with the actual card styles so titles and descriptions never clip.
+    var sizes = {}, measure = h('button', 'flow-graph-node');
+    measure.style.cssText = 'position:fixed;left:-10000px;top:0;width:' + NODE_WIDTH + 'px;height:auto;visibility:hidden';
+    document.body.appendChild(measure);
+    order.forEach(function (id) {
+      measure.textContent = ''; add(measure, h('span', 'flow-graph-node-name', node(id).name), h('span', 'flow-graph-node-desc', node(id).description));
+      sizes[id] = Math.ceil(measure.getBoundingClientRect().height) + 4;
+    });
+    measure.remove();
+    var slotHeights = {}, slotY = {}, maxSlots = {};
+    placements.forEach(function (p) { var key = p[2] + ':' + p[3]; slotHeights[key] = Math.max(slotHeights[key] || 0, sizes[p[0]]); maxSlots[p[2]] = Math.max(maxSlots[p[2]] || 0, p[3] + 1); });
+    var y = PADDING + LANE_HEADER;
+    for (var d = 0; d <= maxDepth; d++) {
+      for (var slot = 0; slot < (maxSlots[d] || 0); slot++) { var key = d + ':' + slot; slotY[key] = y; y += slotHeights[key] + 52; }
+    }
+    var height = y + PADDING, laneX = [], x = PADDING;
+    lanes.forEach(function (lane) { laneX.push(x); lane.rect = { x: x, y: PADDING, w: LANE_WIDTH, h: height - PADDING * 2 }; x += LANE_WIDTH + LANE_GAP; });
+    var width = Math.max(LANE_WIDTH, x - LANE_GAP) + PADDING;
+    var nodes = placements.map(function (p) { return { nodeId:p[0], depth:p[2], lane:p[1], rect:{ x:laneX[p[1]] + 20, y:slotY[p[2] + ':' + p[3]], w:NODE_WIDTH, h:sizes[p[0]] } }; });
+    var geom = {}; nodes.forEach(function (n) { geom[n.nodeId] = n; });
+    var edges = [], number = 0, targetCounts = {};
+    links.forEach(function (link) {
+      var source = geom[link.from], target = geom[link.to], a = source.rect, b = target.rect;
+      var slot = targetCounts[link.to] || 0; targetCounts[link.to] = slot + 1;
+      // Vertical segments stay in the lane gutter; horizontal segments stay in row gaps.
+      var sx = a.x + a.w, sy = a.y + a.h / 2, gutter = laneX[source.lane] + LANE_WIDTH + 12 + (slot % 4) * 6;
+      var tx = b.x + 22 + (slot % 8) * 28, ty = b.y, approach = b.y - 24 - (slot % 3) * 7;
+      var path = 'M ' + sx + ' ' + sy + ' H ' + gutter + ' V ' + approach + ' H ' + tx + ' V ' + ty;
+      var ev = link.eventId ? node(link.eventId) : null;
+      if (ev) number++;
+      edges.push({from:link.from,to:link.to,eventId:link.eventId,number:ev ? number : null,label:ev ? (ev.carrier || 'event') + ' · ' + ev.name : null,dotted:link.dotted,path:path,badge:[tx,approach]});
+    });
+    return { lanes: lanes, nodes: nodes, edges: edges, width: width, height: height };
+  }
+  function graphZoom(id) {
+    if (!node(id) || state.graphCrumbs[state.graphCrumbs.length - 1] === id) return false;
+    var old = state.graphCrumbs.indexOf(id);
+    if (old >= 0) state.graphCrumbs = state.graphCrumbs.slice(0, old + 1);
+    else state.graphCrumbs.push(id);
+    state.graphDepth = '1'; state.resetScroll = true; state.selectedRow = null;
+    syncPanes(id); return true;
+  }
+  function syncPanes(id) {
+    var row = rows.findIndex(function (r) { return r.nodeId === id; }), chain = [];
+    while (row >= 0 && row != null) { chain.unshift(rows[row].nodeId); row = rows[row].parent; }
+    state.path = chain; state.columnCursor = null;
+  }
+  function graphCrumb(index) {
+    state.graphCrumbs = state.graphCrumbs.slice(0, index); state.graphDepth = index ? '1' : '2';
+    state.resetScroll = true; state.selectedRow = null;
+    if (index) syncPanes(state.graphCrumbs[index - 1]); else state.path = [];
+    return true;
+  }
+
+  // ---- Source excerpts ---------------------------------------------------
+  var KEYWORDS = /^(function|const|let|var|return|if|else|elif|for|while|do|switch|case|break|continue|def|class|import|from|export|default|async|await|try|catch|except|finally|throw|raise|new|this|self|fn|pub|use|mod|match|struct|impl|enum|let|mut|in|not|and|or|is|true|false|null|None|True|False|param|foreach|begin|end|then|fi|done|esac|local|echo|exit|with|as|yield|lambda|static|void|int|string|bool)$/;
+  function tokenize(line, lang, st) {
+    var out = [], i = 0, n = line.length;
+    function push(kind, text) { if (text) out.push([kind, text]); }
+    if (lang === 'markdown') {
+      if (/^\s*#{1,6}\s/.test(line)) return [['tok-keyword', line]];
+      if (/^---\s*$/.test(line)) return [['tok-comment', line]];
+      if (/^\s*>/.test(line)) return [['tok-comment', line]];
+      var m = /^(\s*(?:[-*+]|\d+\.)\s+)/.exec(line);
+      if (m) { push('tok-punct', m[1]); i = m[1].length; }
+      var rest = line.slice(i), re = /(`[^`]*`)|(\*\*[^*]+\*\*)|(\[[^\]]*\]\([^)]*\))/g, last = 0, mm;
+      while ((mm = re.exec(rest))) { push('tok-ident', rest.slice(last, mm.index)); push(mm[1] ? 'tok-str' : mm[2] ? 'tok-keyword' : 'tok-number', mm[0]); last = mm.index + mm[0].length; }
+      push('tok-ident', rest.slice(last));
+      return out;
+    }
+    var hashComment = /^(python|shell|powershell|yaml|toml|ruby)$/.test(lang);
+    while (i < n) {
+      var ch = line[i];
+      if (st.block) { var end = line.indexOf('*/', i); if (end < 0) { push('tok-comment', line.slice(i)); i = n; } else { push('tok-comment', line.slice(i, end + 2)); i = end + 2; st.block = false; } continue; }
+      if (ch === '/' && line[i + 1] === '*' && !hashComment) { st.block = true; continue; }
+      if ((ch === '/' && line[i + 1] === '/' && !hashComment) || (ch === '#' && hashComment)) { push('tok-comment', line.slice(i)); break; }
+      if (ch === '"' || ch === "'" || ch === '`') { var j = i + 1; while (j < n && line[j] !== ch) { if (line[j] === '\\') j++; j++; } push('tok-str', line.slice(i, j + 1)); i = j + 1; continue; }
+      if (/[0-9]/.test(ch)) { var k = i; while (k < n && /[0-9a-fA-Fx._]/.test(line[k])) k++; push('tok-number', line.slice(i, k)); i = k; continue; }
+      if (/[A-Za-z_$]/.test(ch)) { var q = i; while (q < n && /[A-Za-z0-9_$-]/.test(line[q])) q++; var word = line.slice(i, q); push(KEYWORDS.test(word) ? 'tok-keyword' : 'tok-ident', word); i = q; continue; }
+      if (/\s/.test(ch)) { var s = i; while (s < n && /\s/.test(line[s])) s++; push('tok-ident', line.slice(i, s)); i = s; continue; }
+      push('tok-punct', ch); i++;
+    }
+    return out;
+  }
+  function snippetBlock(n) {
+    var body = h('div', 'flow-snippet');
+    var ex = n.excerpt;
+    if (!ex || !ex.lines || !ex.lines.length) { add(body, h('span', 'flow-snippet-error', 'source not available')); return body; }
+    add(body, h('div', 'flow-snippet-path', (ex.file || (n.location && n.location.file) || '') + ' · ' + (ex.language || 'text')));
+    var first = ex.first_line || 1, width = String(first + ex.lines.length - 1).length, st = { block: false };
+    var hl = ex.highlight || [n.location ? n.location.line : 0, n.location ? (n.location.end_line || n.location.line) : 0];
+    ex.lines.forEach(function (line, offset) {
+      var no = first + offset, el = h('div', 'flow-snippet-line' + (no >= hl[0] && no <= hl[1] ? ' hl' : ''));
+      var g = String(no); while (g.length < width) g = ' ' + g;
+      add(el, h('span', 'flow-gutter', g));
+      tokenize(line, ex.language || 'text', st).forEach(function (t) { add(el, h('span', t[0], t[1])); });
+      add(body, el);
+    });
+    return body;
+  }
+
+  // ---- Rendering ----------------------------------------------------------
+  function render() {
+    var scrollTop = {}; Array.prototype.forEach.call(root.querySelectorAll('.flow-tree,.flow-graph-scroll,.flow-col'), function (el, i) { scrollTop[i] = [el.scrollTop, el.scrollLeft]; });
+    root.textContent = '';
+    add(root, buildHeader(), buildToolbar(), buildJourney());
+    if (state.view === 'stack') add(root, buildCallStack());
+    else if (state.view === 'panes') add(root, buildPanes());
+    else add(root, buildGraph());
+    add(root, buildLegend());
+    Array.prototype.forEach.call(root.querySelectorAll('.flow-tree,.flow-graph-scroll,.flow-col'), function (el, i) { if (!state.resetScroll && scrollTop[i]) { el.scrollTop = scrollTop[i][0]; el.scrollLeft = scrollTop[i][1]; } });
+    state.resetScroll = false;
+    var sel = root.querySelector('.flow-row.selected, .flow-item.cursor'); if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest' });
+  }
+  function buildHeader() {
+    var head = add(h('div', 'flow-header'), h('span', 'flow-title', flow.title));
+    var parts = [flow.nodes.length + ' nodes', flow.edges.length + ' edges', flow.mode || 'explain'];
+    if (flow.git_ref) parts.push(flow.git_ref);
+    add(head, h('span', 'flow-meta', parts.join(' · ')));
+    if (flow.diff_range) add(head, h('span', 'flow-range-chip', flow.diff_range.base + '..' + flow.diff_range.head));
+    return head;
+  }
+  function tab(name, active, fn) { var b = h('button', 'flow-tab' + (active ? ' active' : ''), name); return on(b, fn); }
+  function buildToolbar() {
+    var views = add(h('div', 'flow-toolbar-row'), h('span', 'flow-toolbar-label', 'view:'));
+    VIEW_TABS.forEach(function (t) { add(views, tab(t[0], state.view === t[1], function () { state.view = t[1]; })); });
+    add(views, h('span', 'flow-keys', 'Enter: follow · Esc: back · Shift+F10: menu'));
+    return add(h('div', 'flow-toolbar'), views);
+  }
+  function badge(text) { return h('span', 'flow-badge', text); }
+  function buildCallStack() {
+    var tree = h('div', 'flow-tree');
+    var d = displayRows();
+    if (!d.length) add(tree, h('span', 'flow-placeholder', 'nothing to show at this level'));
+    d.forEach(function (disp) { add(tree, buildRow(disp)); });
+    return tree;
+  }
+  function buildRow(disp) {
+    var tr = rows[disp.row], n = node(tr.nodeId), st = status(n);
+    var row = h('div', 'flow-row' + (state.selectedRow === disp.row ? ' selected' : '') + (state.collapsed[disp.row] ? ' collapsed' : '') + (review() && st !== 'same' ? ' diff-' + st : ''));
+    on(row, function () { graphZoom(tr.nodeId); });
+    contextSource(row, n); row.tabIndex = 0; row.setAttribute('role', 'button');
+    row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); graphZoom(n.id); render(); } });
+    for (var i = 0; i < Math.min(disp.depth, 1); i++) add(row, h('span', 'flow-indent'));
+    if (disp.depth > 0) add(row, h('span', 'flow-connector', '└─'));
+    if (review()) add(row, h('span', 'flow-diff-marker', DIFF_MARK[st] || ' '));
+    if (!n) return add(row, h('span', 'flow-name', tr.nodeId));
+    add(row, h('span', 'flow-name ' + procClass(n), n.name));
+    if (n.carrier) add(row, h('span', 'flow-carrier', CARRIER_LABEL[n.carrier] || n.carrier));
+    (n.tags || []).forEach(function (t) { add(row, h('span', 'flow-tag', t)); });
+    if (n.hidden_children > 0) add(row, badge('[+' + n.hidden_children + ']'));
+    if (tr.marker === 'repeat') add(row, badge('↩ shown above'));
+    if (tr.marker === 'truncated') add(row, badge('… truncated'));
+    if (tr.childCount > 0 && state.collapsed[disp.row]) add(row, badge('[' + tr.childCount + ' collapsed]'));
+    if (n.description && n.description.trim()) add(row, h('span', 'flow-desc', n.description));
+    if (n.location) {
+      add(row, h('span', 'flow-loc', locDisplay(n.location)));
+
+    }
+    return row;
+  }
+  function buildPanes() {
+    var panes = h('div', 'flow-panes'), count = columnCount();
+    for (var col = 0; col < count; col++) add(panes, buildColumn(col, col + 2 < count));
+    return panes;
+  }
+  function section(label) { return add(h('div', 'flow-section'), h('span', 'flow-section-label', label)); }
+  function buildColumn(col, collapsed) {
+    var n = columnNode(col), column = h('div', 'flow-col');
+    if (collapsed) {
+      column.className += ' collapsed';
+      add(column, h('span', 'flow-col-vlabel ' + (n ? procClass(n) : ''), n ? n.name : flow.title));
+      return on(column, function () { focusColumn(col); });
+    }
+    var focused = col + 1 === columnCount(); if (focused) column.className += ' focused';
+    add(column, n ? nodeHead(n) : overviewHead());
+    var chosen = state.path[col], cursor = focused ? state.columnCursor : null;
+    var items = columnItems(col), groups = [];
+    items.forEach(function (item, index) { var g = groups[groups.length - 1]; if (g && g.section === item.section) g.items.push([index, item]); else groups.push({ section: item.section, items: [[index, item]] }); });
+    groups.forEach(function (g) {
+      var list = section(g.section);
+      g.items.forEach(function (pair) {
+        var index = pair[0], item = pair[1], target = node(item.nodeId); if (!target) return;
+        var st = status(target);
+        var b = h('button', 'flow-item' + (chosen === item.nodeId ? ' active' : '') + (cursor === index ? ' cursor' : '') + (review() && st !== 'same' ? ' diff-' + st : ''));
+        add(b, h('span', 'flow-item-name ' + procClass(target), target.name));
+        if (target.carrier) add(b, h('span', 'flow-carrier', CARRIER_LABEL[target.carrier] || target.carrier));
+        contextSource(b, target);
+        add(list, on(b, function () { selectColumn(col, item.nodeId); graphZoom(item.nodeId); }));
+      });
+      add(column, list);
+    });
+    if (n) contextSource(column, n);
+    return column;
+  }
+  function overviewHead() {
+    var head = add(h('div', 'flow-col-head'), h('span', 'flow-col-title', flow.title));
+    if (flow.summary && flow.summary.trim()) add(head, h('span', 'flow-col-desc', flow.summary));
+    if (flow.next_flow) add(head, h('span', 'flow-col-next', 'next flow: ' + flow.next_flow));
+    return head;
+  }
+  function nodeHead(n) {
+    var line = add(h('div', 'flow-col-title-row'), h('span', 'flow-col-title ' + procClass(n), n.name), h('span', 'flow-tag flow-kind', n.kind));
+    if (n.carrier) add(line, h('span', 'flow-carrier', CARRIER_LABEL[n.carrier] || n.carrier));
+    if (n.process != null && processById[n.process]) add(line, h('span', 'flow-tag', processById[n.process].label));
+    var st = status(n), head = add(h('div', 'flow-col-head' + (review() && st !== 'same' ? ' diff-' + st : '')), line);
+    if (n.tags && n.tags.length) { var tags = h('div', 'flow-col-tags'); n.tags.forEach(function (t) { add(tags, h('span', 'flow-tag', t)); }); add(head, tags); }
+    if (n.description && n.description.trim()) add(head, h('span', 'flow-col-desc', n.description));
+    if (n.payload) add(head, h('span', 'flow-col-payload', n.payload));
+    contextSource(head, n); return head;
+  }
+  function buildStageMap(focus) {
+    var wrap = h('div', 'flow-graph'), scroll = h('div', 'flow-stage-map');
+    var rootNode = focus;
+    if (!rootNode) {
+      rootNode = node(flow.entries[0]);
+      if (rootNode && outgoing(rootNode.id).length === 1) rootNode = node(outgoing(rootNode.id)[0].to);
+    }
+    if (!rootNode) return wrap;
+    add(scroll, h('div', 'flow-map-heading', focus ? 'Choose a branch to continue' : 'The complete story, one step at a time'));
+    add(scroll, h('p', 'flow-map-intro', focus ? rootNode.description : 'Select a step to see its connections. The overview stays available throughout the story.'));
+    var grid = h('div', 'flow-stage-grid');
+    var steps = outgoing(rootNode.id).filter(function (e) { return node(e.to).kind === 'function'; });
+    steps.forEach(function (e, i) {
+      var n = node(e.to), card = h('button', 'flow-stage-card ' + procClass(n));
+      card.dataset.nodeId = n.id;
+      add(card, h('span', 'flow-step-index', focus ? 'BRANCH ' + (i + 1) : 'STEP ' + (i + 1)), h('span', 'flow-stage-name', n.name), h('span', 'flow-stage-desc', n.description), h('span', 'flow-stage-follow', 'Follow this step →'));
+      contextSource(card, n); add(grid, on(card, function () { graphZoom(n.id); }));
+    });
+    add(scroll, grid);
+    if (!focus) {
+      var outcomes = outgoing(rootNode.id).filter(function (e) { return e.kind === 'resolves'; });
+      outcomes.forEach(function (e) { var n = node(e.to), end = h('button', 'flow-outcome'); add(end, h('strong', '', 'At the end · ' + n.name), h('span', '', n.description)); contextSource(end, n); add(scroll, on(end, function () { graphZoom(n.id); })); });
+    }
+    return add(wrap, scroll);
+  }
+  function buildGraph() {
+    var focused = node(state.graphCrumbs[state.graphCrumbs.length - 1]);
+    if (!focused && state.graphDepth === '2') return buildStageMap(null);
+    if (focused && focused.carrier === 'in_memory' && state.graphDepth === '1') return buildStageMap(focused);
+    var g = graphLayout(graphRoots(), state.graphDepth);
+    var wrap = add(h('div', 'flow-graph'), buildGraphBar());
+    if (!g.nodes.length) return add(wrap, add(h('div', 'flow-tree'), h('span', 'flow-placeholder', 'nothing reachable from this root')));
+    var canvas = h('div', 'flow-graph-canvas'); canvas.style.width = g.width + 'px'; canvas.style.height = g.height + 'px';
+    g.lanes.forEach(function (lane) { add(canvas, add(place(h('div', 'flow-lane flow-proc-' + (lane.palette % PROCESS_PALETTE)), lane.rect), h('span', 'flow-lane-pill', lane.label))); });
+    var svgNS = 'http://www.w3.org/2000/svg', svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('class', 'flow-graph-edges'); svg.setAttribute('width', g.width); svg.setAttribute('height', g.height); svg.setAttribute('viewBox', '0 0 ' + g.width + ' ' + g.height);
+    var defs = document.createElementNS(svgNS, 'defs'); defs.innerHTML = '<marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b8a275"/></marker>'; svg.appendChild(defs);
+    g.edges.forEach(function (e) { var p = document.createElementNS(svgNS, 'path'); p.setAttribute('d', e.path); p.setAttribute('fill', 'none'); p.setAttribute('stroke', 'currentColor'); p.setAttribute('stroke-width', '1.5'); p.setAttribute('marker-end', 'url(#flow-arrow)'); p.setAttribute('stroke-linecap', 'round'); if (e.dotted) p.setAttribute('stroke-dasharray', '6 6'); svg.appendChild(p); });
+    add(canvas, svg);
+    g.nodes.forEach(function (ng) {
+      var n = node(ng.nodeId); if (!n) return;
+      var st = status(n);
+      var el = place(h('button', 'flow-graph-node ' + procClass(n) + (n.kind === 'event' ? ' event' : '') + (review() && st !== 'same' ? ' diff-' + st : '')), ng.rect);
+      add(el, h('span', 'flow-graph-node-name', n.name));
+      if (n.description && n.description.trim()) add(el, h('span', 'flow-graph-node-desc', n.description));
+      el.title = n.name + (n.description ? ' — ' + n.description : '');
+      el.dataset.nodeId = n.id; contextSource(el, n);
+      if (state.graphCrumbs[state.graphCrumbs.length - 1] === n.id) el.classList.add('focus');
+      add(canvas, on(el, function () { graphZoom(n.id); }));
+    });
+    g.edges.forEach(function (e) {
+      if (e.number == null) return;
+      var bx = e.badge[0], by = e.badge[1];
+      var b = place(h('button', 'flow-graph-badge', String(e.number)), { x: bx - BADGE / 2, y: by - BADGE / 2, w: BADGE, h: BADGE });
+      b.title = e.label + ' → ' + node(e.to).name; b.setAttribute('aria-label', b.title);
+      contextSource(b, node(e.eventId));
+      add(canvas, on(b, function () { graphZoom(e.to); }));
+
+    });
+    var available = root.clientWidth - 32;
+    var scale = state.zoom === 'fit' ? Math.min(1, available / g.width) : Number(state.zoom);
+    var stage = h('div', 'flow-graph-stage'); stage.style.width = (g.width * scale) + 'px'; stage.style.height = (g.height * scale) + 'px';
+    canvas.style.transform = 'scale(' + scale + ')'; canvas.style.transformOrigin = 'top left'; add(stage, canvas);
+    var scroll = add(h('div', 'flow-graph-scroll'), stage);
+    var events = g.edges.filter(function (e) { return e.number != null; });
+    if (events.length) {
+      var details = h('details', 'flow-connections'); add(details, h('summary', '', 'Connections (' + events.length + ') — event details'));
+      events.forEach(function (e) { var b = h('button', 'flow-connection', e.number + '. ' + e.label + ' → ' + node(e.to).name); contextSource(b, node(e.eventId)); add(details, on(b, function () { graphZoom(e.to); })); });
+      var connections = details;
+    }
+    add(wrap, scroll, connections, h('div', 'flow-scroll-hint', 'Scroll to follow more connections · use Fit width to see every lane'));
+    return wrap;
+  }
+  function buildGraphBar() {
+    var crumbs = h('div', 'flow-crumbs'), names = [flow.title].concat(state.graphCrumbs.map(function (id) { return node(id) ? node(id).name : id; }));
+    names.forEach(function (name, index) {
+      if (index > 0) add(crumbs, h('span', 'flow-crumb-sep', '›'));
+      var c = h('button', 'flow-crumb' + (index === names.length - 1 ? ' current' : ''), name);
+      add(crumbs, index === names.length - 1 ? c : on(c, function () { graphCrumb(index); }));
+    });
+    var tools = add(h('div', 'flow-graph-tools'), h('span', 'flow-graph-hint', 'Click to follow · Right-click for source · Esc to go back'));
+    var depth = add(h('div', 'flow-depth-group'), h('span', 'flow-toolbar-label', 'Connection depth:'));
+    DEPTHS.forEach(function (d) { add(depth, tab(d, state.graphDepth === d, function () { state.graphDepth = d; })); });
+    add(depth, h('span', 'flow-toolbar-label', 'Zoom:'));
+    [['fit','Fit width'],['0.5','50%'],['0.75','75%'],['1','100%']].forEach(function (z) { add(depth, tab(z[1], state.zoom === z[0], function () { state.zoom = z[0]; state.resetScroll = true; })); });
+    return add(h('div', 'flow-graph-bar'), add(tools, depth));
+  }
+  function chip(text, cls) { return add(h('div', 'flow-chip' + (cls ? ' ' + cls : '')), h('span', null, text)); }
+  function buildLegend() {
+    var procs = add(h('div', 'flow-legend-row'), h('span', 'flow-legend-label first', 'process'));
+    flow.processes.forEach(function (p, i) { add(procs, chip(p.label, 'flow-proc-' + (i % PROCESS_PALETTE))); });
+    add(procs, h('span', 'flow-legend-label', 'service state'), chip('field', 'flow-chip-state'));
+    var carriers = add(h('div', 'flow-legend-row'), h('span', 'flow-legend-label first', 'event carrier'));
+    CARRIERS.forEach(function (c) { add(carriers, add(h('div', 'flow-chip flow-chip-' + c[0].replace('_', '-')), svgIcon(c[2]), h('span', null, c[1]))); });
+    var legend = add(h('div', 'flow-legend'), procs, carriers);
+    if (review()) { var diff = add(h('div', 'flow-legend-row'), h('span', 'flow-legend-label first', 'diff')); ['added', 'removed', 'modified'].forEach(function (s) { add(diff, chip(DIFF_MARK[s] + ' ' + s, 'flow-chip-diff-' + s)); }); add(legend, diff); }
+    var details = h('details', 'flow-legend-toggle'); add(details, h('summary', '', 'Legend'), legend); return details;
+  }
+
+  // Shared overview, storyline and explicitly requested source.
+  function buildJourney() {
+    var wrap = h('div', 'flow-journey'), overview = h('div', 'flow-overview');
+    add(overview, on(h('button', 'flow-tool' + (!state.graphCrumbs.length && state.graphDepth !== 'all' ? ' current' : ''), 'Overview'), function () { graphCrumb(0); }));
+    add(overview, on(h('button', 'flow-tool', 'Whole graph'), function () { graphCrumb(0); state.view = 'graph'; state.graphDepth = 'all'; state.zoom = '1'; }));
+    var entries = flow.entries.slice();
+    if (entries.length === 1 && outgoing(entries[0]).length === 1) entries = outgoing(entries[0]).map(function (e) { return e.to; });
+    var steps = [];
+    entries.forEach(function (id) { outgoing(id).forEach(function (e) { if (node(e.to).kind === 'function') steps.push(e.to); }); });
+    steps.forEach(function (id) {
+      var active = state.graphCrumbs.some(function (crumb) {
+        var seen = {}, queue = [id];
+        while (queue.length) { var x = queue.shift(); if (seen[x]) continue; seen[x] = true; if (x === crumb) return true; outgoing(x).forEach(function (e) { queue.push(e.to); }); }
+        return false;
+      });
+      var b = h('button', 'flow-tool' + (active ? ' current' : ''), node(id).name);
+      contextSource(b, node(id));
+      add(overview, on(b, function () { graphCrumb(0); graphZoom(id); }));
+    });
+    var crumbs = h('div', 'flow-crumbs');
+    var back = on(h('button', 'flow-tool', '← Back'), function () { graphCrumb(Math.max(0, state.graphCrumbs.length - 1)); }); back.disabled = !state.graphCrumbs.length; add(crumbs, back);
+    add(crumbs, h('span', '', 'Storyline:'));
+    add(crumbs, on(h('button', 'flow-crumb', 'Overview'), function () { graphCrumb(0); }));
+    state.graphCrumbs.forEach(function (id, i) {
+      add(crumbs, h('span', '', '›'), on(h('button', 'flow-crumb', node(id).name), function () { graphCrumb(i + 1); }));
+    });
+    add(wrap, overview, crumbs);
+    var current = node(state.graphCrumbs[state.graphCrumbs.length - 1]);
+    if (current) {
+      var detail = h('div', 'flow-focus-summary', current.description + (!outgoing(current.id).length ? ' End of this branch — go back to continue the story.' : ''));
+      contextSource(detail, current); add(wrap, detail);
+    }
+    return wrap;
+  }
+  function contextSource(el, n) {
+    if (!n) return el;
+    function menu(e) {
+      e.preventDefault(); e.stopPropagation();
+      var previous = document.querySelector('.flow-context'); if (previous) previous.remove();
+      var rect = el.getBoundingClientRect(), box = h('div', 'flow-context'); box.setAttribute('role', 'menu');
+      box.style.left = Math.max(0, Math.min(e.clientX || rect.left, innerWidth - 220)) + 'px';
+      box.style.top = Math.max(0, Math.min(e.clientY || rect.bottom, innerHeight - 60)) + 'px';
+      var button = h('button', 'flow-tool', n.excerpt ? 'Source' : 'Source unavailable');
+      button.setAttribute('role', 'menuitem'); button.disabled = !n.excerpt;
+      button.addEventListener('click', function () { box.remove(); showSource(n); });
+      box.appendChild(button); document.body.appendChild(box); button.focus();
+      function close(event) { if (event.type === 'keydown' && event.key !== 'Escape') return; if (event.type === 'pointerdown' && box.contains(event.target)) return; box.remove(); document.removeEventListener('pointerdown', close); document.removeEventListener('keydown', close); }
+      document.addEventListener('pointerdown', close); document.addEventListener('keydown', close);
+    }
+    el.addEventListener('contextmenu', menu);
+    el.addEventListener('keydown', function (e) { if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) menu(e); });
+    return el;
+  }
+  function showSource(n) {
+    var dialog = h('dialog', 'flow-source-dialog');
+    add(dialog, h('h2', '', n.name), snippetBlock(n));
+    var close = h('button', 'flow-tool', 'Close source'); close.addEventListener('click', function () { dialog.close(); });
+    add(dialog, close); document.body.appendChild(dialog);
+    dialog.addEventListener('close', function () { dialog.remove(); }); dialog.showModal();
+  }
+
+  // ---- Keyboard -----------------------------------------------------------
+  document.addEventListener('keydown', function (e) {
+    if (document.querySelector('.flow-source-dialog[open]') || document.querySelector('.flow-context')) return;
+    if (e.key === 'Escape') { e.preventDefault(); graphCrumb(Math.max(0, state.graphCrumbs.length - 1)); render(); return; }
+    if (e.target.closest('button') && (e.key === 'Enter' || e.key === ' ')) return;
+    if (e.altKey || e.metaKey) return;
+    var key = e.key, ctrl = e.ctrlKey, shift = e.shiftKey, plain = !ctrl && !shift, changed = false;
+    if (ctrl && !shift && (key === '1' || key === '2' || key === '3')) { state.view = ['stack', 'panes', 'graph'][parseInt(key, 10) - 1]; changed = true; }
+    else if (!plain) return;
+    else if (state.view === 'panes') {
+      if (key === 'ArrowDown') changed = columnMove(1); else if (key === 'ArrowUp') changed = columnMove(-1);
+      else if (key === 'PageDown') changed = columnMove(10); else if (key === 'PageUp') changed = columnMove(-10);
+      else if (key === 'Home') changed = columnEdge(false); else if (key === 'End') changed = columnEdge(true);
+      else if (key === 'ArrowRight' || key === 'Enter' || key === ' ') changed = columnEnter();
+      else if (key === 'ArrowLeft') changed = columnBack();
+      else return;
+    } else {
+      if (key === 'ArrowDown') changed = moveSelection(1); else if (key === 'ArrowUp') changed = moveSelection(-1);
+      else if (key === 'PageDown') changed = moveSelection(10); else if (key === 'PageUp') changed = moveSelection(-10);
+      else if (key === 'Home') changed = selectEdge(false); else if (key === 'End') changed = selectEdge(true);
+      else if (key === 'ArrowRight') changed = selectInto(); else if (key === 'ArrowLeft') changed = selectOut();
+      else if (key === 'Enter' || key === ' ') { if (state.selectedRow != null) changed = graphZoom(rows[state.selectedRow].nodeId); }
+      else if (key === 'e' || key === 'E') { expandAll(); changed = true; }
+      else if (key === 'c' || key === 'C') { collapseAll(); changed = true; }
+      else return;
+    }
+    e.preventDefault();
+    if (changed) render();
+  });
+
+  render();
+  if (document.fonts) document.fonts.ready.then(function () { render(); });
+})();
+</script>
+</body>
+</html>
