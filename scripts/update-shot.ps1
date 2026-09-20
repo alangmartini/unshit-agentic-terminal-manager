@@ -36,6 +36,7 @@
   pwsh scripts/update-shot.ps1
   pwsh scripts/update-shot.ps1 -Mode settings -Out update-settings.png
   pwsh scripts/update-shot.ps1 -Mode install
+  pwsh scripts/update-shot.ps1 -Mode install -NoDigest -Out update-no-digest.png
 #>
 [CmdletBinding()]
 param(
@@ -48,6 +49,11 @@ param(
     # Use a real feed (e.g. the GitHub releases/latest URL) instead of the fake
     # v99.0.0 one; only meaningful with -Mode settings (check, no install).
     [string]$FeedUrl = "",
+    # Publish the fake asset without its sha256 digest. With -Mode install the
+    # app must refuse before downloading (update.install_failed with
+    # error_kind digest_missing), stay running, and Settings > Updates is
+    # captured showing the reason.
+    [switch]$NoDigest,
     [int]$SettleMs = 7000,
     [int]$Width = 1000,
     [int]$Height = 640
@@ -118,10 +124,13 @@ $feed = @{
             name                 = 'terminal-manager-99.0.0-setup.exe'
             browser_download_url = (To-FileUrl $fakeInstaller)
             size                 = $size
-            digest               = "sha256:$digest"
         }
     )
 }
+if (-not $NoDigest) { $feed.assets[0].digest = "sha256:$digest" }
+# In install mode the app normally hands off and exits; without a digest it
+# must refuse and stay up, so that run is captured like the settings shot.
+$expectExit = ($Mode -eq 'install') -and -not $NoDigest
 $feedPath = Join-Path $feedDir 'latest.json'
 # UTF-8 without a BOM: PowerShell 5's `-Encoding UTF8` adds one, which is not JSON.
 [System.IO.File]::WriteAllText($feedPath, ($feed | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false))
@@ -150,13 +159,13 @@ try {
         Remove-Item Env:TM_STARTUP_DISPATCH -ErrorAction SilentlyContinue
     }
     $launched = $proc
-    Write-Host "Launched pid=$($proc.Id) mode=$Mode unmanaged=$Unmanaged feed=$feedPath"
+    Write-Host "Launched pid=$($proc.Id) mode=$Mode unmanaged=$Unmanaged nodigest=$NoDigest feed=$feedPath"
 
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $handle = [IntPtr]::Zero
     while ($clock.Elapsed.TotalMilliseconds -lt 20000) {
         if ($proc.HasExited) {
-            if ($Mode -eq 'install') { break }
+            if ($expectExit) { break }
             throw "Process exited early (code $($proc.ExitCode)); see $errLog"
         }
         $h = [UpdateShotWin]::LargestVisibleWindow([uint32]$proc.Id)
@@ -164,7 +173,7 @@ try {
         Start-Sleep -Milliseconds 100
     }
 
-    if ($Mode -eq 'install') {
+    if ($expectExit) {
         # The app downloads the stand-in, hands off and exits on its own.
         $exited = $proc.WaitForExit(40000)
         if (-not $exited) { throw 'install mode: the app did not exit within 40s after update.install' }
@@ -213,7 +222,17 @@ try {
         Write-Warning "No update-events.jsonl under $($isolation.ConfigDir): the updater never ran"
     }
 
-    if ($Mode -eq 'install') {
+    if ($Mode -eq 'install' -and $NoDigest) {
+        $lines = @(Get-Content $events)
+        if (-not ($lines | Where-Object { $_ -like '*"event":"update.install_failed"*"error_kind":"digest_missing"*' })) {
+            throw 'install mode without digest: telemetry is missing update.install_failed with error_kind digest_missing'
+        }
+        if ($lines | Where-Object { $_ -like '*"event":"update.download_started"*' }) {
+            throw 'install mode without digest: the app started a download it should have refused'
+        }
+        if ($proc.HasExited) { throw 'install mode without digest: the app exited instead of staying up' }
+        Write-Host 'install mode without digest OK: refused before download, app still running, reason captured in Settings'
+    } elseif ($Mode -eq 'install') {
         $lines = @(Get-Content $events)
         foreach ($needle in '"event":"update.check_completed"', '"event":"update.download_completed"', '"event":"update.layout_persisted"', '"event":"update.install_launched"', '"event":"update.daemon_shutdown"', '"event":"update.exiting"') {
             if (-not ($lines | Where-Object { $_ -like "*$needle*" })) { throw "install mode: telemetry is missing $needle" }
