@@ -38,7 +38,9 @@ use crate::pipeline::quad::QuadInstance;
 use crate::pipeline::text::GlyphInstance;
 
 /// Stable signature of the row geometry inputs used to build the
-/// cached instances. Any change in these invalidates the entry.
+/// cached instances. Cell metrics, font, opacity, and atlas changes
+/// invalidate an entry; origin, clip, and trailing empty columns can be
+/// retargeted without re-shaping the row during a terminal resize.
 ///
 /// Floats are converted to bits so the signature is a plain `u64`
 /// tuple. Exact bit equality is the correct test: any drift in the
@@ -90,6 +92,32 @@ impl LineGeometrySig {
             atlas_generation,
         }
     }
+
+    /// Geometry fields that cannot be repaired by translating already-built
+    /// instances or replacing their clip rectangle.
+    #[inline]
+    fn retarget_compatible(self, next: Self) -> bool {
+        self.cell_w_bits == next.cell_w_bits
+            && self.cell_h_bits == next.cell_h_bits
+            && self.font_size_bits == next.font_size_bits
+            && self.opacity_bits == next.opacity_bits
+            && self.atlas_generation == next.atlas_generation
+    }
+
+    #[inline]
+    fn origin_x(self) -> f32 {
+        f32::from_bits(self.origin_x_bits)
+    }
+
+    #[inline]
+    fn origin_y(self) -> f32 {
+        f32::from_bits(self.origin_y_bits)
+    }
+
+    #[inline]
+    fn clip_rect(self) -> [f32; 4] {
+        self.clip_bits.map(f32::from_bits)
+    }
 }
 
 /// Content hash of every cell in a single row. Includes character,
@@ -107,6 +135,31 @@ pub fn hash_row_cells(cells: &[Cell], row: usize, cols: usize) -> u64 {
         hash_cell(&mut hasher, cell);
     }
     hasher.finish()
+}
+
+/// Hash only the visible prefix of a terminal row. Trailing transparent blank
+/// cells carry no pixels, so terminal viewport growth can reuse a cached row
+/// instead of treating added empty columns as a content change.
+#[inline]
+pub fn hash_row_visible_cells(cells: &[Cell], row: usize, cols: usize) -> u64 {
+    let start = row * cols;
+    let mut end = start + cols;
+    while end > start && trailing_cell_is_visually_empty(&cells[end - 1]) {
+        end -= 1;
+    }
+    let mut hasher = rustc_hash::FxHasher::default();
+    // Distinct from `hash_row_cells`: callers must not accidentally compare
+    // this trimmed terminal signature with a full-grid signature.
+    hasher.write_u8(2);
+    for cell in &cells[start..end] {
+        hash_cell(&mut hasher, cell);
+    }
+    hasher.finish()
+}
+
+#[inline]
+fn trailing_cell_is_visually_empty(cell: &Cell) -> bool {
+    cell.is_empty() && cell.bg.a == 0 && cell.attrs.is_empty() && !cell.wide_continuation
 }
 
 #[inline]
@@ -273,19 +326,31 @@ impl LineQuadCache {
         cell_h: f32,
     ) -> Option<&CachedLineState> {
         let cached = self.lines.get_mut(&(node, line_id))?;
-        if cached.content_sig != content_sig || cached.geometry != Some(geometry) {
+        if cached.content_sig != content_sig {
             return None;
         }
-        if cached.cached_row != current_row {
-            let dy = (current_row as f32 - cached.cached_row as f32) * cell_h;
+        let old_geometry = cached.geometry?;
+        if old_geometry != geometry && !old_geometry.retarget_compatible(geometry) {
+            return None;
+        }
+        let dx = geometry.origin_x() - old_geometry.origin_x();
+        let dy = geometry.origin_y() - old_geometry.origin_y()
+            + (current_row as f32 - cached.cached_row as f32) * cell_h;
+        if dx != 0.0 || dy != 0.0 || old_geometry.clip_bits != geometry.clip_bits {
+            let clip_rect = geometry.clip_rect();
             for q in cached.quads.iter_mut() {
+                q.pos[0] += dx;
                 q.pos[1] += dy;
+                q.clip_rect = clip_rect;
             }
             for g in cached.glyphs.iter_mut() {
+                g.pos[0] += dx;
                 g.pos[1] += dy;
+                g.clip_rect = clip_rect;
             }
-            cached.cached_row = current_row;
         }
+        cached.geometry = Some(geometry);
+        cached.cached_row = current_row;
         Some(cached)
     }
 
@@ -294,6 +359,15 @@ impl LineQuadCache {
     /// identities don't linger and leak memory.
     pub fn retain_element_ids(&mut self, node: NodeId, retain_ids: &rustc_hash::FxHashSet<u64>) {
         self.lines.retain(|(n, id), _| *n != node || retain_ids.contains(id));
+    }
+
+    /// Count cached rows owned by one grid element.
+    ///
+    /// Callers use this as a cheap guard before allocating a retain set: a
+    /// normal render with a stable viewport already has exactly one entry per
+    /// live row, so there is nothing to prune.
+    pub fn element_line_count(&self, node: NodeId) -> usize {
+        self.lines.keys().filter(|(cached_node, _)| *cached_node == node).count()
     }
 
     /// Drop every cached row for a single element. Used on
@@ -652,6 +726,46 @@ mod tests {
         assert!(
             (hit.quads[0].pos[1] - stored_y).abs() < f32::EPSILON,
             "Y must remain at {stored_y} when cached_row == current_row",
+        );
+    }
+
+    #[test]
+    fn lookup_and_retarget_reuses_row_across_viewport_geometry_changes() {
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let old =
+            LineGeometrySig::new(10.0, 20.0, 9.0, 18.0, 14.0, 1.0, [0.0, 0.0, 80.0, 60.0], 80, 0);
+        let next =
+            LineGeometrySig::new(30.0, 40.0, 9.0, 18.0, 14.0, 1.0, [5.0, 6.0, 100.0, 70.0], 96, 0);
+        let mut quad = QuadInstance::zeroed();
+        quad.pos = [10.0, 20.0];
+        quad.clip_rect = [0.0, 0.0, 80.0, 60.0];
+        let mut glyph = GlyphInstance::zeroed();
+        glyph.pos = [10.0, 20.0];
+        glyph.clip_rect = [0.0, 0.0, 80.0, 60.0];
+        cache.store(node, 7, 0xbeef, old, vec![quad], vec![glyph], vec![], vec![], 0);
+
+        let hit = cache
+            .lookup_and_retarget(node, 7, 0xbeef, next, 0, 18.0)
+            .expect("unchanged row content must survive viewport-only resize");
+        assert_eq!(hit.quads[0].pos, [30.0, 40.0]);
+        assert_eq!(hit.glyphs[0].pos, [30.0, 40.0]);
+        assert_eq!(hit.quads[0].clip_rect, [5.0, 6.0, 100.0, 70.0]);
+        assert_eq!(hit.glyphs[0].clip_rect, [5.0, 6.0, 100.0, 70.0]);
+    }
+
+    #[test]
+    fn visible_row_hash_ignores_trailing_transparent_blanks() {
+        let mut narrow = CellGrid::new(1, 2);
+        let mut wide = CellGrid::new(1, 4);
+        let fg = Color::WHITE;
+        let bg = Color::TRANSPARENT;
+        narrow.set_cell(0, 0, mk_cell('x', fg, bg));
+        wide.set_cell(0, 0, mk_cell('x', fg, bg));
+        assert_eq!(
+            hash_row_visible_cells(narrow.cells(), 0, narrow.cols()),
+            hash_row_visible_cells(wide.cells(), 0, wide.cols()),
+            "terminal growth that only appends transparent blanks must retain the row cache"
         );
     }
 

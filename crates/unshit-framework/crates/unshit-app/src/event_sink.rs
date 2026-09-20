@@ -1,5 +1,8 @@
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use unshit_core::cell_grid::CellGrid;
+use unshit_core::id::{NodeId, NodeRef};
 use winit::event_loop::EventLoopProxy;
 
 /// Opaque event type that external sources push into the framework.
@@ -22,10 +25,30 @@ pub enum ExternalEvent {
     MinimizeWindow,
     /// Toggle the application window between maximized and restored states.
     ToggleMaximizeWindow,
+    /// Ask the native window manager to resize the drawable surface. The
+    /// resulting surface notification follows the ordinary resize path, so
+    /// layout and GPU configuration retain their usual coalescing behavior.
+    RequestSurfaceSize { width: u32, height: u32 },
     /// User-defined payload (type-erased).
     Custom(Box<dyn std::any::Any + Send>),
     /// Zero-copy byte payload. Only the Arc refcount is bumped on send.
     Bytes(Arc<[u8]>),
+    /// Replace one mounted grid's same-sized content and repaint that node
+    /// without rebuilding the element tree. [`EventSink::send`] coalesces
+    /// successive patches for the same mounted node before they enter the
+    /// external-event queue. A stale or unmounted reference safely falls
+    /// back to a rebuild at delivery time.
+    GridPatch { node: NodeRef, grid: Box<CellGrid> },
+    /// Replace a mounted grid whose cell dimensions changed while its element
+    /// box remains layout-independent (for example, a terminal viewport).
+    /// This is delivered directly rather than merged with high-rate output
+    /// patches so a resize cannot be overwritten by an older grid snapshot.
+    GridResizePatch { node: NodeRef, grid: Box<CellGrid> },
+    /// Internal notification emitted after [`EventSink`] has accumulated one
+    /// or more latest-wins grid patches. Application code should use
+    /// [`ExternalEvent::GridPatch`] instead.
+    #[doc(hidden)]
+    DrainGridPatches,
     /// Hot-reload: a new stylesheet was parsed from a watched CSS file.
     #[cfg(feature = "hot-reload")]
     StylesheetReload(Box<unshit_core::style::parse::CompiledStylesheet>),
@@ -48,6 +71,50 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+#[derive(Default)]
+struct PendingGridPatches {
+    patches: HashMap<NodeId, Box<CellGrid>>,
+    drain_enqueued: bool,
+}
+
+/// Per-application latest-wins storage for high-rate paint-only grid updates.
+/// It is shared by every [`EventSink`] made by an [`crate::app::App`].
+///
+/// The lock deliberately covers only a HashMap insert/drain. It keeps a PTY
+/// producer from allocating one queued event per parsed output batch when the
+/// UI thread is already waiting to paint; the next drain receives the latest
+/// complete grid for each node instead.
+#[derive(Default)]
+pub(crate) struct GridPatchStore {
+    pending: Mutex<PendingGridPatches>,
+}
+
+impl GridPatchStore {
+    fn push(
+        &self,
+        node_id: NodeId,
+        grid: Box<CellGrid>,
+        tx: &flume::Sender<ExternalEvent>,
+    ) -> Result<(), SendError> {
+        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.patches.insert(node_id, grid);
+        if !pending.drain_enqueued {
+            tx.send(ExternalEvent::DrainGridPatches).map_err(|err| SendError(err.into_inner()))?;
+            pending.drain_enqueued = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take(&self) -> HashMap<NodeId, Box<CellGrid>> {
+        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Clear this under the same lock that producers use. A producer that
+        // arrives after the drain takes ownership will enqueue the next wake,
+        // so no output update can be stranded between frames.
+        pending.drain_enqueued = false;
+        std::mem::take(&mut pending.patches)
+    }
+}
+
 /// Handle given to external producers. `Clone + Send + Sync`.
 ///
 /// Pushing an event wakes the event loop automatically.
@@ -56,14 +123,24 @@ impl std::error::Error for SendError {}
 pub struct EventSink {
     tx: flume::Sender<ExternalEvent>,
     proxy: Arc<OnceLock<EventLoopProxy>>,
+    grid_patches: Arc<GridPatchStore>,
 }
 
 impl EventSink {
+    #[cfg(test)]
     pub(crate) fn new(
         tx: flume::Sender<ExternalEvent>,
         proxy: Arc<OnceLock<EventLoopProxy>>,
     ) -> Self {
-        Self { tx, proxy }
+        Self::with_grid_patch_store(tx, proxy, Arc::default())
+    }
+
+    pub(crate) fn with_grid_patch_store(
+        tx: flume::Sender<ExternalEvent>,
+        proxy: Arc<OnceLock<EventLoopProxy>>,
+        grid_patches: Arc<GridPatchStore>,
+    ) -> Self {
+        Self { tx, proxy, grid_patches }
     }
 
     /// Send an event and wake the UI loop.
@@ -72,6 +149,9 @@ impl EventSink {
     /// If the event loop has not started yet the event is buffered in the
     /// channel and will be drained on the first `proxy_wake_up`.
     pub fn send(&self, event: ExternalEvent) -> Result<(), SendError> {
+        if let ExternalEvent::GridPatch { node, grid } = event {
+            return self.send_grid_patch(node, grid);
+        }
         self.tx.send(event).map_err(|e| SendError(e.into_inner()))?;
         if let Some(proxy) = self.proxy.get() {
             proxy.wake_up();
@@ -81,7 +161,29 @@ impl EventSink {
 
     /// Async-compatible send for use inside tokio/async-std tasks.
     pub async fn send_async(&self, event: ExternalEvent) -> Result<(), SendError> {
+        if let ExternalEvent::GridPatch { node, grid } = event {
+            // The queue is unbounded, so the synchronous latest-wins insert
+            // never waits for capacity. Keeping this path shared with `send`
+            // prevents async producers from bypassing output coalescing.
+            return self.send_grid_patch(node, grid);
+        }
         self.tx.send_async(event).await.map_err(|e| SendError(e.into_inner()))?;
+        if let Some(proxy) = self.proxy.get() {
+            proxy.wake_up();
+        }
+        Ok(())
+    }
+
+    fn send_grid_patch(&self, node: NodeRef, grid: Box<CellGrid>) -> Result<(), SendError> {
+        if let Some(node_id) = node.get() {
+            self.grid_patches.push(node_id, grid, &self.tx)?;
+        } else {
+            // Preserve the documented stale-reference fallback without
+            // retaining an unaddressable grid allocation in the store.
+            self.tx
+                .send(ExternalEvent::RequestRebuild)
+                .map_err(|err| SendError(err.into_inner()))?;
+        }
         if let Some(proxy) = self.proxy.get() {
             proxy.wake_up();
         }
@@ -101,6 +203,23 @@ impl EventSink {
     /// Toggle the application window between maximized and restored states.
     pub fn toggle_maximize_window(&self) -> Result<(), SendError> {
         self.send(ExternalEvent::ToggleMaximizeWindow)
+    }
+
+    /// Request a new native drawable-surface size. The platform may apply the
+    /// request asynchronously; consumers should observe layout through their
+    /// ordinary resize callbacks rather than assuming an immediate change.
+    pub fn request_surface_size(&self, width: u32, height: u32) -> Result<(), SendError> {
+        self.send(ExternalEvent::RequestSurfaceSize { width, height })
+    }
+
+    /// Replace a terminal-style grid after its rows or columns changed,
+    /// without rebuilding unrelated UI.
+    pub fn send_grid_resize_patch(
+        &self,
+        node: NodeRef,
+        grid: Box<CellGrid>,
+    ) -> Result<(), SendError> {
+        self.send(ExternalEvent::GridResizePatch { node, grid })
     }
 
     /// Async variant of send_bytes.
@@ -123,6 +242,27 @@ mod tests {
     fn bytes_variant_constructs() {
         let data: Arc<[u8]> = Arc::from(b"hello".as_ref());
         let _event = ExternalEvent::Bytes(data);
+    }
+
+    #[test]
+    fn grid_patches_coalesce_to_the_latest_grid_for_a_node() {
+        let (sink, rx) = make_sink();
+        let node = NodeRef::new();
+        node.set(NodeId { index: 9, generation: 3 });
+
+        sink.send(ExternalEvent::GridPatch {
+            node: node.clone(),
+            grid: Box::new(CellGrid::new(2, 2)),
+        })
+        .unwrap();
+        sink.send(ExternalEvent::GridPatch { node, grid: Box::new(CellGrid::new(3, 4)) }).unwrap();
+
+        assert!(matches!(rx.try_recv().unwrap(), ExternalEvent::DrainGridPatches));
+        assert!(rx.try_recv().is_err(), "one wake marker per pending drain");
+        let patches = sink.grid_patches.take();
+        assert_eq!(patches.len(), 1);
+        let grid = patches.values().next().expect("latest grid");
+        assert_eq!((grid.rows(), grid.cols()), (3, 4));
     }
 
     #[test]

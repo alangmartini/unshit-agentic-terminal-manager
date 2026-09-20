@@ -180,37 +180,48 @@ pub fn resolve_style_with_pseudo(
     // definition, and the live path here drops it rather than silently applying.
     let mut deferred_dropped = Vec::new();
 
-    for rule in &stylesheet.rules {
-        let rule_pseudo = rule.selector.pseudo_element();
-        if rule_pseudo != pseudo_target {
-            continue;
-        }
-        if selector_matches(
-            &rule.selector,
-            element,
-            arena,
-            node_id,
-            hovered,
-            active,
-            focused,
-            focus_via_keyboard,
-        ) {
-            for decl in &rule.declarations {
-                match decl {
-                    StyleDeclaration::Deferred { property, raw_value, scope_hint } => {
-                        apply_deferred_against_env_memoized(
-                            &mut style,
-                            property,
-                            raw_value,
-                            *scope_hint,
-                            &env,
-                            &mut deferred_dropped,
-                            stylesheet_id,
-                            active_root_scope,
-                            has_self_scope,
-                        );
+    let candidate_mask = stylesheet.rule_candidates.matching_mask(
+        element.tag_name(),
+        element.id.as_deref(),
+        &element.classes,
+    );
+    for (word_index, word) in candidate_mask.into_iter().enumerate() {
+        let mut remaining = word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            let rule = &stylesheet.rules[word_index * 64 + bit];
+            let rule_pseudo = rule.selector.pseudo_element();
+            if rule_pseudo != pseudo_target {
+                continue;
+            }
+            if selector_matches(
+                &rule.selector,
+                element,
+                arena,
+                node_id,
+                hovered,
+                active,
+                focused,
+                focus_via_keyboard,
+            ) {
+                for decl in &rule.declarations {
+                    match decl {
+                        StyleDeclaration::Deferred { property, raw_value, scope_hint } => {
+                            apply_deferred_against_env_memoized(
+                                &mut style,
+                                property,
+                                raw_value,
+                                *scope_hint,
+                                &env,
+                                &mut deferred_dropped,
+                                stylesheet_id,
+                                active_root_scope,
+                                has_self_scope,
+                            );
+                        }
+                        _ => apply_declaration(&mut style, decl),
                     }
-                    _ => apply_declaration(&mut style, decl),
                 }
             }
         }
@@ -303,10 +314,8 @@ pub fn resolve_selection_style(
     let mut color: Option<Color> = None;
     let mut bg: Option<Color> = None;
     let mut matched = false;
-    for rule in &stylesheet.rules {
-        if rule.selector.pseudo_element() != Some(PseudoElement::Selection) {
-            continue;
-        }
+    for &rule_index in &stylesheet.selection_rules {
+        let rule = &stylesheet.rules[rule_index];
         if selector_matches(
             &rule.selector,
             element,

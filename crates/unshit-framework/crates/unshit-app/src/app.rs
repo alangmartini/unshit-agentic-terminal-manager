@@ -1,7 +1,7 @@
 use crate::animation_waker::AnimationWaker;
 use crate::clipboard::ClipboardContext;
 use crate::compositor_clock::CompositorClockWaker;
-use crate::event_sink::{EventSink, ExternalEvent};
+use crate::event_sink::{EventSink, ExternalEvent, GridPatchStore};
 use crate::notification::{AttentionUrgency, BellConfig, BellState};
 use crate::scroll_motion::{
     browser_like_initial_slope, browser_like_wheel_duration, dominant_delta, ScrollMotion,
@@ -18,9 +18,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unshit_core::build::{
-    build_tree_from_def, dispatch_resize_callbacks, mark_layout_dirty, mark_node_paint_dirty,
-    mark_paint_dirty, resolve_all_styles, resolve_all_styles_with_transitions, run_layout_pipeline,
-    scale_all_styles, sync_all_animations, tick_all_animations, tick_all_transitions,
+    build_tree_from_def, dispatch_resize_callbacks_with_result, mark_layout_dirty,
+    mark_node_paint_dirty, resolve_all_styles, resolve_all_styles_with_transitions,
+    run_layout_pipeline, scale_all_styles, sync_all_animations, tick_all_animations,
+    tick_all_transitions, ResizeDispatchResult,
 };
 use unshit_core::dirty::DirtyFlags;
 use unshit_core::element::*;
@@ -35,7 +36,7 @@ use unshit_core::style::theme::Theme;
 use unshit_core::style::transition::ActiveTransitions;
 use unshit_core::style::types::Layer;
 use unshit_core::tree::NodeArena;
-use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache};
+use unshit_renderer::batch::{self, BatchCache, ShapeCache, ShapedTextCache, UiGlyphPrewarm};
 use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
@@ -274,6 +275,14 @@ pub struct AppConfig {
     pub theme: Theme,
     /// Maximum atlas memory in bytes.
     pub max_atlas_bytes: Option<usize>,
+    /// Small, static UI text set rasterized while the startup splash is still
+    /// visible. This moves one-time glyph atlas work out of the first
+    /// interaction with a rarely opened route.
+    pub ui_glyph_prewarm: &'static [UiGlyphPrewarm],
+    /// Optional detached route tree to lay out and batch while the startup
+    /// splash is visible. This primes the same text-measure and glyph-atlas
+    /// caches used by a later route transition without retaining the tree.
+    pub startup_prewarm_tree: Option<Arc<dyn Fn() -> ElementTree + Send + Sync>>,
     /// Path to a CSS file for hot-reload. When set with the `hot-reload`
     /// feature enabled, the framework watches this file and re-parses on change.
     pub css_path: Option<std::path::PathBuf>,
@@ -387,6 +396,8 @@ impl Default for AppConfig {
             fallback_chain: crate::font::FallbackChain::default_chain(),
             theme: Theme::dark(),
             max_atlas_bytes: None,
+            ui_glyph_prewarm: &[],
+            startup_prewarm_tree: None,
             css_path: None,
             on_frame_metrics: None,
             on_glyph_atlas_recovery: None,
@@ -427,6 +438,9 @@ pub struct App {
     event_tx: flume::Sender<ExternalEvent>,
     event_rx: flume::Receiver<ExternalEvent>,
     proxy_cell: Arc<OnceLock<EventLoopProxy>>,
+    /// Latest-wins store shared by all external event sinks. It prevents
+    /// high-rate grid producers from filling the queue with obsolete frames.
+    grid_patches: Arc<GridPatchStore>,
     /// The single persistent animation waker shared by every animation
     /// producer (container smooth scroll, grid-animation hooks). Replaces
     /// the per-wheel-notch waker threads; see [`crate::animation_waker`].
@@ -473,6 +487,16 @@ pub struct FrameMetrics {
     pub style_resolve_scope: StyleResolveScope,
     pub scale_us: u64,
     pub layout_us: u64,
+    /// New text-measure cache entries created during this layout pass.
+    pub text_measure_cache_new_entries: usize,
+    /// CPU wall time spent reconfiguring the GPU surface for a new native
+    /// drawable size. Live resize can block here even when layout and batch
+    /// construction remain cheap.
+    pub surface_resize_us: u64,
+    /// CPU wall time spent sampling the native maximized state after a
+    /// resize or move notification. Kept separate because this crosses the
+    /// platform window boundary on macOS.
+    pub window_maximized_sync_us: u64,
     pub batch_build_us: u64,
     /// CPU time spent encoding and submitting the frame's render passes
     /// (wall time of `gpu.render()` on the render thread, minus swapchain
@@ -574,13 +598,15 @@ impl std::fmt::Display for FrameMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms ({})  scale {:.1}ms  layout {:.1}ms  batch {:.1}ms  gpu {:.1}ms  acquire {:.1}ms  hold {:.1}ms  present {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
+            "frame {:.1}ms | tree {:.1}ms  style {:.1}ms ({})  scale {:.1}ms  layout {:.1}ms  surface {:.1}ms  maximized {:.1}ms  batch {:.1}ms  gpu {:.1}ms  acquire {:.1}ms  hold {:.1}ms  present {:.1}ms | nodes {} | quads {} glyphs {} | rss {:.1}MB",
             self.total_us as f64 / 1000.0,
             self.tree_build_us as f64 / 1000.0,
             self.style_resolve_us as f64 / 1000.0,
             self.style_resolve_scope.as_str(),
             self.scale_us as f64 / 1000.0,
             self.layout_us as f64 / 1000.0,
+            self.surface_resize_us as f64 / 1000.0,
+            self.window_maximized_sync_us as f64 / 1000.0,
             self.batch_build_us as f64 / 1000.0,
             self.gpu_render_us as f64 / 1000.0,
             self.present_wait_us as f64 / 1000.0,
@@ -610,6 +636,30 @@ struct AppState {
     needs_rebuild: bool,
     needs_restyle: bool,
     needs_relayout: bool,
+    /// Most recent native surface metrics observed since the last paint.
+    ///
+    /// AppKit emits a `SurfaceResized` event for every live-resize step, but
+    /// `wgpu::Surface::configure` waits for the GPU to become idle. Applying
+    /// every intermediate size on the UI thread can therefore leave a long
+    /// queue of blocking reconfigures after the mouse is released. Keep only
+    /// the newest metrics and apply them once at the beginning of the next
+    /// frame instead.
+    pending_surface_metrics: Option<PendingSurfaceMetrics>,
+    /// Surface-configuration time associated with the in-progress frame.
+    surface_resize_us: u64,
+    /// Native maximized-state sampling time associated with the in-progress
+    /// frame.
+    window_maximized_sync_us: u64,
+    /// Coalesced request to sample the native maximized state. Window
+    /// managers can emit a burst of resize/move notifications while a live
+    /// resize is in progress; querying `Window::is_maximized()` for each
+    /// notification is surprisingly expensive on macOS. Keep only one
+    /// pending sample and consume it at the next admitted paint.
+    pending_window_maximized_sync: bool,
+    /// Earliest point at which a deferred native maximized-state sample may
+    /// run. Each live-resize event pushes it out so AppKit is queried only
+    /// after the resize settles.
+    window_maximized_sync_not_before: Option<Instant>,
     /// When `Some`, the next `needs_restyle` pass cascades from this node
     /// instead of the document root. Set by hover / focus / active state
     /// changes to the lowest common ancestor of the leaving and entering
@@ -705,6 +755,8 @@ struct AppState {
     /// [`FrameMetrics::present_interval_us`]. `None` until the first
     /// frame has painted.
     last_paint_completed_at: Option<Instant>,
+    /// Failed acquisitions have no display clock to throttle their retries.
+    render_retry: RenderRetry,
     /// Rate limiter for the `renderer.glyph_raster_failure` warn event:
     /// timestamp of the last emitted log line, plus counts accumulated
     /// across the frames suppressed since then.
@@ -803,6 +855,10 @@ fn resize_direction_cursor_icon(direction: ResizeDirection) -> CursorIcon {
 /// keystrokes or PTY chunks without keeping the CPU warm after activity
 /// stops. Matches Ghostty's active-renderer-window concept.
 pub(crate) const ACTIVITY_WINDOW: Duration = Duration::from_millis(250);
+/// Native `Window::is_maximized()` crosses into AppKit on macOS. During a
+/// live resize its result cannot usefully change on every pixel-sized surface
+/// event, so sample it only after resize activity settles.
+const WINDOW_MAXIMIZED_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const SMOOTH_SCROLL_WAKE_GRACE: Duration = Duration::from_millis(48);
 
 /// How the frame loop paces paints, chosen once at startup from the
@@ -1146,6 +1202,40 @@ pub fn apply_scroll_grid_patch(
     }
     mark_node_paint_dirty(arena, node_id);
     true
+}
+
+/// Replace a grid that changed rows or columns without invalidating layout.
+/// Callers must use this only when the element's box is independently laid
+/// out; terminal viewports meet that condition because their flex box owns
+/// geometry while the grid owns only painted cells.
+pub fn apply_grid_resize_patch(
+    arena: &mut NodeArena,
+    node_id: NodeId,
+    grid: unshit_core::cell_grid::CellGrid,
+) -> bool {
+    if !matches!(arena.get(node_id).map(|element| &element.content), Some(ElementContent::Grid(_)))
+    {
+        return false;
+    }
+    if let Some(element) = arena.get_mut(node_id) {
+        element.content = ElementContent::Grid(grid);
+    }
+    mark_node_paint_dirty(arena, node_id);
+    true
+}
+
+/// Keep only the newest grid payload for each mounted node during one event
+/// drain. PTY output can produce several snapshots before the event loop gets
+/// its next turn; rendering an intermediate snapshot cannot improve what is
+/// presented, while repeatedly swapping the retained grid extends the hot
+/// path. The most recent payload is the only one a following paint can show.
+#[inline]
+fn queue_latest_grid_patch(
+    patches: &mut HashMap<NodeId, Box<unshit_core::cell_grid::CellGrid>>,
+    node_id: NodeId,
+    grid: Box<unshit_core::cell_grid::CellGrid>,
+) {
+    patches.insert(node_id, grid);
 }
 
 /// Smallest application zoom factor. Matches Chrome's 25% floor.
@@ -1896,7 +1986,9 @@ fn fast_paint_animation_frame(
             .then(|| state.frame_pacer.presentation_target())
             .flatten(),
     );
-    let presented = state.gpu.render() == RenderOutcome::Presented;
+    let outcome = state.gpu.render();
+    state.render_retry.record(outcome, Instant::now(), state.frame_pacer.min_interval());
+    let presented = outcome == RenderOutcome::Presented;
     // Split display waits out of the work numbers at the source so
     // every downstream consumer of gpu_render_us / total_us keeps
     // measuring CPU work (see FrameMetrics::{present_wait_us,present_hold_us}).
@@ -2076,7 +2168,7 @@ fn finalize_frame_metrics(
     let frame_log = |level: &'static str| {
         let correlation_id = format!("process-{}", std::process::id());
         format!(
-            "{{\"event\":\"renderer.frame_performance\",\"level\":{level:?},\"correlation_id\":{correlation_id:?},\"frame_index\":{},\"budget_us\":8333,\"total_us\":{},\"tree_build_us\":{},\"style_resolve_us\":{},\"style_resolve_scope\":{:?},\"scale_us\":{},\"layout_us\":{},\"batch_build_us\":{},\"gpu_render_us\":{},\"present_wait_us\":{},\"present_hold_us\":{},\"present_call_us\":{},\"node_count\":{},\"quad_count\":{},\"glyph_count\":{},\"display_period_ns\":{}}}",
+            "{{\"event\":\"renderer.frame_performance\",\"level\":{level:?},\"correlation_id\":{correlation_id:?},\"frame_index\":{},\"budget_us\":8333,\"total_us\":{},\"tree_build_us\":{},\"style_resolve_us\":{},\"style_resolve_scope\":{:?},\"scale_us\":{},\"layout_us\":{},\"text_measure_cache_new_entries\":{},\"surface_resize_us\":{},\"window_maximized_sync_us\":{},\"batch_build_us\":{},\"gpu_render_us\":{},\"present_wait_us\":{},\"present_hold_us\":{},\"present_call_us\":{},\"node_count\":{},\"quad_count\":{},\"glyph_count\":{},\"atlas_fill_ratio\":{},\"gpu_upload_bytes\":{},\"display_period_ns\":{}}}",
             state.frame_count,
             metrics.total_us,
             metrics.tree_build_us,
@@ -2084,6 +2176,9 @@ fn finalize_frame_metrics(
             metrics.style_resolve_scope.as_str(),
             metrics.scale_us,
             metrics.layout_us,
+            metrics.text_measure_cache_new_entries,
+            metrics.surface_resize_us,
+            metrics.window_maximized_sync_us,
             metrics.batch_build_us,
             metrics.gpu_render_us,
             metrics.present_wait_us,
@@ -2092,6 +2187,8 @@ fn finalize_frame_metrics(
             metrics.node_count,
             metrics.quad_count,
             metrics.glyph_count,
+            metrics.atlas_fill_ratio,
+            metrics.gpu_upload_bytes,
             metrics.display_period_ns,
         )
     };
@@ -2265,6 +2362,16 @@ enum SurfaceMetricsChange {
     Rebuild,
 }
 
+/// Latest native surface metrics waiting to be applied at a paint boundary.
+///
+/// This deliberately stores physical pixels: that is the unit used by the
+/// swapchain and by the layout viewport throughout the framework.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingSurfaceMetrics {
+    size: PhysicalSize<u32>,
+    scale_factor: f32,
+}
+
 fn classify_surface_metrics_change(
     current_size: (f32, f32),
     current_scale: f32,
@@ -2299,7 +2406,9 @@ fn reconcile_surface_metrics(
 
     if new_size.width > 0 && new_size.height > 0 {
         if (current_size.0 as u32) != new_size.width || (current_size.1 as u32) != new_size.height {
+            let started = Instant::now();
             state.gpu.resize(new_size);
+            state.surface_resize_us = started.elapsed().as_micros() as u64;
         }
     }
 
@@ -2323,16 +2432,85 @@ fn reconcile_surface_metrics(
     change
 }
 
-fn reconcile_surface_metrics_from_window(
+/// Merge an incoming native surface event into the latest pending metrics.
+///
+/// Compare against an already-pending event when present, rather than the
+/// last configured surface. A scale-factor change commonly arrives just
+/// before its matching resize on macOS; treating that pair as independent
+/// changes would defeat coalescing and schedule needless redraws.
+fn coalesce_surface_metrics(
+    pending: &mut Option<PendingSurfaceMetrics>,
+    configured_size: (f32, f32),
+    configured_scale: f32,
+    new_size: PhysicalSize<u32>,
+    new_scale: f32,
+) -> SurfaceMetricsChange {
+    let previous = pending.unwrap_or(PendingSurfaceMetrics {
+        size: PhysicalSize::new(
+            configured_size.0.max(0.0) as u32,
+            configured_size.1.max(0.0) as u32,
+        ),
+        scale_factor: configured_scale,
+    });
+    let change = classify_surface_metrics_change(
+        (previous.size.width as f32, previous.size.height as f32),
+        previous.scale_factor,
+        new_size,
+        new_scale,
+    );
+    if !matches!(change, SurfaceMetricsChange::None) {
+        *pending = Some(PendingSurfaceMetrics { size: new_size, scale_factor: new_scale });
+    }
+    change
+}
+
+/// Defer a native surface event until the next `RedrawRequested` frame.
+///
+/// This keeps winit's high-frequency live-resize notifications inexpensive
+/// and ensures the potentially blocking GPU surface reconfigure happens at
+/// most once for a burst of events.
+fn defer_surface_metrics(
+    state: &mut AppState,
+    new_size: PhysicalSize<u32>,
+    new_scale: f32,
+) -> SurfaceMetricsChange {
+    coalesce_surface_metrics(
+        &mut state.pending_surface_metrics,
+        state.gpu.window_size(),
+        state.scale_factor,
+        new_size,
+        new_scale,
+    )
+}
+
+fn defer_surface_metrics_from_window(state: &mut AppState) -> SurfaceMetricsChange {
+    defer_surface_metrics(state, state.window.surface_size(), state.window.scale_factor() as f32)
+}
+
+/// A native maximized-state query is expensive on macOS and can itself cause
+/// AppKit to deliver another window event. Only schedule one when that event
+/// reported a real surface-metric change; same-size notifications must not
+/// perpetuate the query/event cycle.
+#[inline]
+fn should_defer_window_maximized_sync(
+    metrics_change: SurfaceMetricsChange,
+    has_callback: bool,
+) -> bool {
+    has_callback && !matches!(metrics_change, SurfaceMetricsChange::None)
+}
+
+/// Apply the newest deferred native metrics exactly once at the start of a
+/// frame. This is the only deferred path that may reconfigure the GPU surface
+/// or invoke the application scale-factor callback.
+fn apply_pending_surface_metrics(
     state: &mut AppState,
     on_scale_factor: Option<&Arc<dyn Fn(f32) + Send + Sync>>,
 ) -> SurfaceMetricsChange {
-    reconcile_surface_metrics(
-        state,
-        state.window.surface_size(),
-        state.window.scale_factor() as f32,
-        on_scale_factor,
-    )
+    let Some(PendingSurfaceMetrics { size, scale_factor }) = state.pending_surface_metrics.take()
+    else {
+        return SurfaceMetricsChange::None;
+    };
+    reconcile_surface_metrics(state, size, scale_factor, on_scale_factor)
 }
 
 fn publish_window_maximized_change(
@@ -2360,6 +2538,61 @@ fn sync_window_maximized_from_window(
         state.window.is_maximized(),
         on_window_maximized,
     )
+}
+
+/// Mark a native maximized-state sample as needed without touching the
+/// platform window API. Resize and move notifications are delivered in large
+/// bursts during a live drag, so the actual query is performed once from the
+/// admitted paint path below.
+#[inline]
+fn mark_window_maximized_sync_pending(pending: &mut bool) {
+    *pending = true;
+}
+
+#[inline]
+fn defer_window_maximized_sync(state: &mut AppState) {
+    mark_window_maximized_sync_pending(&mut state.pending_window_maximized_sync);
+    state.window_maximized_sync_not_before =
+        Some(Instant::now() + WINDOW_MAXIMIZED_SYNC_MIN_INTERVAL);
+}
+
+#[inline]
+fn window_maximized_sync_due_at(not_before: Option<Instant>, now: Instant) -> Instant {
+    not_before.unwrap_or(now)
+}
+
+#[cfg(test)]
+#[inline]
+fn take_window_maximized_sync_pending(pending: &mut bool) -> bool {
+    std::mem::take(pending)
+}
+
+/// Consume one deferred native maximized-state sample. Returning `true`
+/// means the callback observed a real state transition and the current paint
+/// should rebuild the tree.
+fn sync_deferred_window_maximized(
+    state: &mut AppState,
+    on_window_maximized: Option<&Arc<dyn Fn(bool) + Send + Sync>>,
+    now: Instant,
+) -> bool {
+    if !state.pending_window_maximized_sync
+        || now < window_maximized_sync_due_at(state.window_maximized_sync_not_before, now)
+    {
+        return false;
+    }
+
+    // No consumer means there is no reason to cross the platform boundary at
+    // all. This also keeps applications that do not use the callback on the
+    // cheapest resize path.
+    if on_window_maximized.is_none() {
+        state.pending_window_maximized_sync = false;
+        state.window_maximized_sync_not_before = None;
+        return false;
+    }
+
+    state.pending_window_maximized_sync = false;
+    state.window_maximized_sync_not_before = None;
+    sync_window_maximized_from_window(state, on_window_maximized)
 }
 
 impl AppState {
@@ -2408,6 +2641,7 @@ impl App {
     pub fn new(config: AppConfig, tree_fn: impl Fn() -> ElementTree + 'static) -> Self {
         let (event_tx, event_rx) = flume::unbounded();
         let proxy_cell: Arc<OnceLock<EventLoopProxy>> = Arc::new(OnceLock::new());
+        let grid_patches = Arc::new(GridPatchStore::default());
         Self {
             config,
             tree_fn: Box::new(tree_fn),
@@ -2430,6 +2664,7 @@ impl App {
             event_tx,
             event_rx,
             proxy_cell,
+            grid_patches,
             canvas_registry: CanvasRegistry::new(),
             clipboard: Arc::new(ClipboardContext::new()),
             #[cfg(feature = "async")]
@@ -2446,7 +2681,11 @@ impl App {
     /// Must be called before [`run`](Self::run) to buffer events that arrive
     /// before the event loop starts.
     pub fn event_sink(&self) -> EventSink {
-        EventSink::new(self.event_tx.clone(), Arc::clone(&self.proxy_cell))
+        EventSink::with_grid_patch_store(
+            self.event_tx.clone(),
+            Arc::clone(&self.proxy_cell),
+            Arc::clone(&self.grid_patches),
+        )
     }
 
     /// Returns a shared reference to the clipboard context.
@@ -2596,15 +2835,146 @@ impl App {
 /// The bring-up milestones reported to [`AppConfig::on_startup_stage`], in the
 /// order they fire. Exposed so callers can pre-size storage and assert on the
 /// full set rather than hard-coding string literals.
-pub const STARTUP_STAGES: [&str; 7] = [
+pub const STARTUP_STAGES: [&str; 8] = [
     "window_created",
     "fonts_ready",
     "first_tree_built",
     "first_layout_done",
     "splash_painted",
     "gpu_ready",
+    "ui_glyphs_prewarmed",
     "gpu_swapped",
 ];
+
+fn prewarm_text_measurements(
+    entries: &[UiGlyphPrewarm],
+    scale_factor: f32,
+    font_system: &mut FontSystem,
+    cache: &mut TextMeasureCache,
+) {
+    for entry in entries {
+        let _ = layout::measure_text_with_style_cached(
+            entry.text,
+            entry.font_family,
+            entry.font_weight,
+            entry.font_style,
+            entry.font_size * scale_factor,
+            entry.line_height,
+            entry.letter_spacing,
+            None,
+            font_system,
+            Some(cache),
+        );
+    }
+}
+
+fn prewarm_tree_layout(
+    tree: &ElementTree,
+    stylesheet: &CompiledStylesheet,
+    scale: f32,
+    width: f32,
+    height: f32,
+    font_system: &mut FontSystem,
+    measure_cache: &mut TextMeasureCache,
+) {
+    let mut arena = NodeArena::new();
+    let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+    let root = build_tree_from_def(&tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
+    resolve_all_styles(&mut arena, stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+    let mut pseudo_table = unshit_core::style::pseudo::PseudoSideTable::new();
+    unshit_core::build::resolve_pseudo_elements(
+        &mut arena,
+        &mut taffy,
+        stylesheet,
+        root,
+        NodeId::DANGLING,
+        None,
+        NodeId::DANGLING,
+        &mut pseudo_table,
+    );
+    scale_all_styles(&mut arena, root, scale);
+    let _ = run_layout_pipeline(
+        &mut arena,
+        &mut taffy,
+        root,
+        font_system,
+        width,
+        height,
+        measure_cache,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prewarm_tree_glyphs(
+    tree: &ElementTree,
+    stylesheet: &CompiledStylesheet,
+    scale: f32,
+    width: f32,
+    height: f32,
+    gpu: &mut GpuContext,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    subpixel_swash_cache: &mut SubpixelSwashCache,
+    #[cfg(target_os = "windows")] dw_rasterizer: &DwRasterizer,
+    measure_cache: &mut TextMeasureCache,
+) {
+    let mut arena = NodeArena::new();
+    let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+    let root = build_tree_from_def(&tree.root, &mut arena, &mut taffy, NodeId::DANGLING);
+    resolve_all_styles(&mut arena, stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
+    let mut pseudo_table = unshit_core::style::pseudo::PseudoSideTable::new();
+    unshit_core::build::resolve_pseudo_elements(
+        &mut arena,
+        &mut taffy,
+        stylesheet,
+        root,
+        NodeId::DANGLING,
+        None,
+        NodeId::DANGLING,
+        &mut pseudo_table,
+    );
+    scale_all_styles(&mut arena, root, scale);
+    let _ = run_layout_pipeline(
+        &mut arena,
+        &mut taffy,
+        root,
+        font_system,
+        width,
+        height,
+        measure_cache,
+    );
+    unshit_core::build::mark_paint_dirty(&mut arena, root);
+
+    let mut batch_out = batch::LayeredBatch::new();
+    let mut rasterizer = Rasterizer {
+        swash: swash_cache,
+        subpixel_swash: subpixel_swash_cache,
+        #[cfg(target_os = "windows")]
+        dw: dw_rasterizer,
+    };
+    let mut shaped_cache = ShapedTextCache::new();
+    let mut shape_cache = ShapeCache::new();
+    let mut batch_cache = BatchCache::new();
+    let mut line_cache = unshit_renderer::line_quad_cache::LineQuadCache::new();
+    batch::build_render_batch(
+        &arena,
+        root,
+        &mut batch_out,
+        &mut gpu.glyph_atlas,
+        font_system,
+        &mut rasterizer,
+        measure_cache,
+        &mut shaped_cache,
+        &mut gpu.svg_cache,
+        &mut shape_cache,
+        None,
+        None,
+        &ScrollbarVisualState::default(),
+        NodeId::DANGLING,
+        &mut batch_cache,
+        Some(&mut line_cache),
+    );
+}
 
 /// The id that ties every structured startup line from this process together.
 ///
@@ -2922,8 +3292,8 @@ impl AppHandler {
             startup_refresh_mhz,
             stylesheet,
             mut font_system,
-            swash_cache,
-            subpixel_swash_cache,
+            mut swash_cache,
+            mut subpixel_swash_cache,
             #[cfg(target_os = "windows")]
             dw_rasterizer,
             mut arena,
@@ -2986,6 +3356,41 @@ impl AppHandler {
         if let Some(max_bytes) = self.app.config.max_atlas_bytes {
             let derived_size = (max_bytes as f64).sqrt() as u32;
             gpu.glyph_atlas.max_size = derived_size.max(512);
+        }
+
+        if !self.app.config.ui_glyph_prewarm.is_empty() {
+            let mut rasterizer = Rasterizer {
+                swash: &mut swash_cache,
+                subpixel_swash: &mut subpixel_swash_cache,
+                #[cfg(target_os = "windows")]
+                dw: &dw_rasterizer,
+            };
+            batch::prewarm_ui_glyphs(
+                self.app.config.ui_glyph_prewarm,
+                effective_scale(scale_factor, zoom_factor),
+                &mut gpu.glyph_atlas,
+                &mut font_system,
+                &mut rasterizer,
+            );
+            self.mark_startup("ui_glyphs_prewarmed");
+        }
+
+        if let Some(build_prewarm_tree) = self.app.config.startup_prewarm_tree.as_ref() {
+            let (surface_w, surface_h) = gpu.window_size();
+            prewarm_tree_glyphs(
+                &build_prewarm_tree(),
+                &stylesheet,
+                effective_scale(scale_factor, zoom_factor),
+                surface_w,
+                surface_h,
+                &mut gpu,
+                &mut font_system,
+                &mut swash_cache,
+                &mut subpixel_swash_cache,
+                #[cfg(target_os = "windows")]
+                &dw_rasterizer,
+                &mut measure_cache,
+            );
         }
 
         // The layout was computed against the window; the surface is what will
@@ -3091,6 +3496,11 @@ impl AppHandler {
             needs_rebuild: false,
             needs_restyle: false,
             needs_relayout: false,
+            pending_surface_metrics: None,
+            surface_resize_us: 0,
+            window_maximized_sync_us: 0,
+            pending_window_maximized_sync: false,
+            window_maximized_sync_not_before: None,
             restyle_root: None,
             scale_factor,
             window_maximized: initial_window_maximized,
@@ -3134,6 +3544,7 @@ impl AppHandler {
             frame_probe: crate::frame_probe::FrameProbe::new(),
             interval_probe: crate::frame_probe::FrameProbe::new(),
             last_paint_completed_at: None,
+            render_retry: RenderRetry::default(),
             last_glyph_drop_log: None,
             glyph_drop_failures_accum: 0,
             glyph_drop_bypasses_accum: 0,
@@ -3149,9 +3560,16 @@ impl AppHandler {
 
         // Run the initial subscription reconcile so streams start immediately.
         #[cfg(feature = "async")]
+        let subscription_sink = EventSink::with_grid_patch_store(
+            self.app.event_tx.clone(),
+            Arc::clone(&self.app.proxy_cell),
+            Arc::clone(&self.app.grid_patches),
+        );
+        #[cfg(feature = "async")]
+        let subscription_runtime = self.app.runtime.handle().clone();
+        #[cfg(feature = "async")]
         if let Some(ref mut mgr) = self.app.subscription_manager {
-            let sink = EventSink::new(self.app.event_tx.clone(), Arc::clone(&self.app.proxy_cell));
-            mgr.reconcile(self.app.runtime.handle(), &sink);
+            mgr.reconcile(&subscription_runtime, &subscription_sink);
         }
 
         // Spawn the hot-reload file watcher if a css_path is configured.
@@ -3224,6 +3642,23 @@ impl AppHandler {
     }
 }
 
+/// Keep failed frames paced even when acquisition returns immediately or
+/// producers keep requesting redraws. Success restores ordinary pacing.
+#[derive(Default)]
+struct RenderRetry {
+    deadline: Option<Instant>,
+}
+
+impl RenderRetry {
+    fn record(&mut self, outcome: RenderOutcome, now: Instant, interval: Duration) {
+        self.deadline = (outcome != RenderOutcome::Presented).then_some(now + interval);
+    }
+
+    fn pending(&self, now: Instant) -> Option<Instant> {
+        self.deadline.filter(|deadline| now < *deadline)
+    }
+}
+
 impl ApplicationHandler for AppHandler {
     fn proxy_wake_up(&mut self, _event_loop: &dyn ActiveEventLoop) {
         let Some(state) = self.app.state.as_mut() else {
@@ -3232,6 +3667,11 @@ impl ApplicationHandler for AppHandler {
         let mut coalescer = RebuildCoalescer::default();
         let mut saw_animation_frame = false;
         let mut compositor_tick = None;
+        // Batch paint-only updates just like rebuild requests: a frame only
+        // ever needs the most recent grid for a node. Deferring application
+        // also lets a true rebuild in this drain supersede all grid swaps.
+        let mut pending_grid_patches = HashMap::new();
+        let mut saw_stale_grid_patch = false;
         coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
             match event {
@@ -3265,8 +3705,12 @@ impl ApplicationHandler for AppHandler {
                     coalescer.observe(false);
                 }
                 ExternalEvent::ToggleMaximizeWindow => {
-                    let maximized = state.window.is_maximized();
-                    let next_maximized = !maximized;
+                    // `Window::is_maximized()` temporarily changes the
+                    // style mask for borderless macOS windows. Keep the
+                    // framework's already-synchronized state here so an
+                    // explicit toggle performs only the platform operation
+                    // needed to change state.
+                    let next_maximized = !state.window_maximized;
                     state.window.set_maximized(next_maximized);
                     publish_window_maximized_change(
                         &mut state.window_maximized,
@@ -3274,6 +3718,27 @@ impl ApplicationHandler for AppHandler {
                         self.app.config.on_window_maximized.as_ref(),
                     );
                     coalescer.observe(true);
+                }
+                ExternalEvent::RequestSurfaceSize { width, height } => {
+                    // Some backends apply this immediately and do not emit a
+                    // later SurfaceResized event. Defer that returned size
+                    // through the same coalesced metric path used by native
+                    // resize notifications; asynchronous backends deliver
+                    // their result through WindowEvent::SurfaceResized.
+                    if let Some(applied_size) =
+                        state.window.request_surface_size(PhysicalSize::new(width, height).into())
+                    {
+                        if !matches!(
+                            defer_surface_metrics(
+                                state,
+                                applied_size,
+                                state.window.scale_factor() as f32,
+                            ),
+                            SurfaceMetricsChange::None
+                        ) {
+                            coalescer.observe(false);
+                        }
+                    }
                 }
                 ExternalEvent::Custom(payload) => {
                     if let Some(ref handler) = self.app.config.on_external_event {
@@ -3286,6 +3751,33 @@ impl ApplicationHandler for AppHandler {
                     if let Some(ref handler) = self.app.config.on_bytes {
                         (handler)(data);
                     }
+                    coalescer.observe(false);
+                }
+                ExternalEvent::GridPatch { node, grid } => {
+                    if let Some(node_id) = node.get() {
+                        queue_latest_grid_patch(&mut pending_grid_patches, node_id, grid);
+                        coalescer.observe(false);
+                    } else {
+                        // The terminal route may have unmounted between the
+                        // producer's snapshot and delivery. Rebuild so a
+                        // newly visible route observes the current state.
+                        saw_stale_grid_patch = true;
+                        coalescer.observe(false);
+                    }
+                }
+                ExternalEvent::GridResizePatch { node, grid } => {
+                    if let Some(node_id) = node.get() {
+                        if !apply_grid_resize_patch(&mut state.arena, node_id, *grid) {
+                            saw_stale_grid_patch = true;
+                        }
+                        coalescer.observe(false);
+                    } else {
+                        saw_stale_grid_patch = true;
+                        coalescer.observe(false);
+                    }
+                }
+                ExternalEvent::DrainGridPatches => {
+                    pending_grid_patches.extend(self.app.grid_patches.take());
                     coalescer.observe(false);
                 }
                 #[cfg(feature = "hot-reload")]
@@ -3304,6 +3796,20 @@ impl ApplicationHandler for AppHandler {
                         }
                     }
                     coalescer.observe(true);
+                }
+            }
+        }
+        if saw_stale_grid_patch {
+            coalescer.observe(true);
+        }
+        if !coalescer.needs_rebuild {
+            for (node_id, grid) in pending_grid_patches {
+                if !apply_scroll_grid_patch(&mut state.arena, node_id, *grid) {
+                    // A layout change or a stale mounted node cannot be
+                    // represented by a paint-only grid swap. The rebuild
+                    // observes the authoritative app state instead.
+                    coalescer.observe(true);
+                    break;
                 }
             }
         }
@@ -3487,6 +3993,14 @@ impl ApplicationHandler for AppHandler {
         scale_all_styles(&mut arena, root, effective_scale(scale_factor, zoom_factor));
 
         let mut measure_cache = TextMeasureCache::new();
+        if !self.app.config.ui_glyph_prewarm.is_empty() {
+            prewarm_text_measurements(
+                self.app.config.ui_glyph_prewarm,
+                effective_scale(scale_factor, zoom_factor),
+                &mut font_system,
+                &mut measure_cache,
+            );
+        }
         // The window's own size rather than the GPU's: there is no GPU yet,
         // and the surface will be configured to this same size when there is.
         // `finish_startup` re-runs layout if the two ever disagree, which they
@@ -3496,6 +4010,17 @@ impl ApplicationHandler for AppHandler {
             (size.width.max(1), size.height.max(1))
         };
         let (w, h) = (laid_out_for.0 as f32, laid_out_for.1 as f32);
+        if let Some(build_prewarm_tree) = self.app.config.startup_prewarm_tree.as_ref() {
+            prewarm_tree_layout(
+                &build_prewarm_tree(),
+                &stylesheet,
+                effective_scale(scale_factor, zoom_factor),
+                w,
+                h,
+                &mut font_system,
+                &mut measure_cache,
+            );
+        }
         run_layout_pipeline(
             &mut arena,
             &mut taffy,
@@ -3643,56 +4168,44 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::SurfaceResized(new_size) => {
-                reconcile_surface_metrics(
-                    state,
-                    new_size,
-                    state.window.scale_factor() as f32,
-                    self.app.config.on_scale_factor.as_ref(),
-                );
-                if sync_window_maximized_from_window(
-                    state,
-                    self.app.config.on_window_maximized.as_ref(),
+                let metrics_change =
+                    defer_surface_metrics(state, new_size, state.window.scale_factor() as f32);
+                if should_defer_window_maximized_sync(
+                    metrics_change,
+                    self.app.config.on_window_maximized.is_some(),
                 ) {
-                    state.needs_rebuild = true;
+                    defer_window_maximized_sync(state);
                 }
-                state.window.request_redraw();
+                if !matches!(metrics_change, SurfaceMetricsChange::None) {
+                    state.window.request_redraw();
+                }
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, surface_size_writer } => {
                 let new_size = surface_size_writer
                     .surface_size()
                     .unwrap_or_else(|_| state.window.surface_size());
-                reconcile_surface_metrics(
-                    state,
-                    new_size,
-                    scale_factor as f32,
-                    self.app.config.on_scale_factor.as_ref(),
-                );
-                if sync_window_maximized_from_window(
-                    state,
-                    self.app.config.on_window_maximized.as_ref(),
+                let metrics_change = defer_surface_metrics(state, new_size, scale_factor as f32);
+                if should_defer_window_maximized_sync(
+                    metrics_change,
+                    self.app.config.on_window_maximized.is_some(),
                 ) {
-                    state.needs_rebuild = true;
+                    defer_window_maximized_sync(state);
                 }
-                state.window.request_redraw();
+                if !matches!(metrics_change, SurfaceMetricsChange::None) {
+                    state.window.request_redraw();
+                }
             }
 
             WindowEvent::Moved(_position) => {
-                let metrics_changed = !matches!(
-                    reconcile_surface_metrics_from_window(
-                        state,
-                        self.app.config.on_scale_factor.as_ref()
-                    ),
-                    SurfaceMetricsChange::None
-                );
-                let maximized_changed = sync_window_maximized_from_window(
-                    state,
-                    self.app.config.on_window_maximized.as_ref(),
-                );
-                if maximized_changed {
-                    state.needs_rebuild = true;
+                let metrics_change = defer_surface_metrics_from_window(state);
+                if should_defer_window_maximized_sync(
+                    metrics_change,
+                    self.app.config.on_window_maximized.is_some(),
+                ) {
+                    defer_window_maximized_sync(state);
                 }
-                if metrics_changed || maximized_changed {
+                if !matches!(metrics_change, SurfaceMetricsChange::None) {
                     state.window.request_redraw();
                 }
 
@@ -4323,13 +4836,7 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Focused(focused) => {
-                if !matches!(
-                    reconcile_surface_metrics_from_window(
-                        state,
-                        self.app.config.on_scale_factor.as_ref(),
-                    ),
-                    SurfaceMetricsChange::None
-                ) {
+                if !matches!(defer_surface_metrics_from_window(state), SurfaceMetricsChange::None) {
                     state.window.request_redraw();
                 }
 
@@ -4517,13 +5024,22 @@ impl ApplicationHandler for AppHandler {
                                         text: event.text.as_ref().map(|t| t.to_string()),
                                     });
                                     if let Some(element) = state.arena.get(focused_id) {
+                                        let mut saw_keyboard_handler = false;
+                                        let mut capture_requires_rebuild = false;
                                         for (et, handler) in &element.handlers {
                                             if *et == EventType::KeyboardCapture {
-                                                handler(&kbd_event);
+                                                saw_keyboard_handler = true;
+                                                let response = handler(&kbd_event);
+                                                capture_requires_rebuild |=
+                                                    keyboard_capture_requires_rebuild(
+                                                        response.as_deref(),
+                                                    );
                                             }
                                         }
+                                        if !saw_keyboard_handler || capture_requires_rebuild {
+                                            state.needs_rebuild = true;
+                                        }
                                     }
-                                    state.needs_rebuild = true;
                                     state.window.request_redraw();
                                 }
                             }
@@ -4889,6 +5405,12 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+                if let Some(deadline) = state.render_retry.pending(frame_start) {
+                    event_loop
+                        .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                    return;
+                }
+                state.render_retry.deadline = None;
                 // A minimized window cannot present: Vulkan acquires
                 // return Outdated with no Fifo throttle, so painting
                 // would loop full batch builds at CPU speed. Drop the
@@ -4930,7 +5452,11 @@ impl ApplicationHandler for AppHandler {
                 let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
                 tick_drag_autorepeat(state, &self.app.animation_waker);
                 let animation_active = animations_active(state);
-                if animation_active && can_fast_paint_animations(state) {
+                if state.pending_surface_metrics.is_none()
+                    && !state.pending_window_maximized_sync
+                    && animation_active
+                    && can_fast_paint_animations(state)
+                {
                     // Timer fallback only: the due-gate paces the chain at
                     // the true period. The redraw is NOT re-requested on
                     // the wait branch (a queued internal paint would wake
@@ -5001,6 +5527,33 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
+                // Apply at most one native resize/configure per admitted
+                // paint. On macOS a live window drag can enqueue many
+                // SurfaceResized events before the event loop returns to
+                // drawing; applying them inline would serially block on each
+                // Metal surface reconfigure after mouse-up. Keeping these
+                // metrics pending through a rejected pacer/compositor frame
+                // also prevents a configure that cannot be painted yet.
+                state.surface_resize_us = 0;
+                state.window_maximized_sync_us = 0;
+                let _ =
+                    apply_pending_surface_metrics(state, self.app.config.on_scale_factor.as_ref());
+
+                // Sample the native maximized state only once per admitted
+                // paint. The corresponding resize/move handlers merely set a
+                // coalesced flag because `Window::is_maximized()` can cross
+                // into an expensive platform API on every live-resize step.
+                let maximized_sync_started = Instant::now();
+                if sync_deferred_window_maximized(
+                    state,
+                    self.app.config.on_window_maximized.as_ref(),
+                    frame_start,
+                ) {
+                    state.needs_rebuild = true;
+                }
+                state.window_maximized_sync_us =
+                    maximized_sync_started.elapsed().as_micros() as u64;
+
                 // A pacer rejection is not a frame: keep collecting its
                 // pending events until a paint actually starts. From here on
                 // every path reaches the presentation epilogue below.
@@ -5009,6 +5562,8 @@ impl ApplicationHandler for AppHandler {
 
                 let mut metrics = FrameMetrics::default();
                 metrics.pacing_interval_us = pacing_interval_us;
+                metrics.surface_resize_us = state.surface_resize_us;
+                metrics.window_maximized_sync_us = state.window_maximized_sync_us;
 
                 // Animation positions sample at the predicted present
                 // time (see predicted_present_ts); everything else in
@@ -5036,6 +5591,13 @@ impl ApplicationHandler for AppHandler {
                 // Advance LRU frame counter at the start of each rendered frame.
                 state.gpu.glyph_atlas.advance_frame();
                 run_periodic_atlas_eviction(state);
+
+                // Resize callbacks can mutate a backing terminal or editor
+                // grid during layout. A follow-up snapshot is needed only
+                // when an explicit callback says that mutation changed the
+                // tree's grid content; ordinary geometry observers stay on
+                // the lightweight relayout path.
+                let mut resize_rebuild_requested = false;
 
                 if state.needs_rebuild {
                     let t0 = Instant::now();
@@ -5111,6 +5673,9 @@ impl ApplicationHandler for AppHandler {
                     );
                     if style_work {
                         let t1 = Instant::now();
+                        // A rebuild rescales the entire rendered tree below.
+                        // Re-resolve every node first so that scale does not
+                        // compound onto clean nodes retained by reconciliation.
                         resolve_all_styles_with_transitions(
                             &mut state.arena,
                             &state.stylesheet,
@@ -5153,8 +5718,9 @@ impl ApplicationHandler for AppHandler {
                     );
                     if layout_work {
                         let t3 = Instant::now();
+                        let measure_entries_before = state.measure_cache.len();
                         let (w, h) = state.gpu.window_size();
-                        run_layout_pipeline(
+                        let resize_dispatch = run_layout_pipeline(
                             &mut state.arena,
                             &mut state.taffy,
                             state.root,
@@ -5163,7 +5729,10 @@ impl ApplicationHandler for AppHandler {
                             h,
                             &mut state.measure_cache,
                         );
+                        resize_rebuild_requested |= resize_dispatch.rebuild_requested;
                         metrics.layout_us = t3.elapsed().as_micros() as u64;
+                        metrics.text_measure_cache_new_entries =
+                            state.measure_cache.len().saturating_sub(measure_entries_before);
                     }
 
                     metrics.node_count = state.arena.len();
@@ -5182,9 +5751,10 @@ impl ApplicationHandler for AppHandler {
                     // Reconcile subscriptions after each rebuild.
                     #[cfg(feature = "async")]
                     if let Some(ref mut mgr) = self.app.subscription_manager {
-                        let sink = EventSink::new(
+                        let sink = EventSink::with_grid_patch_store(
                             self.app.event_tx.clone(),
                             Arc::clone(&self.app.proxy_cell),
+                            Arc::clone(&self.app.grid_patches),
                         );
                         mgr.reconcile(self.app.runtime.handle(), &sink);
                     }
@@ -5242,7 +5812,7 @@ impl ApplicationHandler for AppHandler {
 
                     let t3 = Instant::now();
                     let (w, h) = state.gpu.window_size();
-                    run_layout_pipeline(
+                    let resize_dispatch = run_layout_pipeline(
                         &mut state.arena,
                         &mut state.taffy,
                         state.root,
@@ -5251,6 +5821,7 @@ impl ApplicationHandler for AppHandler {
                         h,
                         &mut state.measure_cache,
                     );
+                    resize_rebuild_requested |= resize_dispatch.rebuild_requested;
                     metrics.layout_us = t3.elapsed().as_micros() as u64;
 
                     metrics.node_count = state.arena.len();
@@ -5259,7 +5830,7 @@ impl ApplicationHandler for AppHandler {
                 } else if state.needs_relayout {
                     let t3 = Instant::now();
                     let (w, h) = state.gpu.window_size();
-                    let resize_callbacks_fired = relayout_pipeline(
+                    let resize_dispatch = relayout_pipeline_with_result(
                         &mut state.arena,
                         &mut state.taffy,
                         state.root,
@@ -5272,12 +5843,14 @@ impl ApplicationHandler for AppHandler {
 
                     metrics.node_count = state.arena.len();
                     state.needs_relayout = false;
-                    if resize_callbacks_fired {
-                        state.needs_rebuild = true;
-                        state.window.request_redraw();
-                    }
+                    resize_rebuild_requested |= resize_dispatch.rebuild_requested;
                 } else {
                     metrics.node_count = state.arena.len();
+                }
+
+                if resize_rebuild_requested {
+                    state.needs_rebuild = true;
+                    state.window.request_redraw();
                 }
 
                 // Sync keyframe animations into the driver side table after
@@ -5448,6 +6021,11 @@ impl ApplicationHandler for AppHandler {
                         .flatten(),
                 );
                 let render_outcome = state.gpu.render();
+                state.render_retry.record(
+                    render_outcome,
+                    Instant::now(),
+                    state.frame_pacer.min_interval(),
+                );
                 let presented = render_outcome == RenderOutcome::Presented;
                 // Split display waits out of the work numbers at the
                 // source so every downstream consumer of gpu_render_us /
@@ -5536,19 +6114,12 @@ impl ApplicationHandler for AppHandler {
                         frame_start,
                         self.app.config.on_frame_metrics.as_deref(),
                     );
-                } else if render_outcome == RenderOutcome::Deferred {
-                    // The renderer has the maximum safe number of GPU
-                    // submissions outstanding. Do not turn this into an
-                    // immediate redraw loop while the compositor is stalled;
-                    // wake through the ordinary frame pacer instead.
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                        Instant::now() + state.frame_pacer.min_interval(),
-                    ));
                 } else {
-                    // Surface recovery consumed the attempted frame. Retry on
-                    // the next scheduler admission without counting it or
-                    // closing pending input as presented.
-                    state.window.request_redraw();
+                    // Neither a failed acquire nor a full submission queue
+                    // supplies a display clock. Retry after a frame interval.
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        state.render_retry.deadline.unwrap(),
+                    ));
                 }
 
                 // Close the input latency frame window only on the path
@@ -5607,6 +6178,34 @@ impl ApplicationHandler for AppHandler {
         };
 
         let now = Instant::now();
+        if let Some(deadline) = state.render_retry.deadline {
+            if state.render_retry.pending(now).is_some() {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            } else {
+                state.window.request_redraw();
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            }
+            return;
+        }
+        // A rate-limited maximize-state sample may outlive the last native
+        // resize event. Wake one final redraw when its deadline arrives so
+        // titlebar state still converges after a live resize settles.
+        if state.pending_window_maximized_sync
+            && now >= window_maximized_sync_due_at(state.window_maximized_sync_not_before, now)
+        {
+            state.window.request_redraw();
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            return;
+        }
+        if state.pending_window_maximized_sync
+            && !state.is_recently_active(now)
+            && !animations_active(state)
+        {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                window_maximized_sync_due_at(state.window_maximized_sync_not_before, now),
+            ));
+            return;
+        }
         if state.pacing_mode == PacingMode::CompositorClock {
             let minimized = state.window.is_minimized().unwrap_or(false);
             let animation_active = animations_active(state);
@@ -5897,6 +6496,14 @@ fn dispatch_pointer_event(
         node = element.parent;
     }
     PointerEventDispatch::default()
+}
+
+/// Keyboard-capture handlers historically implied a full rebuild. A terminal
+/// keystroke can instead return [`RequestRedraw`] because its eventual PTY
+/// echo arrives as a paint-only grid patch. All other responses preserve the
+/// legacy rebuild-safe behavior.
+fn keyboard_capture_requires_rebuild(response: Option<&dyn std::any::Any>) -> bool {
+    !response.is_some_and(|response| response.is::<unshit_core::event::RequestRedraw>())
 }
 
 /// Cursor position relative to a node's content box (padding box origin),
@@ -6548,6 +7155,29 @@ fn collect_directwrite_font_paths(
 }
 
 /// Lightweight re-layout: recompute taffy layout and positions without rebuilding tree or styles.
+fn relayout_pipeline_with_result(
+    arena: &mut NodeArena,
+    taffy: &mut taffy::TaffyTree<TextMeasureCtx>,
+    root: NodeId,
+    font_system: &mut FontSystem,
+    width: f32,
+    height: f32,
+    cache: &mut TextMeasureCache,
+) -> ResizeDispatchResult {
+    if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
+        layout::compute_layout(taffy, tn, width, height, font_system, cache);
+        layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
+        // Do not invalidate the entire paint tree for a geometry-only pass.
+        // BatchCache signatures include each node's absolute rect and clip,
+        // so a changed node misses its own cache entry while unchanged
+        // descendants replay theirs. Marking every node PAINT-dirty here
+        // turned a four-pane live resize into a full terminal-grid rebuild
+        // on every configured surface size.
+    }
+    dispatch_resize_callbacks_with_result(arena, root)
+}
+
+#[cfg(test)]
 fn relayout_pipeline(
     arena: &mut NodeArena,
     taffy: &mut taffy::TaffyTree<TextMeasureCtx>,
@@ -6557,12 +7187,8 @@ fn relayout_pipeline(
     height: f32,
     cache: &mut TextMeasureCache,
 ) -> bool {
-    if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
-        layout::compute_layout(taffy, tn, width, height, font_system, cache);
-        layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
-        mark_paint_dirty(arena, root);
-    }
-    dispatch_resize_callbacks(arena, root)
+    relayout_pipeline_with_result(arena, taffy, root, font_system, width, height, cache)
+        .callbacks_fired
 }
 
 /// Get current process RSS (resident set size) in bytes.
@@ -6947,6 +7573,30 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn failed_frames_wait_through_redraw_storms_and_resume_after_success() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        for outcome in [RenderOutcome::Dropped, RenderOutcome::Deferred] {
+            let mut retry = RenderRetry::default();
+            assert_eq!(retry.pending(start), None);
+            retry.record(outcome, start, interval);
+            // Repeated producer wakes must neither admit a frame early nor
+            // move its retry deadline farther into the future.
+            for ms in 0..16 {
+                assert_eq!(
+                    retry.pending(start + Duration::from_millis(ms)),
+                    Some(start + interval)
+                );
+            }
+            assert_eq!(retry.pending(start + interval), None);
+            retry.record(outcome, start + interval, interval);
+            assert_eq!(retry.pending(start + interval), Some(start + interval * 2));
+            retry.record(RenderOutcome::Presented, start + interval, interval);
+            assert_eq!(retry.deadline, None);
+        }
+    }
+
+    #[test]
     fn default_app_config_uses_dark_theme() {
         let config = AppConfig::default();
         assert_eq!(config.theme.name, "dark");
@@ -6964,6 +7614,19 @@ mod tests {
     fn app_config_decorations_defaults_to_native_chrome() {
         let config = AppConfig::default();
         assert!(config.decorations);
+    }
+
+    #[test]
+    fn keyboard_capture_redraw_response_skips_tree_rebuild() {
+        let redraw: Box<dyn std::any::Any> = Box::new(unshit_core::event::RequestRedraw);
+        assert!(
+            !keyboard_capture_requires_rebuild(Some(redraw.as_ref())),
+            "terminal writes may wait for their paint-only PTY echo"
+        );
+
+        let rebuild: Box<dyn std::any::Any> = Box::new(unshit_core::event::RequestRebuild);
+        assert!(keyboard_capture_requires_rebuild(Some(rebuild.as_ref())));
+        assert!(keyboard_capture_requires_rebuild(None));
     }
 
     #[test]
@@ -7073,6 +7736,31 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_style_resolution_resets_scale_before_rescaling() {
+        let stylesheet = CompiledStylesheet::parse(".scaled { font-size: 10px; }");
+        let def = ElementDef::new(Tag::Div)
+            .with_child(ElementDef::new(Tag::Span).with_class("scaled").with_text("x"));
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::new();
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        let child = arena.children(root)[0];
+
+        for _ in 0..2 {
+            resolve_all_styles(
+                &mut arena,
+                &stylesheet,
+                root,
+                NodeId::DANGLING,
+                None,
+                NodeId::DANGLING,
+            );
+            scale_all_styles(&mut arena, root, 2.0);
+        }
+
+        assert_eq!(arena.get(child).unwrap().computed_style.font_size, 20.0);
+    }
+
+    #[test]
     fn frame_metrics_default_has_zero_values() {
         let m = FrameMetrics::default();
         assert_eq!(m.tree_build_us, 0);
@@ -7152,6 +7840,26 @@ mod tests {
     }
 
     #[test]
+    fn deferred_window_maximized_sync_coalesces_resize_storm() {
+        let mut pending = false;
+
+        for _ in 0..256 {
+            mark_window_maximized_sync_pending(&mut pending);
+        }
+
+        assert!(take_window_maximized_sync_pending(&mut pending));
+        assert!(!take_window_maximized_sync_pending(&mut pending));
+    }
+
+    #[test]
+    fn window_maximized_sync_due_at_rate_limits_resize_sampling() {
+        let now = Instant::now();
+        assert_eq!(window_maximized_sync_due_at(None, now), now);
+        let due = now + WINDOW_MAXIMIZED_SYNC_MIN_INTERVAL;
+        assert_eq!(window_maximized_sync_due_at(Some(due), now), due);
+    }
+
+    #[test]
     fn app_config_on_cell_metrics_accepts_callback() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let called = std::sync::Arc::new(AtomicBool::new(false));
@@ -7225,7 +7933,7 @@ mod tests {
     }
 
     #[test]
-    fn lightweight_relayout_marks_paint_dirty_after_window_resize() {
+    fn lightweight_relayout_keeps_clean_nodes_cacheable_after_window_resize() {
         let stylesheet = CompiledStylesheet::parse(
             ".root { width: 100%; height: 100%; } .pane { width: 100%; height: 100%; }",
         );
@@ -7264,13 +7972,11 @@ mod tests {
             &mut measure_cache,
         );
 
+        assert_eq!(arena.get(root).unwrap().layout_rect.width, 400.0);
+        assert_eq!(arena.get(pane).unwrap().layout_rect.width, 400.0);
         assert!(
-            arena.get(root).unwrap().dirty.contains(DirtyFlags::PAINT),
-            "root must repaint after a window-size relayout"
-        );
-        assert!(
-            arena.get(pane).unwrap().dirty.contains(DirtyFlags::PAINT),
-            "resized child subtree must repaint after a window-size relayout"
+            arena.get(root).unwrap().dirty.is_empty() && arena.get(pane).unwrap().dirty.is_empty(),
+            "geometry-only relayout must retain clean descendants for BatchCache's geometry-signature invalidation"
         );
     }
 
@@ -7345,6 +8051,56 @@ mod tests {
     }
 
     #[test]
+    fn surface_metric_coalescing_keeps_only_the_latest_live_resize() {
+        let mut pending = None;
+
+        assert_eq!(
+            coalesce_surface_metrics(
+                &mut pending,
+                (1280.0, 800.0),
+                1.0,
+                PhysicalSize::new(1296, 812),
+                1.0,
+            ),
+            SurfaceMetricsChange::Relayout
+        );
+        assert_eq!(
+            coalesce_surface_metrics(
+                &mut pending,
+                (1280.0, 800.0),
+                1.0,
+                PhysicalSize::new(1440, 900),
+                1.0,
+            ),
+            SurfaceMetricsChange::Relayout
+        );
+        assert_eq!(
+            coalesce_surface_metrics(
+                &mut pending,
+                (1280.0, 800.0),
+                1.0,
+                PhysicalSize::new(1440, 900),
+                2.0,
+            ),
+            SurfaceMetricsChange::Rebuild
+        );
+
+        assert_eq!(
+            pending,
+            Some(PendingSurfaceMetrics { size: PhysicalSize::new(1440, 900), scale_factor: 2.0 }),
+            "a burst must result in one configure at the final size and scale"
+        );
+    }
+
+    #[test]
+    fn maximized_sync_ignores_same_size_surface_notifications() {
+        assert!(!should_defer_window_maximized_sync(SurfaceMetricsChange::None, true));
+        assert!(!should_defer_window_maximized_sync(SurfaceMetricsChange::Relayout, false));
+        assert!(should_defer_window_maximized_sync(SurfaceMetricsChange::Relayout, true));
+        assert!(should_defer_window_maximized_sync(SurfaceMetricsChange::Rebuild, true));
+    }
+
+    #[test]
     fn surface_metric_change_ignores_zero_size() {
         let change = classify_surface_metrics_change(
             (1280.0, 800.0),
@@ -7376,6 +8132,9 @@ mod tests {
             style_resolve_scope: StyleResolveScope::Subtree,
             scale_us: 10,
             layout_us: 300,
+            text_measure_cache_new_entries: 7,
+            surface_resize_us: 25,
+            window_maximized_sync_us: 15,
             batch_build_us: 50,
             gpu_render_us: 400,
             total_us: 1060,
@@ -8240,6 +8999,26 @@ mod tests {
         assert_eq!(c.rebuild_request_count, u32::MAX);
     }
 
+    #[test]
+    fn grid_patch_queue_keeps_only_the_latest_payload_per_node() {
+        let node = NodeId { index: 42, generation: 7 };
+        let mut patches = HashMap::new();
+        queue_latest_grid_patch(
+            &mut patches,
+            node,
+            Box::new(unshit_core::cell_grid::CellGrid::new(2, 2)),
+        );
+        queue_latest_grid_patch(
+            &mut patches,
+            node,
+            Box::new(unshit_core::cell_grid::CellGrid::new(3, 4)),
+        );
+
+        assert_eq!(patches.len(), 1);
+        let grid = patches.remove(&node).expect("latest grid patch");
+        assert_eq!((grid.rows(), grid.cols()), (3, 4));
+    }
+
     /// Build a root div with one grid child, clear the initial dirty flags,
     /// and return (arena, root, grid child).
     fn arena_with_grid_child(rows: usize, cols: usize) -> (NodeArena, NodeId, NodeId) {
@@ -8291,6 +9070,20 @@ mod tests {
             _ => panic!("expected grid content to be left untouched"),
         }
         assert!(!arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+    }
+
+    #[test]
+    fn resize_grid_patch_allows_terminal_viewport_dimension_changes() {
+        use unshit_core::cell_grid::CellGrid;
+        let (mut arena, root, child) = arena_with_grid_child(3, 4);
+
+        assert!(apply_grid_resize_patch(&mut arena, child, CellGrid::new(5, 6)));
+        match &arena.get(child).unwrap().content {
+            ElementContent::Grid(grid) => assert_eq!((grid.rows(), grid.cols()), (5, 6)),
+            _ => panic!("expected resized grid content"),
+        }
+        assert!(arena.get(child).unwrap().dirty.contains(DirtyFlags::PAINT));
+        assert!(arena.get(root).unwrap().dirty.contains(DirtyFlags::SUBTREE_PAINT));
     }
 
     #[test]

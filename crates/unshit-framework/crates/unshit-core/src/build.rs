@@ -36,6 +36,7 @@ pub fn build_tree_from_def(
     element.on_drag = def.on_drag.clone();
     element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
+    element.on_resize_rebuild = def.on_resize_rebuild.clone();
     element.resize_axis = def.resize_axis;
     element.on_pane_resize = def.on_pane_resize.clone();
     element.placeholder = def.placeholder.clone();
@@ -728,55 +729,96 @@ pub fn run_layout_pipeline(
     width: f32,
     height: f32,
     cache: &mut TextMeasureCache,
-) {
+) -> ResizeDispatchResult {
     layout::sync_element_to_taffy(arena, taffy, root, font_system, width, height);
     if let Some(tn) = arena.get(root).and_then(|e| e.taffy_node) {
         layout::compute_layout(taffy, tn, width, height, font_system, cache);
         layout::read_layout_results(arena, taffy, root, 0.0, 0.0);
     }
     layout::clear_dirty_flags(arena, root);
-    dispatch_resize_callbacks(arena, root);
+    dispatch_resize_callbacks_with_result(arena, root)
 }
 
 /// Epsilon threshold for resize detection (0.5 pixels).
 const RESIZE_EPSILON: f32 = 0.5;
 
+/// Outcome of dispatching resize callbacks for one layout pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResizeDispatchResult {
+    /// Whether at least one resize callback ran.
+    pub callbacks_fired: bool,
+    /// Whether an explicit [`ElementDef::on_resize_rebuild`] callback asked
+    /// the caller to rebuild the element tree.
+    pub rebuild_requested: bool,
+}
+
 /// Walk the element tree after layout, detect dimension changes, and fire
 /// `on_resize` callbacks in batch. Updates `prev_width`/`prev_height` after
 /// dispatching so that the next frame can detect further changes.
 pub fn dispatch_resize_callbacks(arena: &mut NodeArena, root: NodeId) -> bool {
-    // Phase 1: collect (NodeId, callback, new_width, new_height) for elements that resized
-    let mut pending: Vec<(NodeId, std::sync::Arc<dyn Fn(f32, f32) + Send + Sync>, f32, f32)> =
-        Vec::new();
-    collect_resized_elements(arena, root, &mut pending);
-    let fired = !pending.is_empty();
+    dispatch_resize_callbacks_with_result(arena, root).callbacks_fired
+}
 
-    // Phase 2: dispatch all callbacks
-    for (node_id, callback, width, height) in &pending {
-        callback(*width, *height);
-        // Update prev dimensions so subsequent frames only fire on new changes
-        if let Some(element) = arena.get_mut(*node_id) {
-            element.prev_width = *width;
-            element.prev_height = *height;
+/// Dispatch resize callbacks and report whether any explicit rebuild callback
+/// requested a tree rebuild.
+pub fn dispatch_resize_callbacks_with_result(
+    arena: &mut NodeArena,
+    root: NodeId,
+) -> ResizeDispatchResult {
+    // Phase 1: collect callbacks for elements whose dimensions changed.
+    let mut pending: Vec<PendingResizeCallback> = Vec::new();
+    collect_resized_elements(arena, root, &mut pending);
+    let callbacks_fired = !pending.is_empty();
+    let mut rebuild_requested = false;
+
+    // Phase 2: dispatch all callbacks. Keep the arena borrow released while
+    // invoking user code, then advance the previous dimensions once per node.
+    for pending_resize in &pending {
+        if let Some(callback) = &pending_resize.on_resize {
+            callback(pending_resize.width, pending_resize.height);
+        }
+        if let Some(callback) = &pending_resize.on_resize_rebuild {
+            rebuild_requested |= callback(pending_resize.width, pending_resize.height);
+        }
+        if let Some(element) = arena.get_mut(pending_resize.node_id) {
+            element.prev_width = pending_resize.width;
+            element.prev_height = pending_resize.height;
         }
     }
 
-    fired
+    ResizeDispatchResult { callbacks_fired, rebuild_requested }
+}
+
+struct PendingResizeCallback {
+    node_id: NodeId,
+    width: f32,
+    height: f32,
+    on_resize: Option<std::sync::Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    on_resize_rebuild: Option<std::sync::Arc<dyn Fn(f32, f32) -> bool + Send + Sync>>,
 }
 
 fn collect_resized_elements(
     arena: &NodeArena,
     node_id: NodeId,
-    pending: &mut Vec<(NodeId, std::sync::Arc<dyn Fn(f32, f32) + Send + Sync>, f32, f32)>,
+    pending: &mut Vec<PendingResizeCallback>,
 ) {
     if let Some(element) = arena.get(node_id) {
         let rect = element.layout_rect;
         let w_changed = (rect.width - element.prev_width).abs() > RESIZE_EPSILON;
         let h_changed = (rect.height - element.prev_height).abs() > RESIZE_EPSILON;
 
-        if (w_changed || h_changed) && element.on_resize.is_some() {
-            let cb = element.on_resize.clone().unwrap();
-            pending.push((node_id, cb, rect.width, rect.height));
+        if w_changed || h_changed {
+            let on_resize = element.on_resize.clone();
+            let on_resize_rebuild = element.on_resize_rebuild.clone();
+            if on_resize.is_some() || on_resize_rebuild.is_some() {
+                pending.push(PendingResizeCallback {
+                    node_id,
+                    width: rect.width,
+                    height: rect.height,
+                    on_resize,
+                    on_resize_rebuild,
+                });
+            }
         }
 
         let mut child = element.first_child;
@@ -790,9 +832,11 @@ fn collect_resized_elements(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::{ElementDef, Tag};
+    use crate::element::{ElementDef, LayoutRect, Tag};
     use crate::style::parse::CompiledStylesheet;
     use crate::style::types::Background;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Build a minimal arena with one element, resolve styles with a stylesheet,
@@ -809,6 +853,50 @@ mod tests {
         resolve_all_styles(&mut arena, &stylesheet, root, NodeId::DANGLING, None, NodeId::DANGLING);
 
         (arena, root, stylesheet)
+    }
+
+    #[test]
+    fn resize_rebuild_callback_reports_only_explicit_rebuild_requests() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let explicit_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls_clone = Arc::clone(&legacy_calls);
+        let explicit_calls_clone = Arc::clone(&explicit_calls);
+        let def = ElementDef::new(Tag::Div)
+            .on_resize(move |_, _| {
+                legacy_calls_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .on_resize_rebuild(move |_, _| {
+                explicit_calls_clone.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        arena.get_mut(root).unwrap().layout_rect =
+            LayoutRect { width: 10.0, height: 20.0, ..LayoutRect::default() };
+
+        let result = dispatch_resize_callbacks_with_result(&mut arena, root);
+        assert_eq!(result, ResizeDispatchResult { callbacks_fired: true, rebuild_requested: true });
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(explicit_calls.load(Ordering::SeqCst), 1);
+
+        // Previous dimensions advance after dispatch, so an unchanged layout
+        // does not fire either callback again.
+        let unchanged = dispatch_resize_callbacks_with_result(&mut arena, root);
+        assert_eq!(unchanged, ResizeDispatchResult::default());
+    }
+
+    #[test]
+    fn legacy_resize_dispatch_wrapper_keeps_bool_contract() {
+        let def = ElementDef::new(Tag::Div).on_resize_rebuild(|_, _| false);
+        let mut arena = NodeArena::new();
+        let mut taffy = taffy::TaffyTree::<TextMeasureCtx>::new();
+        let root = build_tree_from_def(&def, &mut arena, &mut taffy, NodeId::DANGLING);
+        arena.get_mut(root).unwrap().layout_rect.width = 4.0;
+
+        assert!(dispatch_resize_callbacks(&mut arena, root));
+        let result = dispatch_resize_callbacks_with_result(&mut arena, root);
+        assert_eq!(result, ResizeDispatchResult::default());
     }
 
     #[test]

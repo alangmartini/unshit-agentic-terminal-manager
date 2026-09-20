@@ -23,6 +23,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Shaping};
 
+/// Select the least expensive shaping mode that preserves UI text behavior.
+///
+/// ASCII is fully covered by every supported UI font, so it does not need
+/// system fallback or complex-script shaping. Keeping it on Cosmic Text's
+/// basic path avoids the substantially more expensive fallback machinery for
+/// the common case (labels, values, and buttons). Any non-ASCII text keeps
+/// the advanced path so localized and symbol-bearing UI remains correct.
+#[inline]
+pub fn ui_text_shaping(text: &str) -> Shaping {
+    if text.is_ascii() {
+        Shaping::Basic
+    } else {
+        Shaping::Advanced
+    }
+}
+
 /// Faces the platform fallback list reaches before any monochrome symbol
 /// face, and whose color layers the renderer flattens to coverage.
 const COLOR_EMOJI_FAMILIES: &[&str] = &["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"];
@@ -161,6 +177,12 @@ pub fn set_text_with_symbol_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_text_shaping_uses_basic_only_for_ascii() {
+        assert_eq!(ui_text_shaping("Config font size"), Shaping::Basic);
+        assert_eq!(ui_text_shaping("custom · your palette"), Shaping::Advanced);
+    }
 
     #[test]
     fn prefers_text_presentation_accepts_lone_bmp_symbol() {

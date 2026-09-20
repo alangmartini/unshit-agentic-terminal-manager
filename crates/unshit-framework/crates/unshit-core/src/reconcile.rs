@@ -260,6 +260,7 @@ fn update_element_properties(arena: &mut NodeArena, node_id: NodeId, def: &Eleme
     element.on_drag = def.on_drag.clone();
     element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
+    element.on_resize_rebuild = def.on_resize_rebuild.clone();
     element.handlers = def.handlers.clone();
     element.placeholder = def.placeholder.clone();
     element.on_change = def.on_change.clone();
@@ -536,6 +537,7 @@ pub fn build_subtree(
     element.on_drag = def.on_drag.clone();
     element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
+    element.on_resize_rebuild = def.on_resize_rebuild.clone();
     element.handlers = def.handlers.clone();
     element.placeholder = def.placeholder.clone();
     element.on_change = def.on_change.clone();

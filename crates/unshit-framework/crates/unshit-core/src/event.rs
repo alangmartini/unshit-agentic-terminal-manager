@@ -29,6 +29,13 @@ pub enum EventType {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestRebuild;
 
+/// Explicit response from a generic event handler when it consumed the event
+/// but the retained tree remains valid. The framework schedules a redraw
+/// without rebuilding; producers that update a grid asynchronously can then
+/// patch only that node before the paint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestRedraw;
+
 /// Events related to IME (Input Method Editor) composition, used for CJK and other complex input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {

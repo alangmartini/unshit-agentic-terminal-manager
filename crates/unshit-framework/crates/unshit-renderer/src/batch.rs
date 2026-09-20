@@ -6,13 +6,15 @@ use crate::atlas::{GlyphAtlas, GlyphEntry, GlyphKey};
 use crate::canvas::{CanvasCallback, CanvasRegistry};
 #[cfg(target_os = "windows")]
 use crate::dw_rasterizer::DwRasterizer;
-use crate::line_quad_cache::{hash_row_cells, LineGeometrySig, LineQuadCache};
+#[cfg(test)]
+use crate::line_quad_cache::hash_row_cells;
+use crate::line_quad_cache::{hash_row_visible_cells, LineGeometrySig, LineQuadCache};
 use crate::pipeline::image::ImageInstance;
 use crate::pipeline::quad::{QuadInstance, MAX_GRADIENT_STOPS};
 use crate::pipeline::text::GlyphInstance;
 use crate::svg_cache::SvgTessCache;
 use crate::svg_tess::SvgGeometry;
-use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Buffer, FontSystem, Metrics, SwashCache};
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
 
@@ -29,6 +31,30 @@ pub struct Rasterizer<'a> {
     pub subpixel_swash: &'a mut SubpixelSwashCache,
     #[cfg(target_os = "windows")]
     pub dw: &'a DwRasterizer,
+}
+
+/// Reusable shaping buffer for ordinary UI text during one batch build.
+///
+/// A cold, text-heavy route (such as Settings) can contain hundreds of
+/// independent runs. Recreating cosmic-text's `Buffer` for every cache miss
+/// amplifies allocation and line-layout overhead before the shaped-text cache
+/// gets a chance to help on the next frame.
+#[derive(Default)]
+struct UiTextShapingScratch {
+    buffer: Option<Buffer>,
+}
+
+impl UiTextShapingScratch {
+    fn buffer(
+        &mut self,
+        font_system: &mut FontSystem,
+        metrics: Metrics,
+        max_width: Option<f32>,
+    ) -> &mut Buffer {
+        let buffer = self.buffer.get_or_insert_with(|| Buffer::new(font_system, metrics));
+        buffer.set_metrics_and_size(font_system, metrics, max_width.map(|w| w.max(1.0)), None);
+        buffer
+    }
 }
 
 /// Frame-scoped counters for glyphs that dropped out of the batch without
@@ -751,6 +777,68 @@ pub struct ShapedTextCache {
     last_atlas_generation: u64,
 }
 
+/// Static UI text to rasterize into the glyph atlas before the first
+/// interactive frame.
+///
+/// Apps can provide a small representative set for routes that are expensive
+/// only the first time their text appears. Prewarming is deliberately bounded
+/// to caller-selected strings rather than every printable character, keeping
+/// startup work proportional to the UI that is actually shipped.
+#[derive(Clone, Copy, Debug)]
+pub struct UiGlyphPrewarm {
+    pub text: &'static str,
+    pub font_family: &'static str,
+    pub font_weight: FontWeight,
+    pub font_style: FontStyle,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub letter_spacing: f32,
+}
+
+/// Rasterize a bounded set of static UI text before it can land on an input
+/// frame. The instances built as part of this operation are discarded; the
+/// useful result is the pending atlas upload consumed by the first normal
+/// render.
+pub fn prewarm_ui_glyphs(
+    entries: &[UiGlyphPrewarm],
+    scale_factor: f32,
+    atlas: &mut GlyphAtlas,
+    font_system: &mut FontSystem,
+    rasterizer: &mut Rasterizer<'_>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut scratch = UiTextShapingScratch::default();
+    let mut shaped_cache = ShapedTextCache::new();
+    let mut batch = FrameBatch::new();
+    for entry in entries {
+        emit_text_glyphs_cached(
+            entry.text,
+            0.0,
+            0.0,
+            None,
+            entry.font_size * scale_factor,
+            entry.line_height,
+            entry.letter_spacing,
+            entry.font_family,
+            entry.font_weight,
+            entry.font_style,
+            &Color::TRANSPARENT,
+            [0.0, 0.0, 1.0, 1.0],
+            &[],
+            &mut batch,
+            atlas,
+            font_system,
+            rasterizer,
+            &mut scratch,
+            &mut shaped_cache,
+            None,
+        );
+    }
+}
+
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct ShapedCacheKey {
     text_hash: u64,
@@ -1335,6 +1423,7 @@ pub fn build_render_batch(
 ) {
     let initial_clip = [0.0_f32, 0.0, 9999.0, 9999.0];
     let mut portals: Vec<(NodeId, Layer)> = Vec::new();
+    let mut ui_text_scratch = UiTextShapingScratch::default();
     let cursor_blink_force_dirty = cursor_blink_dirty_ancestors(arena);
     walk_for_batch(
         arena,
@@ -1346,6 +1435,7 @@ pub fn build_render_batch(
         rasterizer,
         measure_cache,
         shaped_cache,
+        &mut ui_text_scratch,
         svg_cache,
         shape_cache,
         initial_clip,
@@ -1376,6 +1466,7 @@ pub fn build_render_batch(
             rasterizer,
             measure_cache,
             shaped_cache,
+            &mut ui_text_scratch,
             svg_cache,
             shape_cache,
             initial_clip,
@@ -1585,6 +1676,24 @@ fn intersect_clip_rect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [x, y, (right - x).max(0.0), (bottom - y).max(0.0)]
 }
 
+/// Whether an untransformed border box has any drawable overlap with `clip`.
+///
+/// We still walk a clipped-out node's children: absolute/fixed descendants can
+/// escape their parent's scroll clip. This predicate only skips the node's own
+/// primitives, which the GPU would discard anyway. Transformed nodes bypass
+/// this CPU cull because their painted bounds differ from their layout box.
+#[inline]
+fn rect_intersects_clip(x: f32, y: f32, width: f32, height: f32, clip: [f32; 4]) -> bool {
+    width > 0.0
+        && height > 0.0
+        && clip[2] > 0.0
+        && clip[3] > 0.0
+        && x < clip[0] + clip[2]
+        && x + width > clip[0]
+        && y < clip[1] + clip[3]
+        && y + height > clip[1]
+}
+
 /// Pending-resize decision for a grid node: the dims the renderer computed
 /// from the element's content box are published only when they differ from
 /// the grid's current dims, measured against [`CellGrid::viewport_rows`].
@@ -1611,6 +1720,7 @@ fn walk_for_batch(
     rasterizer: &mut Rasterizer<'_>,
     measure_cache: &mut TextMeasureCache,
     shaped_cache: &mut ShapedTextCache,
+    ui_text_scratch: &mut UiTextShapingScratch,
     svg_cache: &mut SvgTessCache,
     shape_cache: &mut ShapeCache,
     clip_rect: [f32; 4],
@@ -1795,6 +1905,9 @@ fn walk_for_batch(
     let mut grid_offset_stamp: Option<(usize, usize, f32)> = None;
 
     let is_visible = style.visibility == Visibility::Visible;
+    let paints_visible = is_visible
+        && (!node_xform.is_identity()
+            || rect_intersects_clip(render_x, render_y, rect.width, rect.height, clip_rect));
     let opacity = style.opacity;
 
     // Per-axis clipping: `overflow-x` clips the horizontal extent (left/right)
@@ -1828,7 +1941,7 @@ fn walk_for_batch(
     // via `node_xform` baked into each instance's affine, not via the child
     // scroll offset.)
 
-    if is_visible && style.outline_width > 0.0 && style.outline_color.a > 0 {
+    if paints_visible && style.outline_width > 0.0 && style.outline_color.a > 0 {
         let expand = style.outline_width + style.outline_offset;
         let mut oc = style.outline_color.to_linear_f32();
         oc[3] *= opacity;
@@ -1864,7 +1977,7 @@ fn walk_for_batch(
     // contents behind the element, then reopen the pass so the element
     // draws on top. We only emit a boundary if the element has a non zero
     // area after clipping, mirroring the zero area edge case in the design.
-    if is_visible {
+    if paints_visible {
         if let Some(ref backdrop) = style.backdrop_filter {
             let max_blur = backdrop
                 .filters
@@ -1899,7 +2012,7 @@ fn walk_for_batch(
         }
     }
 
-    if is_visible
+    if paints_visible
         && (style.background.is_visible()
             || style.border_width.any_nonzero()
             || !style.box_shadow.is_empty())
@@ -2044,7 +2157,7 @@ fn walk_for_batch(
     }
 
     // Input element rendering
-    if element.tag == Tag::Input && is_visible {
+    if element.tag == Tag::Input && paints_visible {
         let style = &element.computed_style;
         let content_w = rect.width - style.padding.left - style.padding.right;
         let content_h = rect.height - style.padding.top - style.padding.bottom;
@@ -2282,6 +2395,7 @@ fn walk_for_batch(
                         atlas,
                         font_system,
                         rasterizer,
+                        ui_text_scratch,
                         shaped_cache,
                         Some(&mut node_glyph_keys),
                     );
@@ -2442,7 +2556,7 @@ fn walk_for_batch(
         }
         match &element.content {
             ElementContent::Text(ref raw_text)
-                if is_visible && !raw_text.is_empty() && element.anon_text_child.is_none() =>
+                if paints_visible && !raw_text.is_empty() && element.anon_text_child.is_none() =>
             {
                 let transformed_text = apply_text_transform(raw_text, style.text_transform);
                 let mut text = transformed_text.as_ref();
@@ -2618,6 +2732,7 @@ fn walk_for_batch(
                     atlas,
                     font_system,
                     rasterizer,
+                    ui_text_scratch,
                     shaped_cache,
                     Some(&mut node_glyph_keys),
                 );
@@ -2662,7 +2777,7 @@ fn walk_for_batch(
                     });
                 }
             }
-            ElementContent::Image(ref path) if is_visible && !path.is_empty() => {
+            ElementContent::Image(ref path) if paints_visible && !path.is_empty() => {
                 let instance = ImageInstance {
                     pos: [render_x, render_y],
                     size: [rect.width, rect.height],
@@ -2687,7 +2802,7 @@ fn walk_for_batch(
                     });
                 }
             }
-            ElementContent::Canvas if is_visible => {
+            ElementContent::Canvas if paints_visible => {
                 if let Some(registry) = registry {
                     if let Some(ref id) = element.id {
                         if let Some(painter) = registry.get(id) {
@@ -2709,7 +2824,7 @@ fn walk_for_batch(
                     }
                 }
             }
-            ElementContent::Grid(ref grid) if is_visible => {
+            ElementContent::Grid(ref grid) if paints_visible => {
                 // cell_h derives from CSS line_height (the source of truth).
                 let cell_h = style.font_size * style.line_height;
                 // Grid cell width must match the active glyph shaping/raster
@@ -2823,7 +2938,7 @@ fn walk_for_batch(
                     );
                 }
             }
-            ElementContent::Svg(ref node) if is_visible => {
+            ElementContent::Svg(ref node) if paints_visible => {
                 emit_svg_node(
                     node,
                     &SvgAttrs::default(),
@@ -2927,6 +3042,7 @@ fn walk_for_batch(
             rasterizer,
             measure_cache,
             shaped_cache,
+            ui_text_scratch,
             svg_cache,
             shape_cache,
             effective_clip,
@@ -2967,7 +3083,9 @@ fn walk_for_batch(
 
     // Overlay scrollbar rendering.
     // Emitted after children so the scrollbar draws on top of content.
-    if style.overflow_x == Overflow::Scroll || style.overflow_y == Overflow::Scroll {
+    if paints_visible
+        && (style.overflow_x == Overflow::Scroll || style.overflow_y == Overflow::Scroll)
+    {
         let (v_geom, h_geom) =
             scroll::compute_scrollbar_geometry(arena, node_id, render_x, render_y);
 
@@ -3026,7 +3144,8 @@ fn walk_for_batch(
 
     // Resize grip indicator.
     // Per CSS spec, `resize` only works when `overflow` is not `visible`.
-    if style.resize != CssResize::None
+    if paints_visible
+        && style.resize != CssResize::None
         && (style.overflow_x != Overflow::Visible || style.overflow_y != Overflow::Visible)
     {
         const GRIP_SIZE: f32 = 12.0;
@@ -3384,6 +3503,7 @@ fn emit_text_glyphs_cached(
     atlas: &mut GlyphAtlas,
     font_system: &mut FontSystem,
     rasterizer: &mut Rasterizer<'_>,
+    ui_text_scratch: &mut UiTextShapingScratch,
     shaped_cache: &mut ShapedTextCache,
     mut glyph_keys_out: Option<&mut FxHashSet<GlyphKey>>,
 ) {
@@ -3437,17 +3557,16 @@ fn emit_text_glyphs_cached(
     if !from_cache {
         // Cache miss: shape text, rasterize, and populate the shaped cache.
         let metrics = Metrics::new(font_size, font_size * line_height);
-        let mut buffer = Buffer::new(font_system, metrics);
-        buffer.set_size(font_system, max_width.map(|w| w.max(1.0)), None);
+        let buffer = ui_text_scratch.buffer(font_system, metrics, max_width);
         // Text-presentation symbols the family lacks (✳ in a guest title)
         // are re-shaped onto a monochrome symbol face instead of the
         // color-emoji face, whose glyphs this path can only flatten.
         set_text_with_symbol_fallback(
-            &mut buffer,
+            buffer,
             font_system,
             text,
             text_attrs(font_family, font_weight, font_style),
-            Shaping::Advanced,
+            unshit_core::text_fallback::ui_text_shaping(text),
         );
 
         let mut cached_glyphs = Vec::new();
@@ -3779,7 +3898,7 @@ fn terminal_row_content_sig(
     cols: usize,
     blink_phase_on: bool,
 ) -> u64 {
-    let sig = hash_row_cells(cells, row, cols);
+    let sig = hash_row_visible_cells(cells, row, cols);
     if terminal_row_has_blink(cells, row, cols) && !blink_phase_on {
         sig ^ 0x9e37_79b9_7f4a_7c15
     } else {
@@ -5055,13 +5174,6 @@ fn emit_grid_cells(
     let atlas_generation = atlas.generation;
     let blink_phase_on = !CellGrid::is_window_focused() || CellGrid::cursor_blink_phase_now();
 
-    // Shape each unique character once, then cache the fully resolved glyph
-    // per actual atlas key. Fractional cell origins can change the subpixel
-    // bins, so caching only by `char` is incorrect when cell_w/cell_h are not
-    // integers. This cache is shared across every row we actually emit
-    // (cache miss path) in this pass.
-    let mut glyph_cache: FxHashMap<GlyphKey, ResolvedGlyph> = FxHashMap::default();
-
     // Precompute the font-family fields for the ShapeCache key. The style
     // portion still comes from each cell's SGR attrs (bold/italic).
     #[cfg(target_os = "windows")]
@@ -5071,16 +5183,10 @@ fn emit_grid_cells(
     let shape_font_id = shape_cache_font_id(family_name);
     let shape_font_size_tenths = (font_size * 10.0).round() as u32;
 
-    // Auto-invalidate the cache if font, DPI, or size has changed since the
-    // last grid render. `retune` is a no-op when nothing has changed, so the
-    // hot path still costs a single hashmap lookup per cell.
-    shape_cache.retune(family_name, 1.0, font_size);
-
-    // Reusable buffer for glyph shaping on cache miss.
-    let metrics = cosmic_text::Metrics::new(font_size, cell_h);
-    let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(cell_w * 4.0), None);
-    let mut ch_buf = [0u8; 4];
+    // Shaping state is initialized on the first row miss, not at the start
+    // of every grid pass. A replay-only terminal frame needs neither a
+    // cosmic-text buffer nor a glyph hashmap.
+    let mut shaping_state = None;
 
     // Geometry inputs are constant across every row of a single grid pass,
     // so build the geometry signature once and reuse it for every row probe.
@@ -5101,8 +5207,10 @@ fn emit_grid_cells(
     // full-grid identity reset (clear, DECALN). `retain_ids` is built
     // from the grid's stable line_ids.
     if let Some(cache) = line_cache.as_deref_mut() {
-        let retain_ids: FxHashSet<u64> = grid.line_ids().iter().copied().collect();
-        cache.retain_element_ids(node_id, &retain_ids);
+        if cache.element_line_count(node_id) > rows {
+            let retain_ids: FxHashSet<u64> = grid.line_ids().iter().copied().collect();
+            cache.retain_element_ids(node_id, &retain_ids);
+        }
     }
 
     for row in 0..rows {
@@ -5199,6 +5307,16 @@ fn emit_grid_cells(
         let mut row_keys: Vec<GlyphKey> = Vec::new();
         let mut row_glyph_col_index: Vec<Option<u32>> = Vec::with_capacity(cols);
 
+        let (glyph_cache, buffer, ch_buf) = shaping_state.get_or_insert_with(|| {
+            // Auto-invalidate the cache if font, DPI, or size has changed
+            // since the previous miss. `retune` is a no-op when unchanged.
+            shape_cache.retune(family_name, 1.0, font_size);
+            let metrics = cosmic_text::Metrics::new(font_size, cell_h);
+            let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
+            buffer.set_size(font_system, Some(cell_w * 4.0), None);
+            (FxHashMap::default(), buffer, [0u8; 4])
+        });
+
         // Splice fast-path when a compatible cached entry and a concrete
         // damage range are both available. Otherwise emit fresh for the
         // full row.
@@ -5238,13 +5356,13 @@ fn emit_grid_cells(
                 &mut row_glyphs,
                 &mut row_keys,
                 &mut row_glyph_col_index,
-                &mut glyph_cache,
+                glyph_cache,
                 shape_cache,
                 atlas,
                 font_system,
                 rasterizer,
-                &mut buffer,
-                &mut ch_buf,
+                buffer,
+                ch_buf,
                 trace_this_grid,
                 &mut trace_glyphs,
             )
@@ -5270,13 +5388,13 @@ fn emit_grid_cells(
                 &mut row_glyphs,
                 &mut row_keys,
                 &mut row_glyph_col_index,
-                &mut glyph_cache,
+                glyph_cache,
                 shape_cache,
                 atlas,
                 font_system,
                 rasterizer,
-                &mut buffer,
-                &mut ch_buf,
+                buffer,
+                ch_buf,
                 trace_this_grid,
                 &mut trace_glyphs,
             )
@@ -5924,6 +6042,7 @@ pub fn emit_select_overlays(
     vw: f32,
     vh: f32,
 ) {
+    let mut ui_text_scratch = UiTextShapingScratch::default();
     emit_select_overlays_rec(
         arena,
         root,
@@ -5932,6 +6051,7 @@ pub fn emit_select_overlays(
         font_system,
         rasterizer,
         shaped_cache,
+        &mut ui_text_scratch,
         vw,
         vh,
     );
@@ -5945,13 +6065,24 @@ fn emit_select_overlays_rec(
     font_system: &mut FontSystem,
     rasterizer: &mut Rasterizer<'_>,
     shaped_cache: &mut ShapedTextCache,
+    ui_text_scratch: &mut UiTextShapingScratch,
     vw: f32,
     vh: f32,
 ) {
     let Some(element) = arena.get(node_id) else { return };
 
     if element.tag == Tag::Select {
-        emit_select_node(element, batch, atlas, font_system, rasterizer, shaped_cache, vw, vh);
+        emit_select_node(
+            element,
+            batch,
+            atlas,
+            font_system,
+            rasterizer,
+            shaped_cache,
+            ui_text_scratch,
+            vw,
+            vh,
+        );
         // Select has no arena children to recurse into.
         return;
     }
@@ -5973,6 +6104,7 @@ fn emit_select_overlays_rec(
             font_system,
             rasterizer,
             shaped_cache,
+            ui_text_scratch,
             vw,
             vh,
         );
@@ -5988,6 +6120,7 @@ fn emit_select_node(
     font_system: &mut FontSystem,
     rasterizer: &mut Rasterizer<'_>,
     shaped_cache: &mut ShapedTextCache,
+    ui_text_scratch: &mut UiTextShapingScratch,
     vw: f32,
     vh: f32,
 ) {
@@ -6030,6 +6163,7 @@ fn emit_select_node(
             atlas,
             font_system,
             rasterizer,
+            ui_text_scratch,
             shaped_cache,
             None,
         );
@@ -6059,6 +6193,7 @@ fn emit_select_node(
             atlas,
             font_system,
             rasterizer,
+            ui_text_scratch,
             shaped_cache,
             None,
         );
@@ -6164,6 +6299,7 @@ fn emit_select_node(
                 atlas,
                 font_system,
                 rasterizer,
+                ui_text_scratch,
                 shaped_cache,
                 None,
             );
@@ -6188,6 +6324,7 @@ fn emit_select_node(
             atlas,
             font_system,
             rasterizer,
+            ui_text_scratch,
             shaped_cache,
             None,
         );
@@ -7541,7 +7678,7 @@ mod tests {
         let mut buffer = Buffer::new(&mut fs, metrics);
         buffer.set_size(&mut fs, Some(400.0), None);
         let retried = set_text_with_symbol_fallback(
-            &mut buffer,
+            buffer,
             &mut fs,
             "\u{2733} Workspace",
             text_attrs("Segoe UI", FontWeight::Normal, FontStyle::Normal),
@@ -10404,6 +10541,15 @@ mod tests {
         let clipped = intersect_clip_rect(a, disjoint);
         assert_eq!(clipped[2], 0.0, "non-overlapping rects clamp width to zero");
         assert_eq!(clipped[3], 0.0, "non-overlapping rects clamp height to zero");
+    }
+
+    #[test]
+    fn rect_intersects_clip_requires_positive_overlap() {
+        let clip = [10.0, 10.0, 50.0, 50.0];
+        assert!(rect_intersects_clip(20.0, 20.0, 10.0, 10.0, clip));
+        assert!(!rect_intersects_clip(60.0, 20.0, 10.0, 10.0, clip));
+        assert!(!rect_intersects_clip(20.0, 60.0, 10.0, 10.0, clip));
+        assert!(!rect_intersects_clip(20.0, 20.0, 0.0, 10.0, clip));
     }
 
     #[test]

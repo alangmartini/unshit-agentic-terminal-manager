@@ -4,9 +4,7 @@ use crate::id::NodeId;
 use crate::style::parse::PseudoElement;
 use crate::style::types::{apply_text_transform, ComputedStyle, FontStyle, FontWeight, WhiteSpace};
 use crate::tree::NodeArena;
-use cosmic_text::{
-    Attrs, Buffer, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Style, Weight,
-};
+use cosmic_text::{Attrs, Buffer, CacheKeyFlags, Family, FontSystem, Metrics, Style, Weight};
 use rustc_hash::FxHashMap;
 use taffy::TaffyTree;
 
@@ -28,6 +26,10 @@ pub struct TextMeasureCtx {
 /// Keyed on (text_hash, font_size, line_height, letter_spacing, max_width) quantized to tenths of a pixel.
 pub struct TextMeasureCache {
     map: FxHashMap<MeasureCacheKey, (f32, f32)>,
+    /// A frame-thread-local shaping buffer reused for cache misses. Cold
+    /// screens often contain hundreds of distinct labels, so allocating a
+    /// cosmic-text buffer for each first measurement dominates layout time.
+    scratch: Option<Buffer>,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -141,7 +143,7 @@ impl Default for TextMeasureCache {
 
 impl TextMeasureCache {
     pub fn new() -> Self {
-        Self { map: FxHashMap::with_capacity_and_hasher(256, Default::default()) }
+        Self { map: FxHashMap::with_capacity_and_hasher(256, Default::default()), scratch: None }
     }
 
     pub fn clear(&mut self) {
@@ -154,6 +156,31 @@ impl TextMeasureCache {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_into_scratch(
+        &mut self,
+        text: &str,
+        font_family: &str,
+        font_weight: FontWeight,
+        font_style: FontStyle,
+        font_size: f32,
+        line_height: f32,
+        max_width: Option<f32>,
+        font_system: &mut FontSystem,
+    ) -> &Buffer {
+        let metrics = Metrics::new(font_size, font_size * line_height);
+        let buffer = self.scratch.get_or_insert_with(|| Buffer::new(font_system, metrics));
+        buffer.set_metrics_and_size(font_system, metrics, max_width, None);
+        crate::text_fallback::set_text_with_symbol_fallback(
+            buffer,
+            font_system,
+            text,
+            text_attrs(font_family, font_weight, font_style),
+            crate::text_fallback::ui_text_shaping(text),
+        );
+        buffer
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -206,7 +233,26 @@ impl TextMeasureCache {
             letter_spacing,
             max_width,
         );
-        self.map.get(&key).copied()
+        if let Some(result) = self.map.get(&key).copied() {
+            return Some(result);
+        }
+
+        // A label measured without a width constraint remains valid at any
+        // constrained width that can contain its complete unwrapped line.
+        // This lets route prewarming (or an earlier layout at a different
+        // available width) serve ordinary single-line UI text without
+        // reshaping it. Wrapped text never takes this path: its unconstrained
+        // width exceeds the requested constraint.
+        if max_width.is_some() {
+            let mut unconstrained = key;
+            unconstrained.max_width_tenths = -1;
+            if let Some(result) = self.map.get(&unconstrained).copied() {
+                if result.0 <= max_width.unwrap_or_default() {
+                    return Some(result);
+                }
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -232,7 +278,12 @@ impl TextMeasureCache {
             letter_spacing,
             max_width,
         );
-        self.map.insert(key, result);
+        self.map.insert(key.clone(), result);
+        if max_width.is_some() && result.0 <= max_width.unwrap_or_default() {
+            let mut unconstrained = key;
+            unconstrained.max_width_tenths = -1;
+            self.map.entry(unconstrained).or_insert(result);
+        }
     }
 }
 
@@ -633,7 +684,7 @@ fn shaped_buffer(
         font_system,
         text,
         text_attrs(font_family, font_weight, font_style),
-        Shaping::Advanced,
+        crate::text_fallback::ui_text_shaping(text),
     );
     buffer
 }
@@ -683,7 +734,7 @@ pub fn measure_text_with_style_cached(
     letter_spacing: f32,
     max_width: Option<f32>,
     font_system: &mut FontSystem,
-    cache: Option<&mut TextMeasureCache>,
+    mut cache: Option<&mut TextMeasureCache>,
 ) -> (f32, f32) {
     if let Some(ref cache) = cache {
         if let Some(cached) = cache.get(
@@ -700,30 +751,43 @@ pub fn measure_text_with_style_cached(
         }
     }
 
-    let buffer = shaped_buffer(
-        text,
-        font_family,
-        font_weight,
-        font_style,
-        font_size,
-        line_height,
-        max_width,
-        font_system,
-    );
-
-    let mut width = buffer.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
-
-    if letter_spacing != 0.0 {
-        let char_count = text.chars().count();
-        if char_count > 1 {
-            width += (char_count - 1) as f32 * letter_spacing;
+    let measure = |buffer: &Buffer| {
+        let mut width = buffer.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+        if letter_spacing != 0.0 {
+            let char_count = text.chars().count();
+            if char_count > 1 {
+                width += (char_count - 1) as f32 * letter_spacing;
+            }
         }
-    }
+        let line_count = buffer.layout_runs().count();
+        (width.ceil(), (line_count as f32 * font_size * line_height).ceil())
+    };
 
-    let line_count = buffer.layout_runs().count();
-    let height = line_count as f32 * font_size * line_height;
-
-    let result = (width.ceil(), height.ceil());
+    let result = if let Some(cache) = cache.as_deref_mut() {
+        let buffer = cache.shape_into_scratch(
+            text,
+            font_family,
+            font_weight,
+            font_style,
+            font_size,
+            line_height,
+            max_width,
+            font_system,
+        );
+        measure(buffer)
+    } else {
+        let buffer = shaped_buffer(
+            text,
+            font_family,
+            font_weight,
+            font_style,
+            font_size,
+            line_height,
+            max_width,
+            font_system,
+        );
+        measure(&buffer)
+    };
 
     if let Some(cache) = cache {
         cache.insert(
@@ -1136,6 +1200,15 @@ pub fn compute_layout(
             },
             |known_dimensions, available_space, _node_id, context, _style| {
                 if let Some(ctx) = context {
+                    // A fixed-size text box needs no intrinsic measurement.
+                    // Besides avoiding needless shaping, this matters for
+                    // dense settings screens where icons and controls often
+                    // provide both dimensions through CSS.
+                    if let (Some(width), Some(height)) =
+                        (known_dimensions.width, known_dimensions.height)
+                    {
+                        return taffy::Size { width, height };
+                    }
                     let max_width =
                         if matches!(ctx.white_space, WhiteSpace::Nowrap | WhiteSpace::Pre) {
                             // nowrap/pre: text must never wrap, so always measure
@@ -1380,6 +1453,7 @@ mod tests {
     use super::*;
     use crate::element::{Element, ElementDef};
     use crate::svg::types::{SvgAttrs, SvgNode, SvgPrimitive, ViewBox};
+    use cosmic_text::Shaping;
 
     #[test]
     fn cosmic_font_family_strips_css_quotes() {
@@ -1512,6 +1586,51 @@ mod tests {
         );
 
         assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn text_measure_cache_reuses_fitting_unconstrained_measurement() {
+        let mut cache = TextMeasureCache::new();
+        cache.insert(
+            "appearance",
+            "Inter",
+            FontWeight::Normal,
+            FontStyle::Normal,
+            14.0,
+            1.4,
+            0.0,
+            Some(200.0),
+            (84.0, 20.0),
+        );
+
+        assert_eq!(
+            cache.get(
+                "appearance",
+                "Inter",
+                FontWeight::Normal,
+                FontStyle::Normal,
+                14.0,
+                1.4,
+                0.0,
+                Some(100.0),
+            ),
+            Some((84.0, 20.0)),
+        );
+        assert!(
+            cache
+                .get(
+                    "appearance",
+                    "Inter",
+                    FontWeight::Normal,
+                    FontStyle::Normal,
+                    14.0,
+                    1.4,
+                    0.0,
+                    Some(80.0),
+                )
+                .is_none(),
+            "a narrower width may wrap and must be measured separately"
+        );
     }
 
     #[test]

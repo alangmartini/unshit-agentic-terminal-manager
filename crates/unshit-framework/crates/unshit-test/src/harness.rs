@@ -522,6 +522,7 @@ pub(crate) fn build_tree_from_def(
     element.on_drag = def.on_drag.clone();
     element.drag_autorepeat = def.drag_autorepeat;
     element.on_resize = def.on_resize.clone();
+    element.on_resize_rebuild = def.on_resize_rebuild.clone();
     // Generic `.on(EventType, ..)` handlers, mirroring the production
     // reconciler (`reconcile::element_from_def`). Without this the harness
     // silently drops every generic handler, so any test written against

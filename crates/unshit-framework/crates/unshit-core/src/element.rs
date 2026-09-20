@@ -267,6 +267,13 @@ pub struct Element {
     /// See [`crate::event::drag_autorepeat_event`].
     pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Optional resize callback that can request a tree rebuild.
+    ///
+    /// The callback returns `true` only when the state changes require the
+    /// caller to rebuild the element tree. This is kept separate from the
+    /// legacy [`Element::on_resize`] callback so existing users retain their
+    /// callback and dispatch semantics.
+    pub on_resize_rebuild: Option<Arc<dyn Fn(f32, f32) -> bool + Send + Sync>>,
 
     // Previous layout dimensions (for resize detection)
     pub prev_width: f32,
@@ -379,6 +386,7 @@ impl Element {
             on_drag: None,
             drag_autorepeat: false,
             on_resize: None,
+            on_resize_rebuild: None,
             prev_width: 0.0,
             prev_height: 0.0,
             resize_override_width: None,
@@ -475,6 +483,7 @@ impl Element {
         self.on_drag = def.on_drag.clone();
         self.drag_autorepeat = def.drag_autorepeat;
         self.on_resize = def.on_resize.clone();
+        self.on_resize_rebuild = def.on_resize_rebuild.clone();
         self.resize_axis = def.resize_axis;
         self.on_pane_resize = def.on_pane_resize.clone();
         self.placeholder = def.placeholder.clone();
@@ -539,6 +548,9 @@ pub struct ElementDef {
     /// See [`Element::drag_autorepeat`]; set via [`ElementDef::with_drag_autorepeat`].
     pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Optional resize callback that returns `true` when a tree rebuild is
+    /// required after the callback runs.
+    pub on_resize_rebuild: Option<Arc<dyn Fn(f32, f32) -> bool + Send + Sync>>,
     pub handlers: SmallVec<[(crate::event::EventType, EventHandler); 2]>,
     pub resize_axis: Option<ResizeAxis>,
     pub on_pane_resize: Option<Arc<dyn Fn(&PaneResizeEvent) + Send + Sync>>,
@@ -595,6 +607,7 @@ impl ElementDef {
             on_drag: None,
             drag_autorepeat: false,
             on_resize: None,
+            on_resize_rebuild: None,
             handlers: SmallVec::new(),
             resize_axis: None,
             on_pane_resize: None,
@@ -646,6 +659,16 @@ impl ElementDef {
 
     pub fn on_resize(mut self, f: impl Fn(f32, f32) + Send + Sync + 'static) -> Self {
         self.on_resize = Some(Arc::new(f));
+        self
+    }
+
+    /// Register a resize callback that explicitly reports whether the
+    /// resulting state requires a tree rebuild.
+    pub fn on_resize_rebuild(
+        mut self,
+        f: impl Fn(f32, f32) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.on_resize_rebuild = Some(Arc::new(f));
         self
     }
 
@@ -928,6 +951,9 @@ pub struct ElementDefBump<'a> {
     /// See [`Element::drag_autorepeat`].
     pub drag_autorepeat: bool,
     pub on_resize: Option<Arc<dyn Fn(f32, f32) + Send + Sync>>,
+    /// Optional resize callback that returns `true` when a tree rebuild is
+    /// required after the callback runs.
+    pub on_resize_rebuild: Option<Arc<dyn Fn(f32, f32) -> bool + Send + Sync>>,
     pub handlers: bumpalo::collections::Vec<'a, (crate::event::EventType, EventHandler)>,
     pub resize_axis: Option<ResizeAxis>,
     pub on_pane_resize: Option<Arc<dyn Fn(&PaneResizeEvent) + Send + Sync>>,
@@ -968,6 +994,7 @@ impl<'a> ElementDefBump<'a> {
             on_drag: None,
             drag_autorepeat: false,
             on_resize: None,
+            on_resize_rebuild: None,
             handlers: bumpalo::collections::Vec::new_in(bump),
             resize_axis: None,
             on_pane_resize: None,
@@ -1050,6 +1077,16 @@ impl<'a> ElementDefBump<'a> {
         self
     }
 
+    /// Register a resize callback that explicitly reports whether the
+    /// resulting state requires a tree rebuild.
+    pub fn on_resize_rebuild(
+        mut self,
+        f: impl Fn(f32, f32) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.on_resize_rebuild = Some(Arc::new(f));
+        self
+    }
+
     /// Materialize this bump tree into a fully owned [`ElementDef`].
     ///
     /// Copies strings and vecs out of the arena into the global heap. Useful
@@ -1071,6 +1108,7 @@ impl<'a> ElementDefBump<'a> {
             on_drag: self.on_drag.clone(),
             drag_autorepeat: self.drag_autorepeat,
             on_resize: self.on_resize.clone(),
+            on_resize_rebuild: self.on_resize_rebuild.clone(),
             handlers: self.handlers.iter().cloned().collect(),
             resize_axis: self.resize_axis,
             on_pane_resize: self.on_pane_resize.clone(),

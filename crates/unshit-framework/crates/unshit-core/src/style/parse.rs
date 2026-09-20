@@ -37,6 +37,15 @@ impl DroppedDeclaration {
 #[derive(Debug, Clone, Default)]
 pub struct CompiledStylesheet {
     pub rules: Vec<CompiledRule>,
+    /// Terminal-selector candidate index for the cascade. It maps the element's
+    /// tag, id, and classes to an ordered bitset of rules that could match;
+    /// rules with a universal or pseudo-only terminal remain in the universal
+    /// mask. This avoids attempting every stylesheet rule for every element.
+    pub rule_candidates: RuleCandidates,
+    /// Indices into [`Self::rules`] for `::selection` rules only. Selection
+    /// styling is queried for every element during a cascade, so scanning the
+    /// full stylesheet there is disproportionately expensive on large pages.
+    pub selection_rules: Vec<usize>,
     pub custom_properties: HashMap<String, String>,
     /// `@font-face` rules collected in source order. Consumed by the app
     /// crate's font loader at startup to register fonts with cosmic-text.
@@ -62,6 +71,98 @@ pub struct CompiledStylesheet {
     /// `0` for a `Default` (never-parsed) stylesheet, which the memo treats as
     /// "uncached".
     pub parse_id: u64,
+}
+
+/// Latest terminal-selector filters for a compiled rule list. Every bit index
+/// refers to the corresponding entry in the stylesheet's already cascade-sorted
+/// `rules` vector, so set-bit iteration preserves CSS order without sorting at
+/// render time.
+#[derive(Debug, Clone, Default)]
+pub struct RuleCandidates {
+    words: usize,
+    universal: Vec<u64>,
+    by_tag: HashMap<String, Vec<u64>>,
+    by_class: HashMap<String, Vec<u64>>,
+    by_id: HashMap<String, Vec<u64>>,
+}
+
+impl RuleCandidates {
+    fn build(rules: &[CompiledRule]) -> Self {
+        let words = rules.len().div_ceil(64);
+        let mut candidates = Self {
+            words,
+            universal: vec![0; words],
+            by_tag: HashMap::new(),
+            by_class: HashMap::new(),
+            by_id: HashMap::new(),
+        };
+        for (rule_idx, rule) in rules.iter().enumerate() {
+            let Some((terminal, _)) = rule.selector.parts.last() else {
+                continue;
+            };
+            let mut indexed = false;
+            for part in terminal {
+                match part {
+                    SelectorPart::Tag(tag) => {
+                        Self::set_bit(&mut candidates.by_tag, tag, rule_idx, words);
+                        indexed = true;
+                    }
+                    SelectorPart::Class(class) => {
+                        Self::set_bit(&mut candidates.by_class, class, rule_idx, words);
+                        indexed = true;
+                    }
+                    SelectorPart::Id(id) => {
+                        Self::set_bit(&mut candidates.by_id, id, rule_idx, words);
+                        indexed = true;
+                    }
+                    // `:not(.class)` and pseudo-only terminals do not require
+                    // a concrete tag/class/id on the element, so indexing them
+                    // narrowly would be unsound. Keep them universal.
+                    SelectorPart::Universal
+                    | SelectorPart::PseudoClass(_)
+                    | SelectorPart::PseudoElement(_) => {}
+                }
+            }
+            if !indexed {
+                candidates.universal[rule_idx / 64] |= 1u64 << (rule_idx % 64);
+            }
+        }
+        candidates
+    }
+
+    fn set_bit(map: &mut HashMap<String, Vec<u64>>, key: &str, rule_idx: usize, words: usize) {
+        let bits = map.entry(key.to_owned()).or_insert_with(|| vec![0; words]);
+        bits[rule_idx / 64] |= 1u64 << (rule_idx % 64);
+    }
+
+    /// Returns a compact ordered mask of rules whose terminal compound could
+    /// match this element. The resulting bits are a conservative superset;
+    /// descendant combinators, additional classes, and pseudo classes still
+    /// go through the normal selector matcher.
+    pub fn matching_mask(
+        &self,
+        tag: &str,
+        id: Option<&str>,
+        classes: &[String],
+    ) -> SmallVec<[u64; 32]> {
+        let mut mask = SmallVec::from_slice(&self.universal);
+        debug_assert_eq!(mask.len(), self.words);
+        let mut merge = |bits: Option<&Vec<u64>>| {
+            if let Some(bits) = bits {
+                for (dst, src) in mask.iter_mut().zip(bits) {
+                    *dst |= *src;
+                }
+            }
+        };
+        merge(self.by_tag.get(tag));
+        if let Some(id) = id {
+            merge(self.by_id.get(id));
+        }
+        for class in classes {
+            merge(self.by_class.get(class));
+        }
+        mask
+    }
 }
 
 /// Interned handle for a token scope's selector text. The value is the scope's
@@ -591,6 +692,14 @@ impl CompiledStylesheet {
         rules.sort_by(|a, b| {
             a.specificity.cmp(&b.specificity).then(a.source_order.cmp(&b.source_order))
         });
+        let rule_candidates = RuleCandidates::build(&rules);
+        let selection_rules = rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rule)| {
+                (rule.selector.pseudo_element() == Some(PseudoElement::Selection)).then_some(index)
+            })
+            .collect();
 
         // Coverage pass for cascade-time `var()` resolution failures. The live
         // per-element cascade applies `Deferred` carriers against an element's
@@ -612,6 +721,8 @@ impl CompiledStylesheet {
 
         CompiledStylesheet {
             rules,
+            rule_candidates,
+            selection_rules,
             custom_properties,
             font_faces,
             keyframes,
@@ -9931,5 +10042,49 @@ mod tests {
         assert_eq!(dropped[0].property, "color");
         // The bogus value did not apply.
         assert_eq!(style.color, ComputedStyle::default().color);
+    }
+
+    #[test]
+    fn rule_candidates_exclude_disjoint_terminal_selectors() {
+        let sheet = CompiledStylesheet::parse(
+            "* { color: #111; } .alpha { color: #222; } .beta { color: #333; } \
+             .alpha.beta { color: #444; } span { color: #555; } div { color: #666; }",
+        );
+        let mask = sheet.rule_candidates.matching_mask("span", None, &["alpha".to_string()]);
+        let includes = |rule_index: usize| mask[rule_index / 64] & (1 << (rule_index % 64)) != 0;
+        let has_class = |rule: &CompiledRule, wanted: &str| {
+            rule.selector
+                .parts
+                .last()
+                .unwrap()
+                .0
+                .iter()
+                .any(|part| matches!(part, SelectorPart::Class(name) if name == wanted))
+        };
+        let has_tag = |rule: &CompiledRule, wanted: &str| {
+            rule.selector
+                .parts
+                .last()
+                .unwrap()
+                .0
+                .iter()
+                .any(|part| matches!(part, SelectorPart::Tag(name) if name == wanted))
+        };
+
+        for (index, rule) in sheet.rules.iter().enumerate() {
+            let parts = &rule.selector.parts.last().unwrap().0;
+            if parts.iter().any(|part| matches!(part, SelectorPart::Universal))
+                || has_class(rule, "alpha")
+                || has_tag(rule, "span")
+            {
+                assert!(includes(index), "required candidate at rule {index}: {parts:?}");
+            }
+            if (has_class(rule, "beta") && !has_class(rule, "alpha")) || has_tag(rule, "div") {
+                assert!(
+                    !includes(index),
+                    "disjoint terminal selector should not be a candidate: {parts:?}"
+                );
+            }
+        }
     }
 }

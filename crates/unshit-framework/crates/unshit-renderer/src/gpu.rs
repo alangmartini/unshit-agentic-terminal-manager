@@ -2080,48 +2080,6 @@ impl GpuContext {
             }
         }
 
-        self.quad_pipeline.update_uniforms(&self.queue, vw, vh);
-        self.text_pipeline.update_uniforms(&self.queue, vw, vh);
-        self.image_pipeline.update_uniforms(&self.queue, vw, vh);
-        self.svg_pipeline.update_globals(&self.queue, vw, vh);
-
-        #[cfg(feature = "grid-fragment-shader")]
-        {
-            self.grid_fragment_pass.begin_frame();
-            for layer_batch in &self.layered_batch.layers {
-                self.grid_fragment_pass.process(&layer_batch.grid_records);
-            }
-        }
-
-        self.glyph_atlas.upload_pending(&self.queue);
-
-        // Ensure GPU side vertex and index buffers exist for every SVG
-        // geometry referenced this frame, then upload one instance uniform
-        // block per draw call with a known stable ordering.
-        let mut svg_instance_buffer: Vec<SvgInstanceUniforms> = Vec::new();
-        let mut svg_keys: Vec<(usize, usize, usize)> = Vec::new(); // (layer_idx, draw_idx, geometry_key)
-        let mut live_geometries: HashSet<usize> = HashSet::new();
-        for (layer_idx, layer_batch) in self.layered_batch.layers.iter().enumerate() {
-            for (draw_idx, draw) in layer_batch.svg_draws.iter().enumerate() {
-                if let Some(key) = self.svg_pipeline.ensure_geometry(&self.device, &draw.geometry) {
-                    svg_keys.push((layer_idx, draw_idx, key));
-                    live_geometries.insert(key);
-                    svg_instance_buffer.push(SvgInstanceUniforms {
-                        translate: draw.translate,
-                        scale: draw.scale,
-                        clip_rect: draw.clip_rect,
-                        color_tint: draw.color_tint,
-                        opacity: draw.opacity,
-                        _pad: [0.0; 7],
-                    });
-                }
-            }
-        }
-        self.svg_pipeline.prune_unreferenced(&live_geometries);
-        self.svg_pipeline.upload_instances(&self.device, &self.queue, &svg_instance_buffer);
-        let (quad_bases, glyph_bases) = self.upload_content_instance_buffers();
-        let image_layer_plan = self.upload_image_instance_buffers();
-
         let (surface_view, surface_output, reconfigure_after_present) = match &self.target {
             RenderTarget::Window { surface, config, window } => {
                 // Under Fifo this call blocks (inside an OS/driver wait
@@ -2198,10 +2156,6 @@ impl GpuContext {
                                 }
                             }
                         }
-                        // Content buffers were prepared before surface
-                        // acquisition. Do not leave them held across a
-                        // failed acquire; no submission can safely own them.
-                        drop(self.take_pooled_frame_buffers());
                         return RenderOutcome::Dropped;
                     }
                 };
@@ -2214,6 +2168,51 @@ impl GpuContext {
                 (view, None, false)
             }
         };
+
+        // Queue writes allocate staging resources retained until submission.
+        // Acquire first so a hidden/unavailable surface cannot accumulate
+        // uploads for frames that will never be submitted.
+        self.quad_pipeline.update_uniforms(&self.queue, vw, vh);
+        self.text_pipeline.update_uniforms(&self.queue, vw, vh);
+        self.image_pipeline.update_uniforms(&self.queue, vw, vh);
+        self.svg_pipeline.update_globals(&self.queue, vw, vh);
+
+        #[cfg(feature = "grid-fragment-shader")]
+        {
+            self.grid_fragment_pass.begin_frame();
+            for layer_batch in &self.layered_batch.layers {
+                self.grid_fragment_pass.process(&layer_batch.grid_records);
+            }
+        }
+
+        self.glyph_atlas.upload_pending(&self.queue);
+
+        // Ensure GPU side vertex and index buffers exist for every SVG
+        // geometry referenced this frame, then upload one instance uniform
+        // block per draw call with a known stable ordering.
+        let mut svg_instance_buffer: Vec<SvgInstanceUniforms> = Vec::new();
+        let mut svg_keys: Vec<(usize, usize, usize)> = Vec::new(); // (layer_idx, draw_idx, geometry_key)
+        let mut live_geometries: HashSet<usize> = HashSet::new();
+        for (layer_idx, layer_batch) in self.layered_batch.layers.iter().enumerate() {
+            for (draw_idx, draw) in layer_batch.svg_draws.iter().enumerate() {
+                if let Some(key) = self.svg_pipeline.ensure_geometry(&self.device, &draw.geometry) {
+                    svg_keys.push((layer_idx, draw_idx, key));
+                    live_geometries.insert(key);
+                    svg_instance_buffer.push(SvgInstanceUniforms {
+                        translate: draw.translate,
+                        scale: draw.scale,
+                        clip_rect: draw.clip_rect,
+                        color_tint: draw.color_tint,
+                        opacity: draw.opacity,
+                        _pad: [0.0; 7],
+                    });
+                }
+            }
+        }
+        self.svg_pipeline.prune_unreferenced(&live_geometries);
+        self.svg_pipeline.upload_instances(&self.device, &self.queue, &svg_instance_buffer);
+        let (quad_bases, glyph_bases) = self.upload_content_instance_buffers();
+        let image_layer_plan = self.upload_image_instance_buffers();
 
         // Backdrop filter gate (checked before prepare so canvas painters
         // receive the correct sample count).
