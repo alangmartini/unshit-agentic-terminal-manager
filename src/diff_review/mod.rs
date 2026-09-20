@@ -36,6 +36,8 @@ pub struct Review {
     pub patch_path: Option<PathBuf>,
     pub count: String,
     pub base_ref: String,
+    pub from_ref: String,
+    pub to_ref: String,
     pub request: u64,
     pub loading: bool,
     pub error: Option<String>,
@@ -63,7 +65,9 @@ impl Review {
             mode: "last",
             patch_path: None,
             count: "1".into(),
-            base_ref: "main".into(),
+            base_ref: String::new(),
+            from_ref: String::new(),
+            to_ref: "HEAD".into(),
             request: 0,
             loading: false,
             error: None,
@@ -303,6 +307,10 @@ fn refresh(review: &mut Review) {
     let range = match review.mode {
         "unpushed" => git::Range::Unpushed,
         "base" => git::Range::Base(review.base_ref.clone()),
+        "branches" => git::Range::Branches {
+            from: review.from_ref.clone(),
+            to: review.to_ref.clone(),
+        },
         _ => match review.count.parse::<usize>() {
             Ok(n) if (1..=10_000).contains(&n) => git::Range::Last(n),
             _ => {
@@ -418,8 +426,12 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             review.row_start = review.active_hunk.map_or(0, |index| review.hunk_row(index));
         }
         "review.refresh" => refresh(review),
-        "review.mode:last" | "review.mode:unpushed" | "review.mode:base" => {
+        "review.mode:last"
+        | "review.mode:unpushed"
+        | "review.mode:base"
+        | "review.mode:branches" => {
             review.mode = match command {
+                "review.mode:branches" => "branches",
                 "review.mode:base" => "base",
                 "review.mode:unpushed" => "unpushed",
                 _ => "last",
