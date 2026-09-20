@@ -28,11 +28,15 @@ pub enum ScrollbarPart {
     Thumb,
     TrackBefore,
     TrackAfter,
+    Decrement,
+    Increment,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScrollbarGeometry {
     pub axis: ScrollbarAxis,
+    /// Length of each arrow button along the scrolling axis.
+    pub button_size: f32,
     pub track_x: f32,
     pub track_y: f32,
     pub track_w: f32,
@@ -76,11 +80,11 @@ impl ScrollbarVisualState {
     /// The caller builds the full `[r, g, b, a]` color.
     pub fn thumb_alpha(&self, node_id: NodeId, axis: ScrollbarAxis) -> f32 {
         if self.dragging_node == Some(node_id) && self.dragging_axis == Some(axis) {
-            0.52
+            1.0
         } else if self.hovered_node == Some(node_id) && self.hovered_axis == Some(axis) {
-            0.34
+            0.8
         } else {
-            0.004
+            0.65
         }
     }
 
@@ -296,11 +300,17 @@ pub fn compute_scrollbar_geometry(
     let container_w = element.layout_rect.width;
     let container_h = element.layout_rect.height;
 
-    let v_geom = if scroll_y && content_max_y > container_h + 1.0 {
+    let has_vertical =
+        scroll_y && content_max_y > container_h + 1.0 && container_w >= SCROLLBAR_WIDTH;
+    let has_horizontal =
+        scroll_x && content_max_x > container_w + 1.0 && container_h >= SCROLLBAR_WIDTH;
+    let v_geom = if has_vertical {
         let max_scroll_y = content_max_y - container_h;
-        let scroll_ratio = if max_scroll_y > 0.0 { element.scroll_y / max_scroll_y } else { 0.0 };
+        let scroll_ratio = (element.scroll_y / max_scroll_y).clamp(0.0, 1.0);
 
-        let visual_track_h = (container_h - SCROLLBAR_BUTTON_SIZE * 2.0).max(SCROLLBAR_WIDTH);
+        let length = (container_h - if has_horizontal { SCROLLBAR_WIDTH } else { 0.0 }).max(0.0);
+        let button_size = SCROLLBAR_BUTTON_SIZE.min(length / 3.0);
+        let visual_track_h = length - button_size * 2.0;
         let thumb_h = (container_h / content_max_y * container_h * THUMB_SIZE_SCALE)
             .max(MIN_THUMB_SIZE)
             .min(visual_track_h);
@@ -308,10 +318,11 @@ pub fn compute_scrollbar_geometry(
         let thumb_y_offset = scroll_ratio * (track_h - thumb_h);
 
         let track_x = render_x + container_w - SCROLLBAR_WIDTH - SCROLLBAR_INSET;
-        let track_y = render_y + SCROLLBAR_BUTTON_SIZE;
+        let track_y = render_y + button_size;
 
         Some(ScrollbarGeometry {
             axis: ScrollbarAxis::Vertical,
+            button_size,
             track_x,
             track_y,
             track_w: SCROLLBAR_WIDTH,
@@ -328,22 +339,25 @@ pub fn compute_scrollbar_geometry(
         None
     };
 
-    let h_geom = if scroll_x && content_max_x > container_w + 1.0 {
+    let h_geom = if has_horizontal {
         let max_scroll_x = content_max_x - container_w;
-        let scroll_ratio = if max_scroll_x > 0.0 { element.scroll_x / max_scroll_x } else { 0.0 };
+        let scroll_ratio = (element.scroll_x / max_scroll_x).clamp(0.0, 1.0);
 
-        let visual_track_w = (container_w - SCROLLBAR_BUTTON_SIZE * 2.0).max(SCROLLBAR_WIDTH);
+        let length = (container_w - if has_vertical { SCROLLBAR_WIDTH } else { 0.0 }).max(0.0);
+        let button_size = SCROLLBAR_BUTTON_SIZE.min(length / 3.0);
+        let visual_track_w = length - button_size * 2.0;
         let thumb_w = (container_w / content_max_x * container_w * THUMB_SIZE_SCALE)
             .max(MIN_THUMB_SIZE)
             .min(visual_track_w);
         let track_w = visual_track_w;
         let thumb_x_offset = scroll_ratio * (track_w - thumb_w);
 
-        let track_x = render_x + SCROLLBAR_BUTTON_SIZE;
+        let track_x = render_x + button_size;
         let track_y = render_y + container_h - SCROLLBAR_WIDTH - SCROLLBAR_INSET;
 
         Some(ScrollbarGeometry {
             axis: ScrollbarAxis::Horizontal,
+            button_size,
             track_x,
             track_y,
             track_w,
@@ -379,10 +393,14 @@ pub fn scrollbar_hit_test(
     if let Some(geom) = geom_v {
         if x >= geom.track_x
             && x <= geom.track_x + geom.track_w
-            && y >= geom.track_y
-            && y <= geom.track_y + geom.track_h
+            && y >= geom.track_y - geom.button_size
+            && y <= geom.track_y + geom.track_h + geom.button_size
         {
-            let part = if y >= geom.thumb_y && y <= geom.thumb_y + geom.thumb_h {
+            let part = if y < geom.track_y {
+                ScrollbarPart::Decrement
+            } else if y > geom.track_y + geom.track_h {
+                ScrollbarPart::Increment
+            } else if y >= geom.thumb_y && y <= geom.thumb_y + geom.thumb_h {
                 ScrollbarPart::Thumb
             } else if y < geom.thumb_y {
                 ScrollbarPart::TrackBefore
@@ -400,12 +418,16 @@ pub fn scrollbar_hit_test(
 
     // Check horizontal scrollbar
     if let Some(geom) = geom_h {
-        if x >= geom.track_x
-            && x <= geom.track_x + geom.track_w
+        if x >= geom.track_x - geom.button_size
+            && x <= geom.track_x + geom.track_w + geom.button_size
             && y >= geom.track_y
             && y <= geom.track_y + geom.track_h
         {
-            let part = if x >= geom.thumb_x && x <= geom.thumb_x + geom.thumb_w {
+            let part = if x < geom.track_x {
+                ScrollbarPart::Decrement
+            } else if x > geom.track_x + geom.track_w {
+                ScrollbarPart::Increment
+            } else if x >= geom.thumb_x && x <= geom.thumb_x + geom.thumb_w {
                 ScrollbarPart::Thumb
             } else if x < geom.thumb_x {
                 ScrollbarPart::TrackBefore
@@ -505,6 +527,26 @@ pub fn find_scroll_container(arena: &NodeArena, start: NodeId) -> Option<NodeId>
 // Drag / track-click scroll computation
 // ---------------------------------------------------------------------------
 
+/// Move one small step from an arrow button, preserving the other axis.
+pub fn scroll_from_arrow(arena: &mut NodeArena, hit: &ScrollbarHit) -> bool {
+    let Some(element) = arena.get(hit.node_id) else { return false };
+    let current = match hit.axis {
+        ScrollbarAxis::Vertical => element.scroll_y,
+        ScrollbarAxis::Horizontal => element.scroll_x,
+    };
+    let step = match hit.part {
+        ScrollbarPart::Decrement => -40.0,
+        ScrollbarPart::Increment => 40.0,
+        _ => return false,
+    };
+    set_axis_scroll_position(
+        arena,
+        hit.node_id,
+        hit.axis,
+        (current + step).clamp(0.0, hit.geometry.max_scroll),
+    )
+}
+
 /// Given an active drag and the current cursor position on the drag axis,
 /// compute the new scroll offset.
 pub fn scroll_from_drag(drag: &ScrollbarDrag, cursor_pos: f32) -> f32 {
@@ -557,13 +599,8 @@ mod visual_state_tests {
         let state = ScrollbarVisualState::default();
 
         assert!(
-            state.thumb_alpha(node(1), ScrollbarAxis::Vertical) > 0.0,
+            state.thumb_alpha(node(1), ScrollbarAxis::Vertical) >= 0.25,
             "scrollbar thumb should remain visible when content overflows"
-        );
-        assert_eq!(
-            state.thumb_alpha(node(1), ScrollbarAxis::Vertical),
-            0.004,
-            "resting settings scrollbar should stay visible but extremely subdued"
         );
     }
 

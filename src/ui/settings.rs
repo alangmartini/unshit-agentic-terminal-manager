@@ -3044,8 +3044,8 @@ mod tests {
         let thumb_luma =
             u16::from(thumb_sample[0]) + u16::from(thumb_sample[1]) + u16::from(thumb_sample[2]);
         assert!(
-            thumb_luma > page_luma + 2 && thumb_luma < 100,
-            "idle settings scrollbar should be visible but subdued, page={page_sample:?}, thumb={thumb_sample:?}"
+            thumb_luma > page_luma + 90,
+            "idle settings scrollbar should be clearly visible, page={page_sample:?}, thumb={thumb_sample:?}"
         );
     }
 

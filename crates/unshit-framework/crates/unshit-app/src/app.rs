@@ -3898,6 +3898,9 @@ impl ApplicationHandler for AppHandler {
                             ) {
                                 state.smooth_scroll = None;
                                 match hit.part {
+                                    ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                                        scroll::scroll_from_arrow(&mut state.arena, &hit);
+                                    }
                                     ScrollbarPart::Thumb => {
                                         let grab_offset = match hit.axis {
                                             ScrollbarAxis::Vertical => {
