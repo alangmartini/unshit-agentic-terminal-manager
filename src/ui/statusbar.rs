@@ -333,6 +333,7 @@ mod tests {
             process_details_open: false,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
