@@ -294,41 +294,38 @@ fn submit(review: &mut Review, query: Query) {
 
 fn refresh(review: &mut Review) {
     review.viewed = Arc::default();
-    if review.mode == "patch" {
-        review.report = None;
-        review.file_matches = Arc::default();
-        review.selected = 0;
-        review.file_page = 0;
-        if let Some(path) = review.patch_path.clone() {
-            submit(review, Query::PatchFile(path));
-        }
-        return;
-    }
-    let range = match review.mode {
-        "unpushed" => git::Range::Unpushed,
-        "base" => git::Range::Base(review.base_ref.clone()),
-        "branches" => git::Range::Branches {
-            from: review.from_ref.clone(),
-            to: review.to_ref.clone(),
-        },
-        _ => match review.count.parse::<usize>() {
-            Ok(n) if (1..=10_000).contains(&n) => git::Range::Last(n),
-            _ => {
-                review.request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                review.loading = false;
-                review.report = None;
-                review.file_matches = Arc::default();
-                review.clear_patch();
-                review.error = Some("Choose between 1 and 10000 commits.".into());
-                return;
-            }
-        },
+    let query = if review.mode == "patch" {
+        review.patch_path.clone().map(Query::PatchFile)
+    } else {
+        let range = match review.mode {
+            "unpushed" => git::Range::Unpushed,
+            "base" => git::Range::Base(review.base_ref.clone()),
+            "branches" => git::Range::Branches {
+                from: review.from_ref.clone(),
+                to: review.to_ref.clone(),
+            },
+            _ => match review.count.parse::<usize>() {
+                Ok(n) if (1..=10_000).contains(&n) => git::Range::Last(n),
+                _ => {
+                    review.request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    review.loading = false;
+                    review.report = None;
+                    review.file_matches = Arc::default();
+                    review.clear_patch();
+                    review.error = Some("Choose between 1 and 10000 commits.".into());
+                    return;
+                }
+            },
+        };
+        Some(Query::Range(review.root.clone(), range))
     };
     review.report = None;
     review.file_matches = Arc::default();
     review.selected = 0;
     review.file_page = 0;
-    submit(review, Query::Range(review.root.clone(), range));
+    if let Some(query) = query {
+        submit(review, query);
+    }
 }
 
 pub fn accept_drop(state: &mut AppState, paths: &[PathBuf]) -> bool {
