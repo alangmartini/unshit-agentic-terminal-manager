@@ -422,10 +422,7 @@ impl Session {
             handle.abort();
         }
         if let Some(pty) = self.pty.take() {
-            if let Ok(mut child) = pty.child.lock() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            crate::pty::terminate_and_reap(pty.child);
             // Explicitly drop the writer/master so the reader sees EOF.
             drop(pty.writer);
             drop(pty.master);

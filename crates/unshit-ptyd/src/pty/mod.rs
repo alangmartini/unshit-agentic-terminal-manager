@@ -9,11 +9,12 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// A single PTY session: the child process, a writer for stdin, the master PTY
 /// handle (needed for resize), and the current terminal size.
 pub struct PtyPair {
-    child: Box<dyn Child + Send>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     size: PtySize,
@@ -66,6 +67,17 @@ impl PtyManager {
         rows: u16,
         cwd: Option<&Path>,
     ) -> std::io::Result<Box<dyn Read + Send>> {
+        self.spawn_in_with_shell(pane_id, cols, rows, cwd, &default_shell())
+    }
+
+    fn spawn_in_with_shell(
+        &mut self,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        shell: &str,
+    ) -> std::io::Result<Box<dyn Read + Send>> {
         let pty_system = native_pty_system();
 
         let size = PtySize {
@@ -77,16 +89,14 @@ impl PtyManager {
 
         let pty_pair = pty_system.openpty(size).map_err(std::io::Error::other)?;
 
-        let shell = default_shell();
-
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::new(shell);
         if let Some(dir) = cwd {
             cmd.cwd(dir);
             // PowerShell profiles commonly end with `Set-Location <some-dir>`,
             // which overrides the OS-level cwd we just set. Pass the same dir
             // via `-NoExit -Command "Set-Location ..."` so it runs AFTER the
             // profile and wins.
-            if is_powershell_shell(&shell) {
+            if is_powershell_shell(shell) {
                 for arg in build_powershell_cwd_args(dir) {
                     cmd.arg(arg);
                 }
@@ -113,7 +123,7 @@ impl PtyManager {
         self.pairs.insert(
             pane_id,
             PtyPair {
-                child,
+                child: Some(child),
                 writer,
                 master: pty_pair.master,
                 size,
@@ -170,9 +180,7 @@ impl PtyManager {
     ///
     /// Silently ignored if the pane does not exist.
     pub fn destroy(&mut self, pane_id: u32) {
-        if let Some(mut pair) = self.pairs.remove(&pane_id) {
-            let _ = pair.child.kill();
-        }
+        self.pairs.remove(&pane_id);
     }
 
     /// Kill all child processes and remove every PTY entry.
@@ -197,8 +205,29 @@ impl Drop for PtyManager {
 
 impl Drop for PtyPair {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.take() {
+            terminate_and_reap(Arc::new(Mutex::new(child)));
+        }
+    }
+}
+
+/// Kill first, then reap off the teardown thread. On Darwin a killed shell
+/// can remain in kernel exit while PTY descriptors are still open. Waiting
+/// before the caller drops those descriptors deadlocks session destruction.
+/// Keeping the child alive in the reaper still guarantees zombie collection.
+pub(crate) fn terminate_and_reap(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
+    {
+        let mut guard = child.lock().unwrap_or_else(|err| err.into_inner());
+        let _ = guard.kill();
+    }
+    if let Err(err) = std::thread::Builder::new()
+        .name("pty-child-reaper".into())
+        .spawn(move || {
+            let mut guard = child.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = guard.wait();
+        })
+    {
+        log::error!("could not start PTY child reaper: {err}");
     }
 }
 
@@ -454,6 +483,27 @@ mod tests {
 
         mgr.destroy(2);
         assert!(!mgr.has(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_teardown_finishes_before_readers_are_released() {
+        let mut mgr = PtyManager::new();
+        let readers = [
+            mgr.spawn_in_with_shell(1, 80, 24, None, "/bin/bash")
+                .unwrap(),
+            mgr.spawn_in_with_shell(2, 100, 30, None, "/bin/bash")
+                .unwrap(),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            mgr.destroy_all();
+            tx.send(()).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(readers);
+        result.expect("teardown must not wait for PTY readers to be dropped");
+        teardown.join().unwrap();
     }
 
     #[test]
