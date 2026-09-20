@@ -17,6 +17,7 @@ pub fn build_titlebar(
     }
 
     let search_state = shared.clone();
+    let diff_state = shared.clone();
     let sidebar_state = shared.clone();
     let settings_state = shared.clone();
     let close_state = shared.clone();
@@ -113,6 +114,15 @@ pub fn build_titlebar(
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("titlebar-right")
+                .with_child(
+                    ElementDef::new(Tag::Button)
+                        .with_class("pill-btn")
+                        .with_tab_index(0)
+                        .with_text("Review diff")
+                        .on_click(move || {
+                            mutate_with(&diff_state, |st| dispatch(st, "review.open"));
+                        }),
+                )
                 .with_child(
                     ElementDef::new(Tag::Button)
                         .with_class("pill-btn")
@@ -359,12 +369,13 @@ mod tests {
         let el = build_titlebar(&snap, &shared, None);
         let right = &el.children[1];
         assert!(right.classes.contains(&"titlebar-right".to_string()));
-        assert_eq!(right.children.len(), 3);
-        assert!(right.children[0].classes.contains(&"tm-search".to_string()));
-        assert!(right.children[1]
+        assert_eq!(right.children.len(), 4);
+        assert_eq!(collect_text(&right.children[0]), "Review diff");
+        assert!(right.children[1].classes.contains(&"tm-search".to_string()));
+        assert!(right.children[2]
             .classes
             .contains(&"tm-tb-right".to_string()));
-        assert!(right.children[2]
+        assert!(right.children[3]
             .classes
             .contains(&"tm-win-controls".to_string()));
     }
@@ -375,7 +386,7 @@ mod tests {
         let snap = test_snapshot();
         let el = build_titlebar(&snap, &shared, None);
         let right = &el.children[1];
-        let search_btn = &right.children[0];
+        let search_btn = &right.children[1];
         assert!(search_btn.classes.contains(&"pill-btn".to_string()));
         assert!(search_btn.on_click.is_some());
         (search_btn.on_click.as_ref().unwrap())();
@@ -388,7 +399,7 @@ mod tests {
         let initial = shared.lock().unwrap().sidebar_collapsed;
         let snap = test_snapshot();
         let el = build_titlebar(&snap, &shared, None);
-        let actions = &el.children[1].children[1];
+        let actions = &el.children[1].children[2];
         let sidebar_btn = &actions.children[0];
         assert!(sidebar_btn.on_click.is_some());
         (sidebar_btn.on_click.as_ref().unwrap())();
@@ -401,7 +412,7 @@ mod tests {
         let shared = test_shared();
         let snap = test_snapshot();
         let el = build_titlebar(&snap, &shared, None);
-        let actions = &el.children[1].children[1];
+        let actions = &el.children[1].children[2];
         let settings_btn = &actions.children[1];
         assert!(settings_btn.on_click.is_some());
         (settings_btn.on_click.as_ref().unwrap())();
@@ -458,7 +469,7 @@ mod tests {
         let shared = test_shared();
         let snap = test_snapshot();
         let el = build_titlebar(&snap, &shared, None);
-        let controls = &el.children[1].children[2];
+        let controls = &el.children[1].children[3];
         assert!(controls.classes.contains(&"tm-win-controls".to_string()));
         assert_eq!(controls.children.len(), 3);
         assert!(controls.children[0]
@@ -487,7 +498,7 @@ mod tests {
         snap.window_maximized = true;
 
         let el = build_titlebar(&snap, &shared, None);
-        let maximize_button = &el.children[1].children[2].children[1];
+        let maximize_button = &el.children[1].children[3].children[1];
 
         assert!(maximize_button.classes.contains(&"win-restore".to_string()));
         assert!(!maximize_button

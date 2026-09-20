@@ -581,6 +581,7 @@ struct AppState {
     dw_rasterizer: DwRasterizer,
     interaction: InteractionState,
     needs_rebuild: bool,
+    pending_scroll_into_view: Option<String>,
     needs_restyle: bool,
     needs_relayout: bool,
     /// When `Some`, the next `needs_restyle` pass cascades from this node
@@ -616,6 +617,12 @@ struct AppState {
     /// handlers through [`ScrollGridPatch::animation`] and ticked at the
     /// shared animation cadence. See [`tick_grid_animations`].
     grid_animations: HashMap<NodeId, GridAnimationHook>,
+    /// Drag auto-repeat armed: an opted-in element's drag is active with
+    /// the pointer resting outside its content box, so every animation
+    /// frame re-dispatches `DragPhase::Update` (see
+    /// [`tick_drag_autorepeat`]). Counts as animation work so the frame
+    /// chain keeps running while the mouse is held still past the edge.
+    drag_autorepeat: bool,
     /// Timer-fallback due-gate shared by all animation sources (container
     /// smooth scroll and grid animations): the earliest instant the next
     /// animation frame may paint. `None` when no animation is active.
@@ -708,6 +715,26 @@ struct AppState {
     /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
     /// unused otherwise.
     frame_arena: FrameArena,
+}
+
+/// Reveal an element by its HTML id in its nearest scroll container, and
+/// cancel any in-flight smooth-scroll animation that would move it away
+/// again. No-op when the id has no live element or no scrollable ancestor.
+fn reveal_element_by_id(state: &mut AppState, id: &str) {
+    let Some(target) = state
+        .arena
+        .iter()
+        .find(|(_, element)| element.id.as_deref() == Some(id))
+        .map(|(node, _)| node)
+    else {
+        return;
+    };
+    let Some(container) = scroll::scroll_into_view(&mut state.arena, &state.taffy, target) else {
+        return;
+    };
+    if state.smooth_scroll.is_some_and(|animation| animation.node_id == container) {
+        state.smooth_scroll = None;
+    }
 }
 
 const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
@@ -1492,7 +1519,37 @@ fn tick_grid_animations_core(
 /// goes through this so both animation kinds share the fast-paint path,
 /// the pacer bypass, and the wake cadence.
 fn animations_active(state: &AppState) -> bool {
-    state.smooth_scroll.is_some() || !state.grid_animations.is_empty()
+    state.smooth_scroll.is_some() || !state.grid_animations.is_empty() || state.drag_autorepeat
+}
+
+/// Grace past each drag auto-repeat tick that the Timer-fallback waker is
+/// kept alive for, so a held-still pointer keeps the chain ticking until
+/// the next frame disarms it.
+const DRAG_AUTOREPEAT_WAKE_GRACE: Duration = Duration::from_millis(250);
+
+/// One animation-frame step of drag auto-repeat
+/// ([`unshit_core::event::drag_autorepeat_event`]): while an opted-in
+/// element's drag rests outside its content box, re-dispatch
+/// `DragPhase::Update` at the last pointer position and keep the chain
+/// armed; otherwise disarm. Runs at the head of every animation frame,
+/// before the fast/slow paint split, because the handler's state change
+/// wants the same rebuild a real pointer move would get.
+fn tick_drag_autorepeat(state: &mut AppState, waker: &AnimationWaker) {
+    let Some((node, event)) = drag_autorepeat_event(&state.arena, &state.interaction) else {
+        state.drag_autorepeat = false;
+        return;
+    };
+    if let Some(element) = state.arena.get(node) {
+        if let Some(ref on_drag) = element.on_drag {
+            on_drag(&event);
+        }
+    }
+    state.interaction.drag_last_pos = (event.x, event.y);
+    state.drag_autorepeat = true;
+    state.needs_rebuild = true;
+    if state.pacing_mode == PacingMode::Timer {
+        waker.extend_until(Instant::now() + DRAG_AUTOREPEAT_WAKE_GRACE);
+    }
 }
 
 fn can_fast_paint_animations(state: &AppState) -> bool {
@@ -3024,6 +3081,7 @@ impl AppHandler {
             dw_rasterizer,
             interaction: InteractionState::default(),
             needs_rebuild: false,
+            pending_scroll_into_view: None,
             needs_restyle: false,
             needs_relayout: false,
             restyle_root: None,
@@ -3047,6 +3105,7 @@ impl AppHandler {
             scrollbar_visual: ScrollbarVisualState::default(),
             smooth_scroll: None,
             grid_animations: HashMap::new(),
+            drag_autorepeat: false,
             animation_next_frame: None,
             force_animation_paint: false,
             active_transitions: ActiveTransitions::default(),
@@ -3171,6 +3230,10 @@ impl ApplicationHandler for AppHandler {
         for event in self.event_rx.try_iter() {
             match event {
                 ExternalEvent::RequestRebuild => {
+                    coalescer.observe(true);
+                }
+                ExternalEvent::ScrollIntoView(id) => {
+                    state.pending_scroll_into_view = Some(id);
                     coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
@@ -3738,6 +3801,21 @@ impl ApplicationHandler for AppHandler {
                             }
                         }
                         state.interaction.drag_last_pos = pos;
+                        // Arm drag auto-repeat when an opted-in target's
+                        // pointer leaves its content box; the animation
+                        // frame (`tick_drag_autorepeat`) keeps it ticking
+                        // and disarms it once the pointer comes back.
+                        let due = drag_autorepeat_event(&state.arena, &state.interaction).is_some();
+                        if due && !state.drag_autorepeat {
+                            state.drag_autorepeat = true;
+                            kick_animation(
+                                state,
+                                &self.app.animation_waker,
+                                Instant::now() + DRAG_AUTOREPEAT_WAKE_GRACE,
+                            );
+                        } else if !due {
+                            state.drag_autorepeat = false;
+                        }
                     }
                     state.needs_rebuild = true;
                     state.window.request_redraw();
@@ -3846,6 +3924,9 @@ impl ApplicationHandler for AppHandler {
                             ) {
                                 state.smooth_scroll = None;
                                 match hit.part {
+                                    ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                                        scroll::scroll_from_arrow(&mut state.arena, &hit);
+                                    }
                                     ScrollbarPart::Thumb => {
                                         let grab_offset = match hit.axis {
                                             ScrollbarAxis::Vertical => {
@@ -4190,6 +4271,7 @@ impl ApplicationHandler for AppHandler {
                                 state.interaction.drag_origin = None;
                                 state.interaction.drag_target = None;
                                 state.interaction.dragging = false;
+                                state.drag_autorepeat = false;
                                 state.interaction.mousedown_target = None;
                                 state.needs_rebuild = true;
                                 state.window.request_redraw();
@@ -4294,6 +4376,7 @@ impl ApplicationHandler for AppHandler {
                     state.interaction.drag_origin = None;
                     state.interaction.drag_target = None;
                     state.interaction.dragging = false;
+                    state.drag_autorepeat = false;
                     state.interaction.mousedown_target = None;
                     state.needs_rebuild = true;
                     state.window.request_redraw();
@@ -4435,12 +4518,20 @@ impl ApplicationHandler for AppHandler {
                                         modifiers: combo.modifiers,
                                         text: event.text.as_ref().map(|t| t.to_string()),
                                     });
+                                    let mut reveal_id = None;
                                     if let Some(element) = state.arena.get(focused_id) {
                                         for (et, handler) in &element.handlers {
                                             if *et == EventType::KeyboardCapture {
-                                                handler(&kbd_event);
+                                                if let Some(response) = handler(&kbd_event) {
+                                                    if let Ok(request) = response.downcast::<unshit_core::event::RequestScrollIntoView>() {
+                                                        reveal_id = Some(request.0);
+                                                    }
+                                                }
                                             }
                                         }
+                                    }
+                                    if let Some(id) = reveal_id {
+                                        reveal_element_by_id(state, &id);
                                     }
                                     state.needs_rebuild = true;
                                     state.window.request_redraw();
@@ -4845,6 +4936,7 @@ impl ApplicationHandler for AppHandler {
                         (0, None)
                     };
                 let force_animation_paint = std::mem::take(&mut state.force_animation_paint);
+                tick_drag_autorepeat(state, &self.app.animation_waker);
                 let animation_active = animations_active(state);
                 if animation_active && can_fast_paint_animations(state) {
                     // Timer fallback only: the due-gate paces the chain at
@@ -5082,6 +5174,9 @@ impl ApplicationHandler for AppHandler {
                         metrics.layout_us = t3.elapsed().as_micros() as u64;
                     }
 
+                    if let Some(id) = state.pending_scroll_into_view.take() {
+                        reveal_element_by_id(state, &id);
+                    }
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
                     state.needs_restyle = false;

@@ -8,12 +8,16 @@
 //! top by the app state.
 
 pub mod graph;
-pub mod highlight;
+/// The snippet tokenizer lives at [`crate::syntax`] now that the editor and
+/// the diff viewer colour whole files with it. Re-exported under the old
+/// name so `flow_explorer::highlight::…` paths keep working.
+pub use crate::syntax as highlight;
 pub mod ingest;
 pub mod model;
 pub mod pane;
 pub mod poller;
 pub mod producer;
+pub mod skills;
 pub mod snippet;
 pub mod telemetry;
 pub mod tree;

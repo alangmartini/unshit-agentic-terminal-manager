@@ -29,6 +29,12 @@ pub enum EventType {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestRebuild;
 
+/// Response from a keyboard-capture handler to reveal an existing element by
+/// its HTML id in its nearest scroll container. Keyboard capture still rebuilds
+/// the tree normally, so the handler may also update selection state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestScrollIntoView(pub String);
+
 /// Events related to IME (Input Method Editor) composition, used for CJK and other complex input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
@@ -899,6 +905,59 @@ pub fn find_drag_handler(arena: &NodeArena, start: NodeId) -> Option<NodeId> {
     None
 }
 
+/// Drag auto-repeat: the synthetic `DragPhase::Update` a framework should
+/// dispatch on this animation frame, if any.
+///
+/// Fires only while a drag is active on an element that opted in through
+/// `Element::drag_autorepeat` and the pointer currently rests *outside*
+/// that element's content box (padding box origin, matching the
+/// `local_x`/`local_y` convention of real drag events). The event carries
+/// the last pointer position with zero per-event deltas, so a handler that
+/// scrolls toward the pointer keeps scrolling while the mouse is held
+/// still past the edge. Returns the handler node and the event; `None`
+/// means no auto-repeat is due (no drag, target not opted in, or pointer
+/// inside the box).
+pub fn drag_autorepeat_event(
+    arena: &NodeArena,
+    interaction: &InteractionState,
+) -> Option<(NodeId, DragEvent)> {
+    if !interaction.dragging {
+        return None;
+    }
+    let node = interaction.drag_target?;
+    let element = arena.get(node)?;
+    if !element.drag_autorepeat || element.on_drag.is_none() {
+        return None;
+    }
+    let (x, y) = interaction.last_cursor_pos;
+    let r = element.layout_rect;
+    let p = &element.computed_style.padding;
+    let local_x = x - r.x - p.left;
+    let local_y = y - r.y - p.top;
+    let content_w = (r.width - p.left - p.right).max(0.0);
+    let content_h = (r.height - p.top - p.bottom).max(0.0);
+    let outside = local_x < 0.0 || local_y < 0.0 || local_x > content_w || local_y > content_h;
+    if !outside {
+        return None;
+    }
+    let origin = interaction.drag_origin.unwrap_or((x, y));
+    Some((
+        node,
+        DragEvent {
+            phase: DragPhase::Update,
+            x,
+            y,
+            local_x,
+            local_y,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            total_delta_x: x - origin.0,
+            total_delta_y: y - origin.1,
+            button: interaction.drag_button,
+        },
+    ))
+}
+
 /// Walk up from `start` through the parent chain, returning the first node
 /// that has an `on_context_menu` handler.
 pub fn find_context_menu_handler(arena: &NodeArena, start: NodeId) -> Option<NodeId> {
@@ -1576,5 +1635,99 @@ mod tests_mouse_selection_support {
     #[test]
     fn modifiers_display_empty() {
         assert_eq!(Modifiers::empty().to_string(), "");
+    }
+}
+
+#[cfg(test)]
+mod drag_autorepeat_tests {
+    use super::*;
+    use crate::element::{Element, LayoutRect, Tag};
+    use crate::style::types::Edges;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An opted-in draggable element at (10, 20) sized 104x54 with 2px of
+    /// padding on every side, so its content box is (12, 22) sized 100x50
+    /// and `local_*` exclude the padding.
+    fn opted_in_element(arena: &mut NodeArena, hits: Arc<AtomicUsize>) -> NodeId {
+        let mut elem = Element::new(Tag::Div);
+        elem.layout_rect = LayoutRect { x: 10.0, y: 20.0, width: 104.0, height: 54.0 };
+        elem.computed_style.padding = Edges { top: 2.0, right: 2.0, bottom: 2.0, left: 2.0 };
+        elem.on_drag = Some(Arc::new(move |_ev: &DragEvent| {
+            hits.fetch_add(1, Ordering::SeqCst);
+        }));
+        elem.drag_autorepeat = true;
+        arena.alloc(elem)
+    }
+
+    fn dragging(node: NodeId, pos: (f32, f32)) -> InteractionState {
+        InteractionState {
+            dragging: true,
+            drag_target: Some(node),
+            drag_origin: Some((50.0, 40.0)),
+            drag_button: MouseButton::Left,
+            last_cursor_pos: pos,
+            ..InteractionState::default()
+        }
+    }
+
+    #[test]
+    fn pointer_below_the_content_box_yields_an_update_with_zero_deltas() {
+        let mut arena = NodeArena::new();
+        let node = opted_in_element(&mut arena, Arc::new(AtomicUsize::new(0)));
+        let interaction = dragging(node, (50.0, 100.0));
+
+        let (target, ev) = drag_autorepeat_event(&arena, &interaction).expect("auto-repeat due");
+
+        assert_eq!(target, node);
+        assert_eq!(ev.phase, DragPhase::Update);
+        assert_eq!((ev.x, ev.y), (50.0, 100.0));
+        assert_eq!((ev.local_x, ev.local_y), (38.0, 78.0), "local coords exclude padding");
+        assert_eq!((ev.delta_x, ev.delta_y), (0.0, 0.0));
+        assert_eq!((ev.total_delta_x, ev.total_delta_y), (0.0, 60.0));
+        assert_eq!(ev.button, MouseButton::Left);
+    }
+
+    #[test]
+    fn pointer_past_any_edge_is_outside() {
+        let mut arena = NodeArena::new();
+        let node = opted_in_element(&mut arena, Arc::new(AtomicUsize::new(0)));
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (50.0, 5.0))).is_some(), "above");
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (200.0, 40.0))).is_some(), "right");
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (1.0, 40.0))).is_some(), "left");
+        // Inside the padding ring but outside the content box still counts.
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (11.0, 40.0))).is_some(), "padding");
+    }
+
+    #[test]
+    fn pointer_inside_or_on_the_content_box_edge_is_not_due() {
+        let mut arena = NodeArena::new();
+        let node = opted_in_element(&mut arena, Arc::new(AtomicUsize::new(0)));
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (50.0, 40.0))).is_none());
+        // Exactly on the far content edge: local == content size, not past it.
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (112.0, 72.0))).is_none());
+        assert!(drag_autorepeat_event(&arena, &dragging(node, (12.0, 22.0))).is_none());
+    }
+
+    #[test]
+    fn never_due_without_a_drag_an_opt_in_or_a_handler() {
+        let mut arena = NodeArena::new();
+        let node = opted_in_element(&mut arena, Arc::new(AtomicUsize::new(0)));
+        let outside = (50.0, 100.0);
+
+        let mut idle = dragging(node, outside);
+        idle.dragging = false;
+        assert!(drag_autorepeat_event(&arena, &idle).is_none(), "no drag");
+
+        let mut no_target = dragging(node, outside);
+        no_target.drag_target = None;
+        assert!(drag_autorepeat_event(&arena, &no_target).is_none(), "no target");
+
+        arena.get_mut(node).unwrap().drag_autorepeat = false;
+        assert!(drag_autorepeat_event(&arena, &dragging(node, outside)).is_none(), "not opted in");
+
+        arena.get_mut(node).unwrap().drag_autorepeat = true;
+        arena.get_mut(node).unwrap().on_drag = None;
+        assert!(drag_autorepeat_event(&arena, &dragging(node, outside)).is_none(), "no handler");
     }
 }

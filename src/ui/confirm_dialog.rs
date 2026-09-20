@@ -88,6 +88,12 @@ pub fn build_confirm_dialog_overlay(snap: &UiSnapshot, shared: &SharedState) -> 
             error,
         } => build_flow_request_card(*mode, buffer, error.as_deref(), shared),
         ConfirmDialog::UpdateAvailable => build_update_card(&snap.update, shared),
+        ConfirmDialog::GotoLine { buffer, error, .. } => {
+            build_goto_line_card(buffer, error.as_deref(), shared)
+        }
+        ConfirmDialog::DiffRequest { buffer, error } => {
+            build_diff_request_card(buffer, error.as_deref(), shared)
+        }
     };
 
     let backdrop_shared = shared.clone();
@@ -712,6 +718,131 @@ fn build_rename_session_card(
 /// `base..head`) and an "Ask agent" button that dispatches
 /// `dialog.flow_commit`. A precondition failure comes back as `error`
 /// under the input, the same way the rename dialog reports a failed RPC.
+/// The three one-line text prompts (Flow request, go-to-line, diff
+/// against) differ only in their words and which dialog variant they
+/// write back into, so they share one builder.
+struct TextPrompt<'a> {
+    /// Element id, for screenshot assertions and element-tree tests.
+    id: String,
+    /// Extra class beyond the shared prompt-card classes.
+    extra_class: &'a str,
+    title: &'a str,
+    /// One paragraph per entry, in order.
+    bodies: &'a [&'a str],
+    placeholder: &'a str,
+    value: &'a str,
+    error: Option<&'a str>,
+    submit_label: &'a str,
+    /// Dispatched by Enter and by the primary button.
+    commit_command: &'static str,
+    /// Copies the input's live text into the dialog. The commit handler
+    /// takes the dialog out of state, so it only ever sees what this
+    /// wrote back; a non-capturing `fn` keeps each call site's variant
+    /// explicit.
+    set_buffer: fn(&mut crate::state::AppState, String),
+}
+
+fn build_text_prompt_card(prompt: TextPrompt<'_>, shared: &SharedState) -> ElementDef {
+    let TextPrompt {
+        id,
+        extra_class,
+        title,
+        bodies,
+        placeholder,
+        value,
+        error,
+        submit_label,
+        commit_command,
+        set_buffer,
+    } = prompt;
+
+    let input_shared = shared.clone();
+    let submit_shared = shared.clone();
+    let input = ElementDef::new(Tag::Input)
+        .with_class("confirm-dialog-input")
+        .with_placeholder(placeholder)
+        .with_value(value)
+        .with_autofocus(true)
+        .on_change(move |text| {
+            let typed = text.to_string();
+            mutate_with(&input_shared, |st| set_buffer(st, typed));
+        })
+        .on_submit(move |text| {
+            let typed = text.to_string();
+            mutate_with(&submit_shared, |st| {
+                set_buffer(st, typed);
+                dispatch(st, commit_command);
+            });
+        });
+
+    let cancel_shared = shared.clone();
+    let cancel = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("cancel")
+        .on_click(move || {
+            mutate_with(&cancel_shared, |st| {
+                dispatch(st, "dialog.cancel");
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
+
+    let commit_shared = shared.clone();
+    // A Div, like Cancel beside it: a focusable `Tag::Button` here took
+    // focus on click, and when the commit re-rendered the card with an
+    // inline error the focused node was destroyed, dropping focus into
+    // the pane behind the modal. Enter still commits — the input's
+    // `on_submit` is the keyboard path.
+    let commit = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-button")
+        .with_class("primary")
+        .on_click(move || {
+            mutate_with(&commit_shared, |st| {
+                dispatch(st, commit_command);
+            });
+        })
+        .with_child(ElementDef::new(Tag::Span).with_text(submit_label.to_string()));
+
+    let error_id = id.clone();
+    let mut card = ElementDef::new(Tag::Div)
+        .with_class("confirm-dialog-card")
+        .with_class("confirm-dialog-simple-card")
+        .with_class("confirm-dialog-rename-card")
+        .with_class(extra_class)
+        .with_id(id)
+        .on_click(|| {})
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-title")
+                .with_text(title.to_string()),
+        );
+    for body in bodies {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("confirm-dialog-body")
+                .with_text((*body).to_string()),
+        );
+    }
+    card = card.with_child(input);
+    if let Some(msg) = error {
+        card = card.with_child(
+            ElementDef::new(Tag::Div)
+                // Keyed: reconciliation matches unkeyed children by
+                // position, so an error row appearing between the input
+                // and the buttons would otherwise be reconciled *onto*
+                // the buttons row and deallocate the controls in it.
+                .with_id(format!("{error_id}-error"))
+                .with_class("rename-session-error")
+                .with_text(msg.to_string()),
+        );
+    }
+    card.with_child(
+        ElementDef::new(Tag::Div)
+            .with_class("confirm-dialog-buttons")
+            .with_child(cancel)
+            .with_child(commit),
+    )
+}
+
 fn build_flow_request_card(
     mode: FlowMode,
     buffer: &str,
@@ -732,96 +863,87 @@ fn build_flow_request_card(
             "e.g. main..HEAD",
         ),
     };
-    let input_shared = shared.clone();
-    let submit_shared = shared.clone();
-    let input = ElementDef::new(Tag::Input)
-        .with_class("confirm-dialog-input")
-        .with_placeholder(placeholder)
-        .with_value(buffer)
-        .with_autofocus(true)
-        .on_change(move |text| {
-            let typed = text.to_string();
-            mutate_with(&input_shared, |st| {
+    build_text_prompt_card(
+        TextPrompt {
+            id: format!("confirm-dialog-flow-{}", mode.as_str()),
+            extra_class: "confirm-dialog-flow-card",
+            title,
+            bodies: &[
+                body,
+                "The agent runs in the workspace directory; the flow opens as a new tab \
+                 when it finishes.",
+            ],
+            placeholder,
+            value: buffer,
+            error,
+            submit_label: "Ask agent",
+            commit_command: "dialog.flow_commit",
+            set_buffer: |st, typed| {
                 if let Some(ConfirmDialog::FlowRequest { buffer, error, .. }) =
                     st.confirm_dialog.as_mut()
                 {
                     *buffer = typed;
                     *error = None;
                 }
-            });
-        })
-        .on_submit(move |text| {
-            let typed = text.to_string();
-            mutate_with(&submit_shared, |st| {
-                if let Some(ConfirmDialog::FlowRequest { buffer, .. }) = st.confirm_dialog.as_mut()
+            },
+        },
+        shared,
+    )
+}
+
+fn build_goto_line_card(buffer: &str, error: Option<&str>, shared: &SharedState) -> ElementDef {
+    build_text_prompt_card(
+        TextPrompt {
+            id: "confirm-dialog-goto-line".to_string(),
+            extra_class: "confirm-dialog-goto-card",
+            title: "Go to line",
+            bodies: &[
+                "A 1-based line number, optionally followed by `:column`. Numbers past the \
+                 end of the file land on the last line.",
+            ],
+            placeholder: "e.g. 120 or 120:8",
+            value: buffer,
+            error,
+            submit_label: "Go",
+            commit_command: "dialog.goto_commit",
+            set_buffer: |st, typed| {
+                if let Some(ConfirmDialog::GotoLine { buffer, error, .. }) =
+                    st.confirm_dialog.as_mut()
                 {
                     *buffer = typed;
+                    *error = None;
                 }
-                dispatch(st, "dialog.flow_commit");
-            });
-        });
+            },
+        },
+        shared,
+    )
+}
 
-    let cancel_shared = shared.clone();
-    let cancel = ElementDef::new(Tag::Div)
-        .with_class("confirm-dialog-button")
-        .with_class("cancel")
-        .on_click(move || {
-            mutate_with(&cancel_shared, |st| {
-                dispatch(st, "dialog.cancel");
-            });
-        })
-        .with_child(ElementDef::new(Tag::Span).with_text("Cancel".to_string()));
-
-    let ask_shared = shared.clone();
-    let ask = ElementDef::new(Tag::Button)
-        .with_class("confirm-dialog-button")
-        .with_class("primary")
-        .on_click(move || {
-            mutate_with(&ask_shared, |st| {
-                dispatch(st, "dialog.flow_commit");
-            });
-        })
-        .with_child(ElementDef::new(Tag::Span).with_text("Ask agent".to_string()));
-
-    let mut card = ElementDef::new(Tag::Div)
-        .with_class("confirm-dialog-card")
-        .with_class("confirm-dialog-simple-card")
-        .with_class("confirm-dialog-rename-card")
-        .with_class("confirm-dialog-flow-card")
-        .with_id(format!("confirm-dialog-flow-{}", mode.as_str()))
-        .on_click(|| {})
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-title")
-                .with_text(title.to_string()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-body")
-                .with_text(body.to_string()),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("confirm-dialog-body")
-                .with_text(
-                    "The agent runs in the workspace directory; the flow opens as a new tab \
-                     when it finishes."
-                        .to_string(),
-                ),
-        )
-        .with_child(input);
-    if let Some(msg) = error {
-        card = card.with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("rename-session-error")
-                .with_text(msg.to_string()),
-        );
-    }
-    card.with_child(
-        ElementDef::new(Tag::Div)
-            .with_class("confirm-dialog-buttons")
-            .with_child(cancel)
-            .with_child(ask),
+fn build_diff_request_card(buffer: &str, error: Option<&str>, shared: &SharedState) -> ElementDef {
+    build_text_prompt_card(
+        TextPrompt {
+            id: "confirm-dialog-diff-request".to_string(),
+            extra_class: "confirm-dialog-diff-card",
+            title: "Diff against…",
+            bodies: &[
+                "A revision, `base..head`, or `base...head` to diff against the merge base. \
+                 `HEAD` shows the uncommitted work in the workspace.",
+            ],
+            placeholder: "e.g. HEAD or main..HEAD",
+            value: buffer,
+            error,
+            submit_label: "Show diff",
+            commit_command: "dialog.diff_commit",
+            set_buffer: |st, typed| {
+                if let Some(ConfirmDialog::DiffRequest { buffer, error }) =
+                    st.confirm_dialog.as_mut()
+                {
+                    *buffer = typed;
+                    *error = None;
+                }
+            },
+        },
+        shared,
     )
 }
 
@@ -1008,6 +1130,78 @@ mod tests {
             count,
             remember,
             kept_pane_ids: kept_pane_ids.iter().copied().collect(),
+        }
+    }
+
+    fn goto_dialog(error: Option<&str>) -> ConfirmDialog {
+        ConfirmDialog::GotoLine {
+            pane_id: 1,
+            buffer: "abc".to_string(),
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn card_of(dialog: ConfirmDialog) -> ElementDef {
+        let s = shared();
+        s.lock().unwrap().confirm_dialog = Some(dialog);
+        let snap = s.lock().unwrap().ui_snapshot();
+        build_confirm_dialog_overlay(&snap, &s)
+    }
+
+    fn walk_classes(el: &ElementDef, class: &str, out: &mut Vec<String>) {
+        if el.classes.iter().any(|c| c == class) {
+            out.push(el.id.clone().unwrap_or_default());
+        }
+        for child in &el.children {
+            walk_classes(child, class, out);
+        }
+    }
+
+    fn focusable_tags(el: &ElementDef, out: &mut Vec<Tag>) {
+        if matches!(el.tag, Tag::Button | Tag::Select) || el.tab_index.is_some() {
+            out.push(el.tag);
+        }
+        for child in &el.children {
+            focusable_tags(child, out);
+        }
+    }
+
+    /// Committing an invalid line number re-renders the card with an
+    /// inline error. The error row used to be unkeyed, so reconciliation
+    /// matched it onto the buttons row by position and deallocated the
+    /// focused control — and focus then fell into the pane behind the
+    /// modal, where the retyped number was inserted into the document.
+    #[test]
+    fn a_validation_error_keeps_the_prompt_s_controls_and_its_focus() {
+        let clean = card_of(goto_dialog(None));
+        let failed = card_of(goto_dialog(Some("Not a line number")));
+
+        let mut buttons_clean = Vec::new();
+        walk_classes(&clean, "confirm-dialog-button", &mut buttons_clean);
+        let mut buttons_failed = Vec::new();
+        walk_classes(&failed, "confirm-dialog-button", &mut buttons_failed);
+        assert_eq!(buttons_clean.len(), 2, "Cancel and Go");
+        assert_eq!(
+            buttons_failed.len(),
+            buttons_clean.len(),
+            "the error must not cost the card its controls"
+        );
+
+        // The error row carries a key, so it is reconciled as itself
+        // rather than onto whatever sat at its index before.
+        let mut errors = Vec::new();
+        walk_classes(&failed, "rename-session-error", &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(!errors[0].is_empty(), "the error row must be keyed");
+
+        // Nothing in the card may take focus away from the input.
+        for card in [&clean, &failed] {
+            let mut tags = Vec::new();
+            focusable_tags(card, &mut tags);
+            assert!(
+                tags.iter().all(|tag| *tag == Tag::Input),
+                "only the input may be focusable, found {tags:?}"
+            );
         }
     }
 

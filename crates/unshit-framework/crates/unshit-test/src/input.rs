@@ -2,9 +2,10 @@ use std::time::Instant;
 use unshit_app::app::{apply_scroll_grid_patch, ScrollGridPatch};
 use unshit_core::element::{ElementContent, InputType, Tag};
 use unshit_core::event::{
-    dispatch_click, dispatch_context_menu, find_drag_handler, find_focusable_ancestor, hit_test,
-    next_focusable, prev_focusable, word_boundary_at, DragEvent, DragPhase, Event, EventType,
-    Modifiers, MouseButton, ScrollEvent, TextSelection, DRAG_THRESHOLD,
+    dispatch_click, dispatch_context_menu, drag_autorepeat_event, find_drag_handler,
+    find_focusable_ancestor, hit_test, next_focusable, prev_focusable, word_boundary_at, DragEvent,
+    DragPhase, Event, EventType, Modifiers, MouseButton, MouseEvent, MouseEventKind, ScrollEvent,
+    TextSelection, DRAG_THRESHOLD,
 };
 use unshit_core::id::NodeId;
 use unshit_core::layout;
@@ -150,6 +151,9 @@ impl TestHarness {
         // Check scrollbar hit first
         if let Some(hit) = scroll::find_scrollbar_at(&self.arena, self.root, x, y) {
             match hit.part {
+                ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                    scroll::scroll_from_arrow(&mut self.arena, &hit);
+                }
                 ScrollbarPart::Thumb => {
                     let grab_offset = match hit.axis {
                         ScrollbarAxis::Vertical => y - hit.geometry.thumb_y,
@@ -205,6 +209,11 @@ impl TestHarness {
             self.needs_restyle = true;
         }
 
+        // Press reaches the nearest `MouseDown` handler with element-local
+        // coordinates, as in the app: grid handlers place a selection
+        // anchor here, before any drag can extend it.
+        self.dispatch_button_event(hovered, EventType::MouseDown, MouseEventKind::Down, x, y);
+
         let new_focused = find_focusable_ancestor(&self.arena, self.interaction.hovered)
             .unwrap_or(NodeId::DANGLING);
         if new_focused != self.interaction.focused {
@@ -248,6 +257,47 @@ impl TestHarness {
         }
     }
 
+    /// Walk up from `start` to the nearest element with a handler for
+    /// `event_type` (`MouseDown` / `MouseUp`) and invoke it with a button
+    /// event carrying window and element-local coordinates, mirroring the
+    /// app's `dispatch_mouse_button_event`. Returns whether one fired.
+    fn dispatch_button_event(
+        &self,
+        start: NodeId,
+        event_type: EventType,
+        kind: MouseEventKind,
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let mut node = start;
+        while !node.is_dangling() {
+            let Some(element) = self.arena.get(node) else {
+                break;
+            };
+            let handler = element
+                .handlers
+                .iter()
+                .find(|(et, _)| *et == event_type)
+                .map(|(_, handler)| handler.clone());
+            if let Some(handler) = handler {
+                let (local_x, local_y) = drag_local_coords(&self.arena, node, x, y);
+                let event = Event::Mouse(MouseEvent {
+                    kind,
+                    x,
+                    y,
+                    local_x,
+                    local_y,
+                    button: MouseButton::Left,
+                    modifiers: Modifiers::empty(),
+                });
+                handler(&event);
+                return true;
+            }
+            node = element.parent;
+        }
+        false
+    }
+
     /// Simulate a mouse button release at (x, y).
     pub fn mouse_up(&mut self, x: f32, y: f32) {
         if self.interaction.scrollbar_drag.is_some() {
@@ -256,6 +306,11 @@ impl TestHarness {
             self.interaction.last_cursor_pos = (x, y);
             return;
         }
+
+        // Release reaches the nearest `MouseUp` handler under the pointer,
+        // as in the app, whether or not a drag was in flight.
+        let under_pointer = hit_test(&self.arena, self.root, x, y).unwrap_or(NodeId::DANGLING);
+        self.dispatch_button_event(under_pointer, EventType::MouseUp, MouseEventKind::Up, x, y);
 
         // If a drag was active, dispatch DragEnd and suppress click
         if self.interaction.dragging {
@@ -447,6 +502,24 @@ impl TestHarness {
             }
             node = parent;
         }
+    }
+
+    /// Drive one framework drag auto-repeat tick: while a drag on an element
+    /// that opted in via `ElementDef::with_drag_autorepeat` rests outside its
+    /// content box, re-dispatch `DragPhase::Update` at the last pointer
+    /// position, mirroring the app's per-animation-frame
+    /// `tick_drag_autorepeat`. Returns whether an update was dispatched.
+    pub fn tick_drag_autorepeat(&mut self) -> bool {
+        let Some((node, event)) = drag_autorepeat_event(&self.arena, &self.interaction) else {
+            return false;
+        };
+        if let Some(element) = self.arena.get(node) {
+            if let Some(ref on_drag) = element.on_drag {
+                on_drag(&event);
+            }
+        }
+        self.interaction.drag_last_pos = (event.x, event.y);
+        true
     }
 
     /// Simulate a text selection drag from (start_x, start_y) to (end_x, end_y).

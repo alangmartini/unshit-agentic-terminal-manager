@@ -13,8 +13,12 @@ pub mod browser;
 pub mod command_palette;
 pub mod daemon;
 pub mod diagnostics;
+pub mod diff;
+pub mod diff_review;
 pub mod drag;
 pub mod editor;
+pub mod explorer;
+pub mod file_index;
 pub mod flow_explorer;
 pub mod git;
 pub mod git_watch;
@@ -31,6 +35,7 @@ pub mod shell;
 pub mod startup;
 pub mod startup_perf;
 pub mod state;
+pub mod syntax;
 pub mod telemetry_sink;
 pub mod terminal;
 pub mod theme;
@@ -264,11 +269,14 @@ fn build_tree(
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
     window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
+    let sidebar_width = if snap.sidebar_collapsed {
+        48.0
+    } else {
+        snap.sidebar_width
+    };
     let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
-        .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
-        .with_style(StyleDeclaration::MinWidth(Dimension::Px(
-            snap.sidebar_width,
-        )));
+        .with_style(StyleDeclaration::Width(Dimension::Px(sidebar_width)))
+        .with_style(StyleDeclaration::MinWidth(Dimension::Px(sidebar_width)));
 
     let drag_shared = shared.clone();
     let sidebar_resizer = ElementDef::new(Tag::Div)
@@ -331,12 +339,17 @@ fn build_tree(
         root = root.with_style(StyleDeclaration::FontScale(config_font_scale));
     }
 
-    if snap.settings_open {
+    // Review owns the content area, like Settings. Keep daemon sessions
+    // alive while avoiding layout and painting of the obscured terminals.
+    if snap.settings_open && snap.diff_review.is_none() {
         root = root
             .with_class("settings")
             .with_child(build_settings_page(snap, shared))
-            .with_child(with_custom_surface_style(build_statusbar(snap), snap));
-    } else {
+            .with_child(with_custom_surface_style(
+                build_statusbar(snap, shared),
+                snap,
+            ));
+    } else if snap.diff_review.is_none() {
         root = root.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("layout")
@@ -348,7 +361,10 @@ fn build_tree(
                         .with_class("role-main")
                         .with_child(build_tabbar(snap, shared))
                         .with_child(build_terminal_grid(snap, shared, grids))
-                        .with_child(with_custom_surface_style(build_statusbar(snap), snap)),
+                        .with_child(with_custom_surface_style(
+                            build_statusbar(snap, shared),
+                            snap,
+                        )),
                 ),
         );
     }
@@ -364,7 +380,9 @@ fn build_tree(
 
     ElementTree {
         root: root
+            .with_child(crate::ui::diff_review::build(snap, shared))
             .with_child(build_ctx_menu_overlay(snap, shared))
+            .with_child(crate::ui::process_details::build(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
@@ -957,6 +975,7 @@ fn main() {
                 let cols = snapshot.grid.cols();
                 let mut terminal = crate::terminal::Terminal::new(rows, cols);
                 terminal.apply_snapshot(&snapshot);
+                terminal.set_telemetry_pane(pane_id);
                 guard.terminals.insert(
                     pane_id,
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
@@ -984,8 +1003,9 @@ fn main() {
                 );
             }
             Ok((None, reader)) => {
-                let terminal =
+                let mut terminal =
                     crate::terminal::Terminal::new(init_rows as usize, init_cols as usize);
+                terminal.set_telemetry_pane(pane_id);
                 guard.terminals.insert(
                     pane_id,
                     std::sync::Arc::new(std::sync::Mutex::new(terminal)),
@@ -1191,13 +1211,11 @@ fn main() {
                 true
             })),
             on_file_drop: Some(Arc::new(move |paths: &[std::path::PathBuf]| -> bool {
-                // Native drag-and-drop. When the Quick Prompt overlay is
-                // open, attach any dropped image files as chips (the
-                // drag-and-drop counterpart to Ctrl+V). When it is closed,
-                // `attach_dropped_images` is a no-op and we request no
-                // rebuild, leaving terminal drops untouched.
+                // The review overlay accepts one patch; Quick Prompt accepts
+                // images. Both handlers are no-ops while their overlay is closed.
                 let mut guard = file_drop_shared.lock_recover();
-                crate::state::attach_dropped_images(&mut guard, paths)
+                crate::diff_review::accept_drop(&mut guard, paths)
+                    || crate::state::attach_dropped_images(&mut guard, paths)
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
@@ -1381,6 +1399,7 @@ fn main() {
         },
     );
     let _ = window_event_sink.set(app.event_sink());
+    crate::diff_review::start(shared.clone(), app.event_sink());
 
     // Branch names are decoration, so they are resolved after the window is
     // on its way up rather than in front of it. Started here, immediately
@@ -1410,14 +1429,21 @@ fn main() {
     {
         let hooks_shared = shared.clone();
         let hooks_sink = window_event_sink.clone();
+        let reveal_sink = window_event_sink.clone();
         crate::state::register_editor_open_hooks(crate::state::EditorOpenHooks {
             shared: hooks_shared,
+            request_reveal: Box::new(move |id| {
+                if let Some(sink) = reveal_sink.get() {
+                    let _ = sink.send(unshit::app::ExternalEvent::ScrollIntoView(id));
+                }
+            }),
             request_rebuild: Box::new(move || {
                 if let Some(sink) = hooks_sink.get() {
                     let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
                 }
             }),
         });
+        crate::state::start_explorer_refresh();
     }
 
     // Self-update: the check and download threads need the same way back
@@ -1464,16 +1490,36 @@ fn main() {
     // Dev/automation hook: dispatch `;`-separated state commands once at
     // startup (screenshot scripts, desktop regression). Not a user
     // surface; commands run with the same rights as any local keybind.
+    //
+    // The lock is taken per command, not once for the batch, so the
+    // pseudo-command `sleep:<ms>` can hand it to a background worker:
+    // without that, an e2e chain can never observe anything a worker
+    // produces (a loaded diff pane, a built file index) and can only ever
+    // drive the synchronous half of a feature.
     if let Ok(commands) = std::env::var("TM_STARTUP_DISPATCH") {
         // One-shot: children must not inherit it. The self-update installer
         // (and the app it relaunches) would otherwise replay `update.install`.
         std::env::remove_var("TM_STARTUP_DISPATCH");
-        let mut guard = shared.lock_recover();
         for command in commands.split(';').filter(|c| !c.trim().is_empty()) {
-            let handled = crate::state::dispatch(&mut guard, command.trim());
+            let command = command.trim();
+            if let Some(ms) = command.strip_prefix("sleep:") {
+                let ms: u64 = ms.parse().unwrap_or(0);
+                // Bounded: a typo must not wedge startup before the event
+                // loop is even entered.
+                let ms = ms.min(30_000);
+                log::info!(
+                    "{{\"event\":\"startup.dispatch_sleep\",\"level\":\"info\",\"ms\":{ms}}}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                continue;
+            }
+            let handled = {
+                let mut guard = shared.lock_recover();
+                crate::state::dispatch(&mut guard, command)
+            };
             log::info!(
                 "{{\"event\":\"startup.dispatch\",\"level\":\"info\",\"command\":{:?},\"handled\":{}}}",
-                command.trim(),
+                command,
                 handled
             );
         }
@@ -1576,6 +1622,54 @@ mod tests {
                 snap.layout_rect.x >= 0.0 && snap.layout_rect.x + snap.layout_rect.width <= 1280.0,
                 "{selector} should be horizontally visible, got {:?}",
                 snap.layout_rect
+            );
+        }
+    }
+
+    #[test]
+    fn conceptual_flow_rows_have_visible_layout() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut state = seed_state();
+        crate::state::mutate_add_flow_tab(
+            &mut state,
+            crate::flow_explorer::FlowPane::open(&path).unwrap(),
+        );
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let grids = std::collections::HashMap::new();
+        let rebuild_snap = snap.clone();
+        let rebuild_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&snap, &shared, &grids, None),
+            1400.0,
+            950.0,
+        );
+        harness.set_scale_factor(1.25);
+        harness.step();
+        harness.rebuild(move || {
+            build_tree(
+                &rebuild_snap,
+                &rebuild_shared,
+                &std::collections::HashMap::new(),
+                None,
+            )
+        });
+        harness.step();
+        let tree = harness.query(".flow-tree").unwrap().layout_rect;
+        let rows = harness.query_all(".flow-row");
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            assert!(
+                row.layout_rect.width >= 100.0 && row.layout_rect.height >= 12.0,
+                "row collapsed: {:?}; tree: {tree:?}",
+                row.layout_rect
+            );
+            assert!(
+                row.layout_rect.y >= tree.y && row.layout_rect.y < tree.y + tree.height,
+                "row outside viewport: {:?}; tree: {tree:?}",
+                row.layout_rect
             );
         }
     }
@@ -1727,6 +1821,233 @@ mod tests {
             guard.active_pane,
             crate::state::PaneId(2),
             "scrolling must not move keyboard focus"
+        );
+    }
+
+    /// One pane over a 3x5 terminal holding `L0`..`L5`: `L0`..`L2` in
+    /// scrollback, `L3`..`L5` live, so absolute line `n` shows text `Ln`.
+    /// Returns the shared state, a harness over the real tree, and the
+    /// grid's layout rect (`.terminal-content` has no padding, so pointer
+    /// coordinates relative to it are the drag's `local_x`/`local_y`).
+    fn selection_drag_fixture() -> (SharedState, TestHarness, unshit::core::element::LayoutRect) {
+        use unshit::core::cell_grid::CellGrid;
+
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut state = seed_state();
+        let pane = crate::state::Pane {
+            id: crate::state::PaneId(1),
+            title: "one".to_string(),
+            subtitle: "bash".to_string(),
+            pid: 0,
+            cpu: 0.0,
+            mem_bytes: 0,
+        };
+        state.panes = vec![vec![pane]];
+        state.row_ratios = vec![1.0];
+        state.col_ratios = vec![vec![1.0]];
+        state.tabs[0].panes = state.panes.clone();
+        state.tabs[0].row_ratios = state.row_ratios.clone();
+        state.tabs[0].col_ratios = state.col_ratios.clone();
+        state.active_pane = crate::state::PaneId(1);
+        state.tabs[0].active_pane = crate::state::PaneId(1);
+
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        term.process_bytes(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5");
+        state.terminals.insert(1, Arc::new(Mutex::new(term)));
+
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1u32, CellGrid::new(3, 5));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
+            1280.0,
+            900.0,
+        );
+        harness.step();
+
+        let contents = harness.query_all(".terminal-content");
+        assert_eq!(contents.len(), 1, "the pane must render a grid");
+        let rect = contents[0].layout_rect;
+        (shared, harness, rect)
+    }
+
+    fn selection_of(shared: &SharedState, pane: u32) -> crate::state::TermSelection {
+        shared
+            .lock()
+            .unwrap()
+            .terminal_selections
+            .get(&pane)
+            .copied()
+            .expect("a live selection")
+    }
+
+    fn scroll_offset_of(shared: &SharedState, pane: u32) -> usize {
+        shared
+            .lock()
+            .unwrap()
+            .terminals
+            .get(&pane)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .scroll_offset()
+    }
+
+    /// A wheel notch mid-drag scrolls the view under the selection without
+    /// moving its anchor: the anchor stays on the text it was pressed on
+    /// and only the focus follows the pointer's new absolute line.
+    #[test]
+    fn selection_anchor_survives_a_wheel_scroll_mid_drag() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+
+        // Press on live row 0 (`L3`, absolute line 3), drag to row 2 (`L5`).
+        harness.mouse_down(x, rect.y + 0.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (3, 5));
+
+        // Wheel up one line while the button is still held.
+        harness.mouse_wheel(x, rect.y + 2.5 * cell_h, 0.0, cell_h);
+        harness.step();
+        assert_eq!(scroll_offset_of(&shared, 1), 1);
+
+        // The pointer barely moves, but the row under it now shows `L4`.
+        harness.mouse_move(x + 1.0, rect.y + 2.5 * cell_h);
+        harness.step();
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            sel.anchor.0, 3,
+            "anchor must stay on the line it was pressed on"
+        );
+        assert_eq!(
+            sel.focus.0, 4,
+            "focus follows the pointer's absolute line after the scroll"
+        );
+    }
+
+    /// Dragging past the top edge auto-scrolls the scrollback toward the
+    /// pointer and pins the focus to the (now older) top row while the
+    /// anchor stays put; holding still keeps scrolling through the
+    /// framework's drag auto-repeat, and releasing ends it.
+    #[test]
+    fn drag_past_the_top_edge_autoscrolls_and_keeps_the_anchor() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+
+        // Press on live row 2 (`L5`), drag above the pane's top edge.
+        harness.mouse_down(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y - 8.0);
+        harness.step();
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            1,
+            "the first overshooting update scrolls a line at once"
+        );
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            sel.anchor.0, 5,
+            "anchor stays on the line it was pressed on"
+        );
+        assert_eq!(sel.focus.0, 2, "focus is pinned to the new top row (`L2`)");
+
+        // Held still past the edge: the auto-repeat tick keeps scrolling,
+        // metered by wall clock (12 lines/s one row past the edge). Backdate
+        // the meter by a second instead of sleeping: that asks for 12 lines
+        // and the scrollback only holds two more, so however long the tick
+        // itself takes the outcome is exact.
+        {
+            let mut st = shared.lock().unwrap();
+            let auto = st
+                .terminal_drag_autoscroll
+                .as_mut()
+                .expect("auto-scroll is armed while the pointer rests past the edge");
+            auto.last_tick = auto
+                .last_tick
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("the monotonic clock is past its first second");
+        }
+        assert!(
+            harness.tick_drag_autorepeat(),
+            "the grid opted in, so it keeps receiving drag updates"
+        );
+        harness.step();
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            3,
+            "scrolls as far as the scrollback goes"
+        );
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 0));
+
+        // Releasing ends the drag: no further auto-repeat, view stays put,
+        // selection survives.
+        harness.mouse_up(x, rect.y - 8.0);
+        harness.step();
+        assert!(!harness.tick_drag_autorepeat());
+        assert_eq!(scroll_offset_of(&shared, 1), 3);
+        let sel = selection_of(&shared, 1);
+        assert_eq!((sel.anchor.0, sel.focus.0), (5, 0));
+        assert!(
+            shared.lock().unwrap().terminal_drag_autoscroll.is_none(),
+            "auto-scroll bookkeeping is closed out on release"
+        );
+    }
+
+    /// A pane whose program owns the mouse (Claude Code in its alternate
+    /// screen, vim, less with mouse support) scrolls its own viewport, so
+    /// dragging past its edge must not move our scrollback under the
+    /// highlight.
+    #[test]
+    fn drag_past_the_edge_does_not_autoscroll_a_mouse_reporting_pane() {
+        let (shared, mut harness, rect) = selection_drag_fixture();
+        let cell_h = 20.0;
+        let x = rect.x + 25.0;
+        shared
+            .lock()
+            .unwrap()
+            .terminals
+            .get(&1)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1000h");
+
+        harness.mouse_down(x, rect.y + 2.5 * cell_h);
+        harness.step();
+        harness.mouse_move(x, rect.y - 8.0);
+        harness.step();
+        assert!(harness.tick_drag_autorepeat());
+        harness.step();
+
+        assert_eq!(
+            scroll_offset_of(&shared, 1),
+            0,
+            "the program owns the viewport"
+        );
+        let sel = selection_of(&shared, 1);
+        assert_eq!(
+            (sel.anchor.0, sel.focus.0),
+            (5, 3),
+            "focus clamps to the live top row"
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .terminal_drag_autoscroll
+                .and_then(|auto| auto.blocked),
+            Some("mouse_reporting")
         );
     }
 

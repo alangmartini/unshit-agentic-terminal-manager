@@ -98,18 +98,30 @@ cargo build --release -p unshit-ptyd --bin unshit-ptyd
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.4.0-setup.exe`.
+The result is `dist\terminal-manager-0.5.0-setup.exe`.
 
 ## Usage
+
+- **Git diff review:** click **Review diff** in the titlebar, or find **Review Git diff** in the command palette. Choose **Last N commits** (first-parent history), **Unpushed** (the locally known push target), or **Compare base** (a branch, tag, or SHA; changes since its common ancestor with HEAD). Select a file to inspect the numbered unified patch. Enter a count/base and press Enter or **Refresh** to reload; Escape closes the view. Uses the focused session's recorded launch directory when available, otherwise the workspace directory. Staged and working-tree edits are excluded. It does not fetch or modify the repository. Large patches paginate; individual Git queries have a 4 MiB preview limit and 15-second timeout.
 
 - **Tabs:** `Ctrl+T` opens a new terminal; `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs; `Ctrl+Shift+W` closes a tab.
 - **Splits:** `Ctrl+D` splits right, `Ctrl+Shift+D` splits down, `Ctrl+W` unsplits. Move focus between panes with `Ctrl+Alt+Arrow`; `Ctrl+Arrow` remains available to terminal applications for word navigation.
 - **Command palette:** `Ctrl+Shift+P`. Type to fuzzy-search, or prefix your query with `>`, `@`, `:`, or `/` to scope the search. `Enter` runs the highlighted item, `Esc` clears the query then closes.
 - **Quick Prompt:** `Ctrl+Shift+Q`. Type a prompt, optionally paste images, pick Claude or Codex, and submit to launch the agent in a fresh worktree.
-- **Flow Explorer:** open the palette and pick **Explain flow…** (name the flow, e.g. *Send a prompt*) or **Review change as flows…** (a `base..head`, blank for the default branch up to `HEAD`). An agent tab opens; approve its single write if your agent asks, and the flow appears as a new tab when it finishes. Inside the pane: `Ctrl+1/2/3` switch call stack / panes / graph, arrows and `Enter` walk the tree or columns, `s` opens the source excerpt, `e`/`c` expand or collapse everything. The skill the app sends lives at `assets/flow-explorer/SKILL.md` and can be copied into `~/.claude/skills/` to run it by hand; **Open flow…** opens the resulting JSON.
+- **Flow Explorer:** open the palette and pick **Explain flow…** (name the flow, e.g. *Send a prompt*) or **Review change as flows…** (a `base..head`, blank for the default branch up to `HEAD`). An agent tab opens; approve its single write if your agent asks, and the flow appears as a new tab when it finishes. Inside the pane: `Ctrl+1/2/3` switch call stack / panes / graph, arrows and `Enter` walk the tree or columns, `s` opens the source excerpt, `e`/`c` expand or collapse everything.
+- **Flow skills:** in **Settings > Agent skills**, install the same `flow-explorer` skill for Codex, Claude Code, Cursor, or GitHub Copilot across your local projects. Ask an ordinary conversation to "use flow-explorer to visualize what you just explained": concepts use logical steps and lanes without requiring a repository or inventing source locations. The skill saves a unique JSON file and opens it in the running app with `terminal-manager flow open <path>`. If the app is closed, use **Open flow…** later. Settings shows each copy's path and status, offers updates, and preserves custom skills and edits. Some clients also discover other clients' skill folders; these controls manage copies, not client enable/disable preferences. Start a new agent session if the installed skill does not appear.
+- **Standalone skill flow HTML:** [skill-flow-html](assets/skill-flow-html/SKILL.md) maps a skill into a self-contained browser page with a compact overview, focused drill-down, storyline breadcrumbs and explicit right-click source viewing. Copy the folder into your project's `.agents/skills/skill-flow-html/` to install it. The [bundled example](assets/skill-flow-html/assets/example/create-worktree.flow.html) can be opened directly in a browser; this standalone renderer does not change the native Flow Explorer pane.
 - **Agents:** `Ctrl+Shift+A` starts the first installed agent CLI (checked in the order Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI; Claude Code when none is found) in the active workspace; right-click a workspace or its `agents` subtab for **New agent ›** with one row per installed CLI, or run `terminal-manager agent codex` from a terminal to open one in that terminal's workspace (`--workspace-id N` targets another). Panes whose title identifies an agent are filed under `agents` automatically and return to `terminals` when the agent exits. Right-click the `agents` subtab and choose **Kill all agents** to stop them; plain terminals are left alone.
 - **Agent recovery:** after a cold restart, open Terminal Manager and use the **Resume Claude/Codex** chip in an affected pane with an exact or unambiguous conversation id. For unattended recovery after Windows restarts, enable both **Start at Windows sign-in** and **Automatic agent resume** in **Settings → Sessions**. Enabling automatic resume immediately installs the minimal SessionStart capture hooks used to remember exact ids. Turning it off leaves those hooks installed for manual recovery; use **Remove recovery hooks** in the same section to remove only Terminal Manager's managed entries.
 - **Other:** `Ctrl+B` toggles the sidebar, `Ctrl+,` opens Settings, `F2` renames the active session, `Ctrl+=` / `Ctrl+-` zoom the font, `F11` toggles fullscreen.
+
+Git review offers **Unified** and **Side by side** views. Split view pairs the old and new lines, shares vertical scrolling, and wraps long lines within each column. Narrow windows can scroll horizontally to see both columns. Switching views keeps the loaded file and range and preserves a selected hunk; otherwise it returns to the beginning. It does not query Git again.
+
+Use **Previous hunk** / **Next hunk** to jump between changed sections of the open file. The target header appears at the top and the counter shows your position. **File start** returns to the beginning. Navigation crosses row-page boundaries without reloading Git; the footer shows the visible row range. Binary and metadata-only patches have no text hunks.
+
+Click **Mark viewed** after reviewing a file; **Viewed · Undo** clears the mark. The sidebar labels viewed files, and the progress count includes all files in the range, regardless of the path filter. Marks survive file navigation and layout changes without hiding the patch. Refreshing/changing the range or closing the review clears them. Marks are kept only for the current review session.
+
+Use **Filter files** to narrow the changed-file list by path, including a renamed file's former path. Matching ignores case and accepts either slash style. Filtering leaves the open patch in place and shows a notice if it is outside the results. **Clear filter** restores the complete list; no Git query is needed.
 
 ## Configuration
 
@@ -122,6 +134,12 @@ User data is stored under your platform config and data directories:
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
 | Agent tab classification, launch and kill events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
+| Terminal mode changes (alternate screen, mouse reporting) and selection auto-scroll events | `%APPDATA%\com.godly.terminal\terminal-events.jsonl` |
+| Editor pane opens, saves, pastes, find and quick open events | `%APPDATA%\com.godly.terminal\editor-events.jsonl` |
+| Diff pane requests, navigation and file opens | `%APPDATA%\com.godly.terminal\diff-events.jsonl` |
+| Flow Explorer opens, producer launches and hand-offs | `%APPDATA%\com.godly.terminal\flow-events.jsonl` |
+| Per-pane CPU and memory sampling events | `%APPDATA%\com.godly.terminal\resource-events.jsonl` |
+| Startup phase timings | `%APPDATA%\com.godly.terminal\startup-events.jsonl` |
 | Opt-in Windows login startup | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`Unshit Terminal Manager` value) |
 
 - **Keybindings** are editable in **Settings → Keybinds**. Each action keeps a stable id and is persisted as JSON; defaults follow Windows conventions (see the table above).

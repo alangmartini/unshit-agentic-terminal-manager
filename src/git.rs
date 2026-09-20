@@ -70,6 +70,65 @@ pub fn detect_git_branch(path: &Path) -> Option<String> {
     Some(branch)
 }
 
+/// Absolute path of the working tree containing `path`, or `None` when it
+/// is not a directory, not inside a checkout, or git is unavailable.
+///
+/// Uses `rev-parse --show-toplevel` rather than walking for a `.git` entry
+/// (as `crate::state::inside_git_checkout` does) because the diff viewer
+/// needs the root git itself would use: inside a linked worktree or a
+/// submodule the ancestor walk finds a `.git` *file* whose directory is
+/// not the tree git diffs against. Spawns a process (~30 ms on Windows),
+/// so call it off the UI thread.
+/// Resolve a repository-relative path against `root`, refusing anything
+/// that would land outside it.
+///
+/// The right-hand side is never trusted: a diff path is parsed straight
+/// out of `git diff` output and a flow location is whatever the producer
+/// wrote. `Path::join` silently discards `root` for an absolute
+/// right-hand side, and `..` walks out of the checkout — and the pane
+/// that opens is a writable editor, so `Ctrl+S` would then write there.
+/// A hostile name need not even exist in the work tree: `git diff A..B`
+/// reads the trees directly, so `core.protectNTFS` never sees it.
+pub fn resolve_in_repo(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let mut resolved = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            // `..`, a leading separator, a drive letter or a UNC prefix.
+            // None of them appear in a path git reports relative to the
+            // repository root, and every one of them escapes it.
+            _ => return None,
+        }
+    }
+    // `root` itself is a directory, not a file to open.
+    (resolved != root).then_some(resolved)
+}
+
+pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
+    if !path.is_dir() {
+        return None;
+    }
+    let output = git_command(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    // git prints forward slashes even on Windows; PathBuf handles those, but
+    // normalise so the string form matches what the rest of the app shows.
+    Some(std::path::PathBuf::from(
+        root.replace('/', std::path::MAIN_SEPARATOR_STR),
+    ))
+}
+
 /// Fail if any source file spawns `git` without going through
 /// [`git_command`]. Returns the offending `path:line` locations.
 ///
@@ -177,6 +236,74 @@ mod tests {
     fn returns_none_for_missing_path() {
         let missing = PathBuf::from("/definitely/does/not/exist/terminal-manager-git");
         assert!(detect_git_branch(&missing).is_none());
+    }
+
+    /// The diff viewer resolves the tree to run `git diff` in from the
+    /// pane's working directory, which is usually a subdirectory.
+    #[test]
+    fn repo_root_resolves_the_work_tree_from_a_subdirectory() {
+        let dir = unique_temp_dir("root");
+        init_repo(&dir);
+        let nested = dir.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let root = repo_root(&nested).expect("root resolved from a subdirectory");
+        // The temp dir itself can be a symlink (macOS /tmp) and git prints
+        // the resolved path, so compare canonical forms.
+        let expected = fs::canonicalize(&dir).expect("canonical repo dir");
+        let actual = fs::canonicalize(&root).expect("canonical repo root");
+        assert_eq!(actual, expected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_in_repo_refuses_anything_that_leaves_the_root() {
+        let root = PathBuf::from("C:/repo");
+        assert_eq!(
+            resolve_in_repo(&root, "src/state.rs"),
+            Some(root.join("src").join("state.rs"))
+        );
+        assert_eq!(
+            resolve_in_repo(&root, "./src/state.rs"),
+            Some(root.join("src").join("state.rs"))
+        );
+        // git reports paths with forward slashes; Windows accepts both.
+        for escape in [
+            "../outside.rs",
+            "src/../../outside.rs",
+            "..\\..\\Users\\Public\\run.ps1",
+            "/etc/passwd",
+            "C:/Users/me/.ssh/config",
+            "C:\\Users\\me\\.ssh\\config",
+            "\\\\server\\share\\x",
+        ] {
+            assert_eq!(resolve_in_repo(&root, escape), None, "{escape:?} escapes");
+        }
+        // The root itself is a directory, not a file to open.
+        assert_eq!(resolve_in_repo(&root, ""), None);
+        assert_eq!(resolve_in_repo(&root, "."), None);
+    }
+
+    #[test]
+    fn repo_root_is_none_outside_a_checkout() {
+        let dir = unique_temp_dir("noroot");
+        // A bare temp directory can still sit inside a repo on some CI
+        // layouts; only assert the negative when it genuinely is not one.
+        // Asserting `repo_root(&dir).is_none()` again inside the guard
+        // would restate the condition and pass however `repo_root`
+        // behaves, so assert a *different* fact that the same git call
+        // decides: a directory with no repository has no branch either.
+        if repo_root(&dir).is_none() {
+            assert!(detect_git_branch(&dir).is_none());
+            let nested = dir.join("nested");
+            let _ = fs::create_dir_all(&nested);
+            assert!(repo_root(&nested).is_none());
+        }
+        // Short-circuits on `!path.is_dir()` before git runs, so this
+        // pins the guard rather than git's verdict.
+        assert!(repo_root(&PathBuf::from("/definitely/not/here")).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -29,9 +29,12 @@ The audit surfaced adjacent hazards that are not yet fixed:
 - [ ] **Wide-glyph cell mapping** — CJK/emoji glyphs render wide but occupy one
   editor cell, so cursor/selection drift on such lines. Tab stops are handled;
   extend `char_width_at` with unicode-width and `wide_continuation` cells.
-- [ ] **Duplicate-open focuses the existing pane** — opening an already-open
-  path today creates a second editor pane; last save silently wins. Focus the
-  existing pane instead, and consider an mtime staleness check before overwrite.
+- [x] **Duplicate-open focuses the existing pane** — shipped 2026-09-13:
+  `editor.open` canonicalises the path, focuses the existing file pane in any
+  workspace and emits `editor.focus_existing` instead of opening a second pane.
+  Diff panes are excluded from the match, so two diffs of the same repo still
+  open side by side. The mtime staleness check before overwrite is still open;
+  it now lives with the save hardening item below.
 - [ ] **CloseEditor dialog: store tab id, not index** — `tab: Some(idx)` can
   close the wrong tab if tab order changes while the dialog is up (consistent
   with the existing `KillWorkspace { workspace_idx }` pattern, so low risk).
@@ -70,8 +73,7 @@ The audit surfaced adjacent hazards that are not yet fixed:
   editors; telemetry sink path injection so process-exit `editor.close` events
   are assertable and state tests stop appending to the developer's live
   `editor-events.jsonl`; touchpad sub-cell wheel fallback; Ctrl+Up/Down
-  viewport scroll; Tab key insert; 512 KiB log rotation branch; pin current
-  duplicate-open behavior as the baseline for the dedup fix above. Seed a real
+  viewport scroll; Tab key insert; 512 KiB log rotation branch. Seed a real
   editor in `close_editor_dialog_discard_click_dispatches_discard_close` (it
   currently only proves the dialog clears).
 - [ ] **Paint-only patch for edits** — every buffer-changing keystroke returns
@@ -82,6 +84,58 @@ The audit surfaced adjacent hazards that are not yet fixed:
 - [ ] **Max-line-length guard** — a valid 16 MiB single-line file makes
   cursor/paint math scan the whole line per keystroke (freeze, not crash).
   Refuse pathological line lengths on open or add a per-line lazy width index.
+
+## Flow Explorer follow-ups
+
+- [ ] **`Ctrl+1/2/3` view keys are dead** — `flow_key_command` maps them to
+  `flow.view:stack|columns|graph`, but the framework resolves registered Ctrl
+  chords before a pane's capture handler and `Ctrl+1..Ctrl+9` are the tab-switch
+  keybinds, so the flow pane never sees them; only the view buttons work. Either
+  move the view cycle onto an unregistered chord (`Alt+1/2/3`, or a plain letter
+  the way `o`/`d` drive the editor hand-offs) or register real keybind actions.
+  `specs/flow-explorer.md` A3.2 documents the Ctrl+1/2/3 behaviour and has to be
+  amended with whatever lands.
+
+- [ ] **The call stack view paints nothing** — a flow pane opened on either
+  committed fixture shows its header, toolbar and legend but an empty body
+  in the default `call stack` view; `graph` renders the same flow correctly,
+  and `flow.expand_all` / `flow.select_first` change nothing. Not a data
+  problem and not new: `call_stack_renders_one_row_per_visible_tree_row` and
+  `review_fixture_shows_the_range_and_a_diff_legend` both find their
+  `.flow-row` elements in the built tree, and a build of `46877f1` (v0.4.0
+  code, before any editor work) reproduces the blank body exactly. So the
+  rows exist and the engine gives them no size — start at `.flow-tree`
+  (`flex: 1; min-height: 0; overflow-y: auto`) inside `.pane-body` and at
+  whether the engine honours that combination, the way `.flow-graph` escapes
+  it by being absolutely placed with explicit dimensions.
+
+## Test and tooling follow-ups
+
+- [ ] **Intermittent `STATUS_HEAP_CORRUPTION` (0xc0000374) at test-process exit**
+  — a parallel `cargo test -p terminal-manager` aborts at exit in roughly
+  20-30% of runs; the same suite is clean 6/6 with `--test-threads=1`.
+  Pre-existing, not introduced by the editor work: reproduced at `12cfeee` (run 9
+  of 10), before any of the editor diff/navigation wiring commits. Every test
+  reports `ok` before the abort, so the corruption is at teardown — most
+  likely a global or `OnceLock`-owned allocation freed across allocator
+  boundaries (wgpu, or a PTY handle) rather than a test bug. Capture a run under
+  a debugger with page heap enabled to name the allocation; until then run the
+  suite with `--test-threads=1` for a clean signal.
+
+- [ ] **Clipboard round-trip tests race every other process on the machine**
+  — `terminal_copy_in_an_editor_pane_copies_the_selection` and its paste
+  siblings write to the real Windows clipboard and read it straight back.
+  `clipboard_access_guard()` serialises them inside the test binary, but the
+  clipboard is machine-global: the framework's own
+  `crates/unshit-framework/crates/unshit-test/tests/clipboard.rs` has a
+  `clear()` test, a second `cargo test` run or the developer pressing Ctrl+C
+  in any window will do the same, and the read then returns `""`. Observed
+  once on 2026-09-13 (`selection must reach the clipboard, got ""`) and clean
+  on the three runs either side of it. That file also warns that creating
+  `arboard::Clipboard` instances concurrently on Windows can corrupt the heap,
+  which is worth weighing against the entry above. Fixing it properly means a
+  cross-process lock (a named mutex or a lock file both binaries agree on), or
+  a clipboard seam the tests can fake.
 
 ## Product ideas
 

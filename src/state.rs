@@ -190,6 +190,8 @@ pub struct CtxMenu {
 /// set the overlay renders and which dispatch commands it emits.
 #[derive(Clone, Debug)]
 pub enum CtxMenuTarget {
+    /// File/folder menu retains its original workspace root across navigation.
+    Explorer { path: PathBuf, root: PathBuf },
     /// Menu opened on a workspace row in the sidebar.
     Workspace { idx: usize },
     /// Menu opened on a tab in the tabbar. Carries the active pane id
@@ -302,6 +304,23 @@ pub enum ConfirmDialog {
     /// through the generic `dialog.confirm`, so a stray Enter cannot start
     /// an install that closes every session.
     UpdateAvailable,
+    /// Go-to-line prompt for the editor pane that was active when it
+    /// opened. The pane is pinned at open time because the dialog steals
+    /// focus: resolving "the active editor" at commit time would follow a
+    /// focus change made between opening and submitting. Commits via
+    /// `dialog.goto_commit`.
+    GotoLine {
+        pane_id: u32,
+        buffer: String,
+        error: Option<String>,
+    },
+    /// "Diff against…" prompt. Commits via `dialog.diff_commit`; `error`
+    /// carries a range that did not parse, shown under the input so the
+    /// typed text survives the correction.
+    DiffRequest {
+        buffer: String,
+        error: Option<String>,
+    },
 }
 
 /// Outcome of resolving the user's persisted close preference when the
@@ -342,6 +361,7 @@ pub enum SettingsSection {
     Keybinds,
     Sessions,
     Notifications,
+    AgentSkills,
     Updates,
     DangerZone,
 }
@@ -354,18 +374,20 @@ impl SettingsSection {
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::AgentSkills => "agent skills",
             SettingsSection::Updates => "updates",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 7] {
+    pub fn all() -> [SettingsSection; 8] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
             SettingsSection::Notifications,
+            SettingsSection::AgentSkills,
             SettingsSection::Updates,
             SettingsSection::DangerZone,
         ]
@@ -951,6 +973,7 @@ pub struct AppState {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     /// Theme id that was last published to visible terminal grids. Empty
@@ -977,8 +1000,11 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
+    pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Last window maximized state reported by the framework.
@@ -1006,6 +1032,14 @@ pub struct AppState {
     /// with the per-frame snapshot through `Arc`; mutate through
     /// `Arc::make_mut` on the dispatch path only.
     pub flows: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Quick-open index of the active workspace. `None` until the first
+    /// build lands, which is what makes the palette say "Indexing...".
+    /// Shared with the snapshot through `Arc` because it holds up to
+    /// 50 000 entries and is rebuilt far less often than a frame.
+    pub file_index: Option<std::sync::Arc<crate::file_index::FileIndex>>,
+    /// True while a build is in flight, so a second `palette.files` does
+    /// not start a second walk of the same tree.
+    pub file_index_building: bool,
     /// Agent launches waiting for their flow JSON, keyed by the launch
     /// pane id. Read by the poll thread through `flow_poll_snapshot` and
     /// dropped when the launch pane closes.
@@ -1139,6 +1173,9 @@ pub struct AppState {
     pub terminal_link_hover_repaint: std::collections::HashSet<u32>,
     /// Last left-press on a terminal, for double/triple-click promotion.
     pub terminal_click: Option<TerminalClick>,
+    /// Live selection edge auto-scroll for the drag in progress, if the
+    /// pointer has overshot a pane edge. See [`terminal_drag_autoscroll`].
+    pub terminal_drag_autoscroll: Option<TerminalDragAutoscroll>,
     /// App wide default shell. Empty means "let the daemon's own
     /// `default_shell()` decide". Per workspace overrides land in
     /// Task 6 and take precedence via `shell::resolve`.
@@ -1270,6 +1307,7 @@ impl AppState {
             active_pane: self.active_pane,
             settings_open: self.settings_open,
             settings_section: self.settings_section,
+            flow_skill_installations: self.flow_skill_installations.clone(),
             theme: self.theme.clone(),
             custom_theme: self.custom_theme,
             config_font_size_pt: self.config_font_size_pt,
@@ -1283,8 +1321,10 @@ impl AppState {
             tab_width_px: self.tab_width_px,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
+            process_details_open: self.process_details_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
+            explorer: self.explorer.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             window_maximized: self.window_maximized,
@@ -1337,11 +1377,37 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            diff_review: self.diff_review.clone(),
+            editor_find_bars: self
+                .editors
+                .iter()
+                .filter_map(|(&id, editor)| {
+                    editor.find.as_ref().map(|find| {
+                        (
+                            id,
+                            EditorFindView {
+                                query: find.query.clone(),
+                                counter: find.counter_label(),
+                                case_sensitive: find.case_sensitive,
+                            },
+                        )
+                    })
+                })
+                .collect(),
             flow_panes: self
                 .flows
                 .iter()
                 .map(|(&id, pane)| (id, pane.clone()))
                 .collect(),
+            // Quick open must never serve another workspace's tree. The
+            // live index outlives a switch until a rebuild lands, and for
+            // a workspace with no directory no rebuild is ever scheduled,
+            // so gate on the root here rather than trusting whatever is
+            // in the field.
+            file_index: self.file_index.clone().filter(|index| {
+                active_workspace_cwd(self).as_deref() == Some(index.root.as_path())
+            }),
+            file_index_building: self.file_index_building,
         }
     }
 
@@ -1362,6 +1428,20 @@ impl AppState {
     }
 }
 
+/// Everything the find bar of one editor pane renders.
+///
+/// A projection rather than a borrow of `FindState`: the bar is built
+/// during the element-tree pass, which must not hold the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorFindView {
+    /// The live query, so the input keeps what was typed across rebuilds.
+    pub query: String,
+    /// Already formatted: `3 of 12`, `No results`, or empty.
+    pub counter: String,
+    /// The explicit `Aa` toggle, not the smart-case result.
+    pub case_sensitive: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct UiSnapshot {
     pub workspaces: Vec<Workspace>,
@@ -1372,6 +1452,7 @@ pub struct UiSnapshot {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     pub config_font_size_pt: u32,
@@ -1386,8 +1467,10 @@ pub struct UiSnapshot {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Mirrors `AppState::window_maximized` so titlebar controls can
@@ -1467,8 +1550,18 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    pub diff_review: Option<crate::diff_review::Review>,
+    /// Find bars that are currently open, by pane id. Only what the bar
+    /// renders, so the tree build never reaches into a live pane.
+    pub editor_find_bars: std::collections::HashMap<u32, EditorFindView>,
     /// Flow Explorer panes rendered instead of a terminal, by pane id.
     pub flow_panes: std::collections::HashMap<u32, std::sync::Arc<crate::flow_explorer::FlowPane>>,
+    /// Quick-open index behind the palette's Files mode. `None` while the
+    /// first build is still running.
+    pub file_index: Option<std::sync::Arc<crate::file_index::FileIndex>>,
+    /// Mirrors `AppState::file_index_building` so the palette can say
+    /// "Indexing..." instead of "no matching files".
+    pub file_index_building: bool,
 }
 
 fn current_folder_name() -> String {
@@ -1582,6 +1675,7 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
+        flow_skill_installations: Vec::new(),
         theme: theme::default_theme_id().to_string(),
         custom_theme: theme::default_custom_theme(),
         last_terminal_theme_painted: String::new(),
@@ -1596,8 +1690,11 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        process_details_open: false,
+        diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
+        explorer: crate::explorer::Explorer::default(),
         sidebar_collapsed: false,
         sidebar_width: 252.0,
         window_maximized: false,
@@ -1611,6 +1708,8 @@ pub fn seed_state() -> AppState {
         terminals: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
         flows: std::collections::HashMap::new(),
+        file_index: None,
+        file_index_building: false,
         flow_pending: std::collections::HashMap::new(),
         agent_restarts: std::collections::HashMap::new(),
         pending_agent_resumes: std::collections::HashMap::new(),
@@ -1655,6 +1754,7 @@ pub fn seed_state() -> AppState {
         terminal_link_hover: None,
         terminal_link_hover_repaint: std::collections::HashSet::new(),
         terminal_click: None,
+        terminal_drag_autoscroll: None,
         default_shell: crate::shell::infer_default_shell(&crate::shell::discover_installed()),
         quick_prompt: None,
     }
@@ -1703,13 +1803,80 @@ fn load_tab_state(state: &mut AppState) {
     state.col_ratios = tab.col_ratios.clone();
 }
 
+/// Workspace tab indices belonging to the focused pane's group. Mixed
+/// splits belong to both groups; the active tab uses its live pane layout.
+pub fn grouped_tab_indices(
+    tabs: &[TerminalTab],
+    active_tab: usize,
+    live_panes: &[Vec<Pane>],
+    active_pane: PaneId,
+    is_agent: impl Fn(u32) -> bool,
+) -> Vec<usize> {
+    let active_is_agent = is_agent(active_pane.0);
+    tabs.iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            let panes = if index == active_tab {
+                live_panes
+            } else {
+                &tab.panes
+            };
+            (index == active_tab
+                || panes
+                    .iter()
+                    .flatten()
+                    .any(|pane| is_agent(pane.id.0) == active_is_agent))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn visible_tab_indices(state: &AppState) -> Vec<usize> {
+    grouped_tab_indices(
+        &state.tabs,
+        state.active_tab,
+        &state.panes,
+        state.active_pane,
+        |id| is_agent_pane(state, id),
+    )
+}
+
+/// Translate a visible insertion slot back into the workspace's tab order.
+fn grouped_tab_drop_index(
+    cursor_x: f32,
+    cursor_y: f32,
+    rect: crate::drag::Rect,
+    visible: &[usize],
+) -> Option<usize> {
+    let slot = crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, rect, visible.len())?;
+    Some(
+        visible
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| visible.last().map_or(0, |index| index + 1)),
+    )
+}
+
 pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     if new_index >= state.tabs.len() || new_index == state.active_tab {
         return;
     }
+    let agents = is_agent_pane(state, state.active_pane.0);
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+    // A mixed split may have last focused the other group.
+    if is_agent_pane(state, state.active_pane.0) != agents {
+        if let Some(pane) = state
+            .panes
+            .iter()
+            .flatten()
+            .find(|pane| is_agent_pane(state, pane.id.0) == agents)
+        {
+            state.active_pane = pane.id;
+            state.tabs[new_index].active_pane = pane.id;
+        }
+    }
 }
 
 fn save_workspace_state(state: &mut AppState) {
@@ -1748,7 +1915,10 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     }
     save_workspace_state(state);
     state.active_workspace = new_index;
+    // The index describes the workspace we just left.
+    state.file_index = None;
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane_id: u32) -> bool {
@@ -1763,7 +1933,11 @@ pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane
 }
 
 fn focus_workspace_pane_by_index(state: &mut AppState, workspace_idx: usize, pane_id: u32) -> bool {
-    if workspace_idx >= state.workspaces.len() {
+    // The active workspace's tabs are the live `state.tabs`, not a copy in
+    // `state.workspaces` — so it stays addressable even when that list is
+    // empty, which is the shape of a seeded state and of the first run
+    // before any workspace has been persisted.
+    if workspace_idx != state.active_workspace && workspace_idx >= state.workspaces.len() {
         return false;
     }
 
@@ -1913,12 +2087,15 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     let pane_id = PaneId(id_num);
 
     let title = editor.display_name.clone();
+    // The subtitle is what the tab strip and pane header show under the
+    // name; a diff pane is not a file and should not claim to be one.
+    let subtitle = if editor.is_diff() { "diff" } else { "editor" };
     state.editors.insert(id_num, editor);
 
     let pane = Pane {
         id: pane_id,
         title: title.clone(),
-        subtitle: "editor".to_string(),
+        subtitle: subtitle.to_string(),
         pid: 0,
         cpu: 0.0,
         mem_bytes: 0,
@@ -1927,7 +2104,7 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     let tab = TerminalTab {
         id: format!("t{}", id_num),
         name: title,
-        subtitle: "editor".to_string(),
+        subtitle: subtitle.to_string(),
         status: TabStatus::Idle,
         panes: vec![vec![pane.clone()]],
         active_pane: pane_id,
@@ -1943,6 +2120,12 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
     pane_id
+}
+
+/// Record the `flow.open` lifecycle event and open the pane as a new tab.
+pub(crate) fn open_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    record_flow_pane_event(&pane, "flow.open", "info", None);
+    mutate_add_flow_tab(state, pane)
 }
 
 /// Open a Flow Explorer pane as a new single-pane tab. Mirrors
@@ -3053,6 +3236,20 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         .map(|pane| pane.id.0)
         .collect::<Vec<_>>();
     for pane_id in pane_ids {
+        // Editor and flow panes live in their own side maps, and removing
+        // a workspace used to destroy only the PTY half. An editor left
+        // behind is unreachable from any tab but still in `state.editors`
+        // for the life of the process: it never records its `close`, and
+        // a diff job finishing afterwards still finds it and fills it
+        // with a document nobody can read. `mutate_close_pane` and
+        // `mutate_close_tab` have always pruned all three.
+        if let Some(editor) = state.editors.remove(&pane_id) {
+            record_editor_closed(&editor);
+            continue;
+        }
+        if remove_flow_pane(state, pane_id) {
+            continue;
+        }
         state.pty_manager.destroy(pane_id);
         state.terminals.remove(&pane_id);
         state.custom_titled_panes.remove(&pane_id);
@@ -3068,6 +3265,7 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         old_active
     };
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -3911,12 +4109,26 @@ pub fn mutate_tab_width_px_delta(state: &mut AppState, delta: i32) -> bool {
     true
 }
 
+/// Re-resolve every editor pane's palette after a theme change.
+///
+/// Editor grids carry real colours rather than palette indices — they
+/// bypass the terminal's palette remap — so nothing recolours them on the
+/// next paint the way a terminal grid recolours itself. Each pane
+/// repaints only if its resolved colours actually differ.
+pub fn recolor_editor_panes(state: &mut AppState) {
+    let colors = editor_colors(state);
+    for editor in state.editors.values_mut() {
+        editor.set_colors(colors);
+    }
+}
+
 pub fn mutate_theme(state: &mut AppState, theme_id: &str) -> bool {
     let resolved = theme::resolve_theme_id(theme_id).to_string();
     if state.theme == resolved {
         return false;
     }
     state.theme = resolved;
+    recolor_editor_panes(state);
     true
 }
 
@@ -3936,6 +4148,7 @@ pub fn mutate_custom_theme_color(
     theme::set_custom_theme_color(&mut state.custom_theme, slot, color);
     state.theme = theme::CUSTOM_THEME_ID.to_string();
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     true
 }
 
@@ -3947,6 +4160,7 @@ pub fn reset_custom_theme(state: &mut AppState) -> bool {
     state.custom_theme = default;
     state.theme = theme::CUSTOM_THEME_ID.to_string();
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     true
 }
 
@@ -3973,6 +4187,7 @@ pub fn reset_appearance(state: &mut AppState) -> bool {
     state.tab_width_px = DEFAULT_TAB_WIDTH_PX;
     sync_terminal_size_to_font_metrics(state);
     state.last_terminal_theme_painted.clear();
+    recolor_editor_panes(state);
     changed
 }
 
@@ -4270,6 +4485,7 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
         }
     }
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 /// Resolve the close-button click against the persisted preference
@@ -5187,6 +5403,226 @@ fn open_command_palette(state: &mut AppState) {
     clear_palette_query(state);
 }
 
+/// `palette.files`: open the palette straight into Files mode.
+///
+/// The `/` prefix is the mode, so seeding the query with it is the whole
+/// switch; the index build is kicked off here rather than on the first
+/// keystroke so the rows are usually there by the time anything is typed.
+fn dispatch_palette_files(state: &mut AppState) -> bool {
+    open_command_palette(state);
+    state.palette_query = "/".to_string();
+    state.palette_active = 0;
+    ensure_file_index(state);
+    true
+}
+
+/// Whether the explorer tree is the visible sidebar panel.
+fn explorer_visible(state: &AppState) -> bool {
+    state.explorer.active && !state.sidebar_collapsed
+}
+
+/// Open the explorer panel on the active workspace's root, without moving
+/// keyboard focus into its tree.
+fn show_explorer(state: &mut AppState) {
+    state.explorer.active = true;
+    state.sidebar_collapsed = false;
+    sync_explorer(state);
+}
+
+pub fn sync_explorer(state: &mut AppState) {
+    let root = active_workspace_cwd(state);
+    state.explorer.set_root(root.clone());
+    if explorer_visible(state) {
+        if let Some(root) = root {
+            load_explorer_directory(state, root);
+        }
+        continue_explorer_restore(state);
+    }
+}
+
+fn load_expanded_explorer_directories(state: &mut AppState) {
+    if !explorer_visible(state) {
+        return;
+    }
+    let pending: Vec<_> = state
+        .explorer
+        .expanded
+        .iter()
+        .filter(|path| {
+            state.explorer.directory_visible(path)
+                && state.explorer.is_directory(path)
+                && !state.explorer.listings.contains_key(*path)
+        })
+        .cloned()
+        .collect();
+    for path in pending {
+        load_explorer_directory(state, path);
+    }
+}
+
+fn continue_explorer_restore(state: &mut AppState) {
+    load_expanded_explorer_directories(state);
+    if !explorer_visible(state) || !state.explorer.restore_selection {
+        return;
+    }
+    if let (Some(selected), Some(hooks)) =
+        (state.explorer.selected.clone(), EDITOR_OPEN_HOOKS.get())
+    {
+        if state.explorer.visible_paths().contains(&selected) {
+            state.explorer.restore_selection = false;
+            (hooks.request_reveal)(crate::explorer::row_id(&selected));
+        }
+    }
+}
+
+fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        push_error_toast(state, "Open a file in the editor to reveal it in Explorer.");
+        return true;
+    };
+    let target = editor.path.clone();
+    let Some(root) = active_workspace_cwd(state) else {
+        push_error_toast(state, "This workspace has no folder to reveal files in.");
+        return true;
+    };
+    show_explorer(state);
+    let generation = state.explorer.generation;
+    let selected = state.explorer.selected.clone();
+    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
+    let revision = state.explorer.reveal_revision;
+    let pane = state.active_pane;
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return true;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-reveal".into())
+        .spawn(move || {
+            let result = crate::explorer::reveal_path(&root, &target);
+            let mut state = hooks.shared.lock_recover();
+            if state.explorer.generation != generation
+                || state.explorer.reveal_revision != revision
+                || state.active_pane != pane
+                || state.explorer.selected != selected
+                || !explorer_visible(&state)
+            {
+                return;
+            }
+            match result {
+                Ok((target, listings)) => {
+                    for (path, listing) in listings {
+                        state.explorer.expanded.insert(path.clone());
+                        state.explorer.accept(generation, path, listing);
+                    }
+                    state.explorer.selected = Some(target.clone());
+                    drop(state);
+                    (hooks.request_reveal)(crate::explorer::row_id(&target));
+                }
+                Err(error) => {
+                    push_error_toast(&mut state, format!("Could not reveal file: {error}"));
+                    drop(state);
+                    (hooks.request_rebuild)();
+                }
+            }
+        })
+    {
+        push_error_toast(state, format!("Could not reveal file: {error}"));
+    }
+    true
+}
+
+pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
+    use crate::explorer::Listing;
+    if state.explorer.listings.contains_key(&path) {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    let generation = state.explorer.generation;
+    let pending = Arc::new(Listing::Loading);
+    state
+        .explorer
+        .listings
+        .insert(path.clone(), pending.clone());
+    let worker_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-list".into())
+        .spawn(move || {
+            let listing = crate::explorer::read_directory(&worker_path);
+            {
+                let mut state = hooks.shared.lock_recover();
+                if state.explorer.generation != generation {
+                    return;
+                }
+                if !state
+                    .explorer
+                    .update_listing(generation, worker_path, &pending, listing)
+                {
+                    return;
+                }
+                continue_explorer_restore(&mut state);
+            }
+            (hooks.request_rebuild)();
+        })
+    {
+        state
+            .explorer
+            .accept(generation, path, Listing::Error(error.to_string()));
+    }
+}
+
+/// Build (or rebuild) the quick-open index for the active workspace on a
+/// worker thread, unless a fresh one for the same root is already here.
+///
+/// Enumerating a checkout spawns a process and touches the filesystem —
+/// never on the UI thread. Until the first build lands the palette shows
+/// "Indexing…" rather than "no matching files".
+fn ensure_file_index(state: &mut AppState) {
+    let Some(root) = active_workspace_cwd(state) else {
+        return;
+    };
+    let fresh = state.file_index.as_ref().is_some_and(|index| {
+        index.root == root
+            && !crate::file_index::is_stale(index, crate::file_index::DEFAULT_INDEX_MAX_AGE)
+    });
+    if fresh || state.file_index_building {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        // No shared state to write back into (unit tests, headless):
+        // leave the index alone rather than blocking the caller on a
+        // filesystem walk.
+        return;
+    };
+    state.file_index_building = true;
+    let spawned = std::thread::Builder::new()
+        .name("quickopen-index".into())
+        .spawn(move || {
+            let index = crate::file_index::build_index(&root);
+            {
+                let mut guard = hooks.shared.lock_recover();
+                guard.file_index_building = false;
+                // A workspace switch during the walk makes this index
+                // describe the wrong tree; the next open rebuilds it.
+                if active_workspace_cwd(&guard).as_deref() == Some(index.root.as_path()) {
+                    guard.file_index = Some(std::sync::Arc::new(index));
+                }
+            }
+            (hooks.request_rebuild)();
+        })
+        .is_ok();
+    if !spawned {
+        state.file_index_building = false;
+        log::warn!(
+            "{{\"event\":\"quickopen.index_spawn_failed\",\"level\":\"warn\",\"root\":{:?}}}",
+            state
+                .file_index
+                .as_ref()
+                .map(|index| index.root.display().to_string())
+        );
+    }
+}
+
 fn close_command_palette(state: &mut AppState) -> bool {
     let changed =
         state.palette_open || !state.palette_query.is_empty() || state.palette_active != 0;
@@ -5220,19 +5656,44 @@ fn clear_palette_query(state: &mut AppState) {
 fn set_palette_query(state: &mut AppState, query: String) {
     state.palette_query = crate::command_palette::sanitize_palette_query(&query);
     reset_palette_selection(state);
+    ensure_file_index_for_query(state);
 }
 
 fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
     let mut candidate = state.palette_query.clone();
     candidate.push(ch);
     state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    ensure_file_index_for_query(state);
     true
 }
 
 fn palette_backspace_query(state: &mut AppState) -> bool {
     state.palette_query.pop();
     reset_palette_selection(state);
+    ensure_file_index_for_query(state);
     true
+}
+
+/// Start the quick-open index whenever the query lands in Files mode.
+///
+/// The mode is derived from the query's `/` prefix, so it is reachable by
+/// typing and by the `/ files` pill as well as by `palette.files` — and
+/// only the last of those used to build anything. The other two left
+/// `file_index: None` with nothing running, which the palette rendered as
+/// a permanent "Indexing…" over a build that was never started.
+fn ensure_file_index_for_query(state: &mut AppState) {
+    if query_wants_file_index(&state.palette_query) {
+        ensure_file_index(state);
+    }
+}
+
+/// Whether a palette query puts the palette in Files mode. Split out from
+/// the call above because the build itself needs `EDITOR_OPEN_HOOKS`,
+/// which unit tests do not install — this keeps the routing decision
+/// testable on its own.
+fn query_wants_file_index(query: &str) -> bool {
+    crate::command_palette::parse_palette_query(query).mode
+        == crate::command_palette::PaletteMode::Files
 }
 
 fn palette_delete_query(state: &mut AppState) -> bool {
@@ -5429,13 +5890,27 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "tabs.worktree_mode.toggle"
             | "pane.close"
             | "sidebar.toggle"
+            | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
             | "editor.open"
             | "editor.save"
+            | "review.open"
+            | "editor.goto"
+            | "editor.find"
+            | "editor.indent"
+            | "editor.outdent"
+            | "editor.toggle_comment"
+            | "palette.files"
+            | "diff.open"
     ) || command.starts_with("workspace.switch:")
         || command.starts_with("terminal.focus:")
         || command.starts_with("flow.")
+        || command.starts_with("diff.open:")
+        // Quick-open rows carry an absolute path from the workspace's own
+        // file index, never user text, so opening one is as safe as the
+        // `editor.open` dialog it replaces.
+        || command.starts_with("editor.open:")
 }
 
 fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
@@ -5456,11 +5931,106 @@ fn execute_palette_item(state: &mut AppState, item_id: &str) -> bool {
         return false;
     }
 
+    let picked_file = item.kind == crate::command_palette::PaletteItemKind::File;
     let handled = dispatch(state, &command);
-    if handled {
-        close_command_palette(state);
+    // Either way the pick itself is consumed, so the palette closes. The
+    // chord version of a command like `editor.find` stays unclaimed on
+    // purpose, so Ctrl+F reaches the shell in a terminal pane; a palette
+    // row has no such fall-through, and leaving it open with nothing
+    // happening reads as a click that did not register.
+    close_command_palette(state);
+    if !handled {
+        push_error_toast(state, format!("{} is not available here", item.label));
+        return true;
     }
-    handled
+    // Quick open is the one palette mode whose rows are data rather than a
+    // fixed catalogue, so "did the index actually get used" is only
+    // answerable from a pick event. Recorded after the dispatch, on the
+    // pane the pick produced (or refocused), so the id joins pick -> open
+    // -> save -> close instead of naming nothing.
+    if picked_file {
+        record_quickopen_pick(state);
+    }
+    true
+}
+
+/// Which way `editor.indent` / `editor.outdent` moves the text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReindentCommand {
+    Indent,
+    Outdent,
+}
+
+/// `editor.indent` / `editor.outdent`: Tab and Shift+Tab.
+///
+/// Unclaimed when the active pane is not a writable editor, so Tab still
+/// reaches the shell in a terminal pane and a diff pane keeps it for
+/// nothing (`apply_edit` refuses a read-only buffer anyway).
+fn dispatch_editor_reindent(state: &mut AppState, command: ReindentCommand) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if editor.read_only {
+        return false;
+    }
+    editor.apply_edit(|buffer| match command {
+        ReindentCommand::Indent => buffer.indent(),
+        ReindentCommand::Outdent => buffer.outdent(),
+    });
+    true
+}
+
+/// `editor.toggle_comment`: `Ctrl+/`.
+///
+/// A language with no line comment — JSON, CSS, Markdown — has nothing to
+/// toggle. That no-op is the one thing here worth a telemetry line: it is
+/// indistinguishable from a dead keybind from the user's side, and this
+/// is the record that tells a later reader which it was. Nothing on the
+/// success path is recorded; these are keystroke commands and the sink is
+/// not for the keystroke path.
+fn dispatch_editor_toggle_comment(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if editor.read_only {
+        return false;
+    }
+    let language = editor.language();
+    let Some(prefix) = language.line_comment_prefix() else {
+        record_editor_pane_event(
+            editor,
+            "editor.comment_unsupported",
+            "info",
+            Some(language.as_str()),
+        );
+        return true;
+    };
+    editor.apply_edit(|buffer| buffer.toggle_line_comment(prefix));
+    true
+}
+
+/// `quickopen.pick` for the editor pane the palette just focused. Carries
+/// that pane's correlation id and path; never the query the user typed.
+fn record_quickopen_pick(state: &AppState) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        return;
+    };
+    let path = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "quickopen.pick",
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(&path),
+        file_bytes: None,
+        line_count: None,
+        line: None,
+        reason: None,
+        os_error: None,
+    });
 }
 
 /// Viewport dimensions for a new editor pane, derived the same way new
@@ -5485,6 +6055,7 @@ fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
 pub struct EditorOpenHooks {
     pub shared: SharedState,
     pub request_rebuild: Box<dyn Fn() + Send + Sync>,
+    pub request_reveal: Box<dyn Fn(String) + Send + Sync>,
 }
 
 static EDITOR_OPEN_HOOKS: std::sync::OnceLock<std::sync::Arc<EditorOpenHooks>> =
@@ -5494,6 +6065,58 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
     let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+}
+
+/// Polls visible explorer folders for filesystem changes about once a
+/// second (see `refresh_explorer_once`). No-op if hooks are not registered.
+pub fn start_explorer_refresh() {
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-refresh".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if refresh_explorer_once(&hooks.shared) {
+                (hooks.request_rebuild)();
+            }
+        })
+    {
+        log::warn!("Could not start explorer refresh: {error}");
+    }
+}
+
+/// Filesystem work runs only on the refresh worker, outside the state lock.
+/// One batch produces at most one rebuild, and quiet/hidden trees produce none.
+fn refresh_explorer_once(shared: &SharedState) -> bool {
+    let (generation, targets) = {
+        let state = shared.lock_recover();
+        if !explorer_visible(&state) {
+            return false;
+        }
+        (state.explorer.generation, state.explorer.refresh_targets())
+    };
+    let updates: Vec<_> = targets
+        .into_iter()
+        .map(|(path, previous)| {
+            let listing = crate::explorer::read_directory(&path);
+            (path, previous, listing)
+        })
+        .collect();
+    let mut state = shared.lock_recover();
+    if !explorer_visible(&state) {
+        return false;
+    }
+    let mut changed = false;
+    for (path, previous, listing) in updates {
+        changed |= state
+            .explorer
+            .update_listing(generation, path, &previous, listing);
+    }
+    if changed {
+        continue_explorer_restore(&mut state);
+    }
+    changed
 }
 
 /// Handle `editor.open` (no path): native file picker, routed back
@@ -5574,6 +6197,7 @@ fn record_editor_pane_event(
         path: Some(&path_str),
         file_bytes: Some(editor.file_bytes),
         line_count: Some(editor.buffer.line_count() as u64),
+        line: None,
         reason,
         os_error: None,
     });
@@ -5631,6 +6255,7 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
                 path: Some(&path_str),
                 file_bytes: None,
                 line_count: None,
+                line: None,
                 reason: Some("io"),
                 os_error: e.raw_os_error(),
             });
@@ -5652,10 +6277,79 @@ pub fn save_editor_pane(state: &mut AppState, pane_id: u32) -> bool {
 /// through unclaimed.
 fn dispatch_editor_save(state: &mut AppState) -> bool {
     let pane_id = state.active_pane.0;
-    if !state.editors.contains_key(&pane_id) {
+    let Some(editor) = state.editors.get(&pane_id) else {
         return false;
+    };
+    // A diff pane has no file behind it; `EditorPane::save` would happily
+    // write the rendered diff over the repo root. Claim the key and do
+    // nothing, which is also what Ctrl+S does in every diff viewer.
+    if editor.read_only {
+        return true;
     }
     save_editor_pane(state, pane_id);
+    true
+}
+
+/// Paste the clipboard into `pane_id`'s editor buffer as one undo step.
+///
+/// Reached from `terminal.paste` (Ctrl+V, Ctrl+Shift+V, Shift+Insert are
+/// registered system bindings, so the shortcut resolver claims them before
+/// the pane's keyboard capture handler ever sees them) and from the
+/// editor's own Ctrl+V arm, which stays live in case the binding is
+/// overridden. Terminal paste normalisation deliberately does NOT apply:
+/// `normalize_pasted_text` promotes newlines to CR for the shell, which
+/// would collapse a multi-line paste into a single buffer line.
+/// `EditorBuffer::insert_str` does the editor-side normalisation (CRLF and
+/// lone CR to LF). Returns whether the buffer changed.
+pub(crate) fn dispatch_editor_paste(state: &mut AppState, pane_id: u32) -> bool {
+    // A diff pane accepts copy but ignores paste. Bail before touching the
+    // clipboard so a read failure cannot toast at a pane that would have
+    // refused the text anyway.
+    if state.editors.get(&pane_id).is_some_and(|e| e.read_only) {
+        return false;
+    }
+    let text = match state.clipboard.read_text() {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("editor.paste: clipboard read failed: {e}");
+            push_error_toast(state, format!("paste failed: {e}"));
+            return false;
+        }
+    };
+    // Empty covers a genuinely empty clipboard and the non-text payloads
+    // arboard maps to an empty string (image, file list). Silently doing
+    // nothing matches every editor; the terminal's image/file-path
+    // fallback would insert a temp path into the document.
+    if text.is_empty() {
+        return false;
+    }
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    let changed = editor.apply_edit(|b| b.insert_str(&text));
+    if changed {
+        if let Some(editor) = state.editors.get(&pane_id) {
+            record_editor_pane_event(editor, "editor.paste", "info", None);
+        }
+        sync_editor_pane_title(state, pane_id);
+    }
+    changed
+}
+
+/// Copy `pane_id`'s editor selection to the clipboard. Returns `false`
+/// when there is nothing selected so the chord falls through unclaimed,
+/// mirroring the terminal copy path.
+pub(crate) fn dispatch_editor_copy(state: &mut AppState, pane_id: u32) -> bool {
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return false;
+    };
+    let Some(text) = editor.buffer.selected_text() else {
+        return false;
+    };
+    if let Err(e) = state.clipboard.write_text(&text) {
+        log::warn!("editor.copy: clipboard write failed: {e}");
+        push_error_toast(state, format!("copy failed: {e}"));
+    }
     true
 }
 
@@ -5722,11 +6416,54 @@ pub fn request_close_tab(state: &mut AppState, index: usize) {
     crate::persist::save_workspaces(state);
 }
 
+/// Send a navigation event to the diff sink when the pane is a diff one,
+/// and report whether it was sent.
+///
+/// Go-to-line and find work on a diff pane, but its `path` is a
+/// repository *directory* and its correlation id belongs to the diff job,
+/// so the editor sink would count a directory as a file and hand a reader
+/// an id with no `editor.open` behind it. Same split as
+/// [`record_editor_closed`].
+fn record_on_diff_sink(
+    editor: &crate::editor::EditorPane,
+    event: &'static str,
+    line: Option<u64>,
+) -> bool {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    let Some(view) = editor.diff() else {
+        return false;
+    };
+    let label = view.spec.label();
+    let mut record = DiffEventRecord::new(event, "info", &view.job_id);
+    record.range = Some(&label);
+    record.rows = Some(view.rows.len() as u64);
+    record.line = line;
+    record_diff_event(&record);
+    true
+}
+
 /// Durably close out an editor pane's lifecycle in the JSONL sink so the
 /// correlation chain (open → saves → close) is replayable from telemetry
 /// alone. `reason: "dirty"` at warn level marks unsaved changes that died
 /// with the pane.
 fn record_editor_closed(editor: &crate::editor::EditorPane) {
+    // A diff pane's lifecycle belongs in the diff sink beside the request
+    // that created it; its `path` is a repository root, which the editor
+    // sink would record as a file.
+    if let Some(view) = editor.diff() {
+        use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+        let label = view.spec.label();
+        let mut record = DiffEventRecord::new("diff.closed", "info", &view.job_id);
+        record.range = Some(&label);
+        record.rows = Some(view.rows.len() as u64);
+        record.files = Some(view.files.len() as u64);
+        // What the pane was used for, counted rather than logged per
+        // keystroke; zeroes say the diff was opened and never walked.
+        record.hunk_steps = Some(view.hunk_steps);
+        record.file_steps = Some(view.file_steps);
+        record_diff_event(&record);
+        return;
+    }
     let level = if editor.dirty { "warn" } else { "info" };
     record_editor_pane_event(
         editor,
@@ -5782,6 +6519,28 @@ fn close_editor_dialog_scope(state: &mut AppState, pane_ids: &[u32], tab: Option
 /// surface a refusal/failure toast. Emits `editor.open` /
 /// `editor.open_failed` telemetry either way.
 pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
+    dispatch_editor_open_at(state, raw_path, None)
+}
+
+/// The editor palette for the active theme. Editor grids never pass
+/// through the terminal palette remap, so a pane resolves real colours
+/// once here and again on every theme change.
+pub fn editor_colors(state: &AppState) -> crate::editor::EditorColors {
+    crate::editor::EditorColors::for_theme(&state.theme, &state.custom_theme)
+}
+
+/// Open `raw_path`, or focus the pane that already has it, then jump to
+/// `line` (1-based) when one is given.
+///
+/// Opening the same file twice used to produce two independent buffers of
+/// the same file, whose saves would clobber each other. Focusing the
+/// existing pane is both what every editor does and the only safe
+/// behaviour here (see BACKLOG "duplicate open").
+pub fn dispatch_editor_open_at(
+    state: &mut AppState,
+    raw_path: &str,
+    line: Option<(usize, Option<usize>)>,
+) -> bool {
     use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
 
     let trimmed = raw_path.trim();
@@ -5791,9 +6550,26 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
     }
     let path = std::path::PathBuf::from(trimmed);
     let path_str = path.to_string_lossy().into_owned();
+
+    if let Some(existing) = find_editor_pane_for_path(state, &path) {
+        if focus_pane_anywhere(state, PaneId(existing)) {
+            if let Some((line_1, col_1)) = line {
+                if let Some(editor) = state.editors.get_mut(&existing) {
+                    editor.goto_line(line_1, col_1);
+                }
+            }
+            record_editor_focus_existing(state, existing, &path_str, line.map(|(l, _)| l));
+            return true;
+        }
+    }
+
     let (rows, cols) = editor_viewport_dims(state);
-    match crate::editor::EditorPane::open(&path, rows, cols) {
-        Ok(editor) => {
+    let colors = editor_colors(state);
+    match crate::editor::EditorPane::open_with_colors(&path, rows, cols, colors) {
+        Ok(mut editor) => {
+            if let Some((line_1, col_1)) = line {
+                editor.goto_line(line_1, col_1);
+            }
             record_editor_event(&EditorEventRecord {
                 timestamp_unix_ms: now_unix_ms(),
                 event: "editor.open",
@@ -5802,6 +6578,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 path: Some(&path_str),
                 file_bytes: Some(editor.file_bytes),
                 line_count: Some(editor.buffer.line_count() as u64),
+                line: line.map(|(l, _)| l as u64),
                 reason: None,
                 os_error: None,
             });
@@ -5822,6 +6599,7 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
                 path: Some(&path_str),
                 file_bytes,
                 line_count: None,
+                line: None,
                 reason: Some(err.reason()),
                 os_error: match &err {
                     crate::editor::OpenError::Io(e) => e.raw_os_error(),
@@ -5835,6 +6613,799 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
             push_error_toast(state, err.message(&path));
         }
     }
+    true
+}
+
+/// Pane id of an editor holding `path`, in any workspace.
+///
+/// Compares canonicalised paths so `src/state.rs` and an absolute spelling
+/// of the same file are one pane; falls back to the raw path when
+/// canonicalisation fails (a deleted file, a permission error), which is
+/// still correct for the common "the same string twice" case.
+fn find_editor_pane_for_path(state: &AppState, path: &std::path::Path) -> Option<u32> {
+    let target = std::fs::canonicalize(path).ok();
+    state
+        .editors
+        .iter()
+        .filter(|(_, editor)| !editor.is_diff())
+        .find(
+            |(_, editor)| match (&target, std::fs::canonicalize(&editor.path).ok()) {
+                (Some(a), Some(b)) => a == &b,
+                _ => editor.path == path,
+            },
+        )
+        .map(|(id, _)| *id)
+}
+
+/// Focus `pane` wherever it lives, switching workspace and tab as needed.
+fn focus_pane_anywhere(state: &mut AppState, pane: PaneId) -> bool {
+    // The active workspace first: its tabs are the live ones, and it is
+    // also the only workspace that exists at all in a seeded state.
+    if focus_workspace_pane_by_index(state, state.active_workspace, pane.0) {
+        return true;
+    }
+    for ws_idx in 0..state.workspaces.len() {
+        if ws_idx == state.active_workspace {
+            continue;
+        }
+        if focus_workspace_pane_by_index(state, ws_idx, pane.0) {
+            return true;
+        }
+    }
+    false
+}
+
+fn record_editor_focus_existing(
+    state: &mut AppState,
+    pane_id: u32,
+    path: &str,
+    line: Option<usize>,
+) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return;
+    };
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event: "editor.focus_existing",
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(path),
+        file_bytes: Some(editor.file_bytes),
+        line_count: Some(editor.buffer.line_count() as u64),
+        line: line.map(|l| l as u64),
+        reason: None,
+        os_error: None,
+    });
+    record_diagnostic_pty_event(state, format!("editor_focus_existing pane={pane_id}"));
+}
+
+/// Handle `editor.open_at:<line>[.<col>]:<path>`.
+///
+/// The line comes **first** because a Windows path contains a colon
+/// (`C:\src\main.rs`), so a trailing `:<line>` cannot be split off
+/// unambiguously. The column, when given, is separated by a dot for the
+/// same reason.
+fn dispatch_editor_open_at_command(state: &mut AppState, arg: &str) -> bool {
+    let Some((position, path)) = arg.split_once(':') else {
+        push_error_toast(state, "Open at: expected editor.open_at:<line>:<path>");
+        return true;
+    };
+    let (line_text, col_text) = match position.split_once('.') {
+        Some((l, c)) => (l, Some(c)),
+        None => (position, None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        push_error_toast(
+            state,
+            format!("Open at: '{line_text}' is not a line number"),
+        );
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    dispatch_editor_open_at(state, path, Some((line.max(1), col)))
+}
+
+/// Handle `editor.goto:<line>[:<col>]` on the active editor pane. No
+/// path is involved, so the column can use a colon here.
+fn dispatch_editor_goto(state: &mut AppState, arg: &str) -> bool {
+    let pane_id = state.active_pane.0;
+    if !state.editors.contains_key(&pane_id) {
+        return false;
+    }
+    let (line_text, col_text) = match arg.split_once(':') {
+        Some((l, c)) => (l, Some(c)),
+        None => (arg, None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        push_error_toast(state, format!("Go to line: '{line_text}' is not a number"));
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    let landed = editor.goto_line(line.max(1), col);
+    record_editor_line_event(state, pane_id, "editor.goto", landed);
+    true
+}
+
+fn record_editor_line_event(state: &mut AppState, pane_id: u32, event: &'static str, line: usize) {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return;
+    };
+    if record_on_diff_sink(editor, "diff.goto", Some(line as u64)) {
+        return;
+    }
+    let path = editor.path.to_string_lossy().into_owned();
+    record_editor_event(&EditorEventRecord {
+        timestamp_unix_ms: now_unix_ms(),
+        event,
+        level: "info",
+        correlation_id: &editor.correlation_id,
+        path: Some(&path),
+        file_bytes: None,
+        line_count: Some(editor.buffer.line_count() as u64),
+        line: Some(line as u64),
+        reason: None,
+        os_error: None,
+    });
+}
+
+/// `editor.goto`: open the go-to-line prompt for the active editor.
+///
+/// Unclaimed when the active pane is not an editor, so the chord falls
+/// through to the terminal rather than opening a dialog with nothing to
+/// jump in.
+fn dispatch_editor_goto_dialog(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    if !state.editors.contains_key(&pane_id) {
+        return false;
+    }
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+        pane_id,
+        buffer: String::new(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.goto_commit`: jump using the prompt's buffer. A bad number
+/// reopens the dialog with the reason inline so the typed text survives.
+fn dispatch_goto_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::GotoLine {
+        pane_id,
+        buffer,
+        error: _,
+    }) = state.confirm_dialog.take()
+    else {
+        return false;
+    };
+    let text = buffer.trim().to_string();
+    if text.is_empty() {
+        return true;
+    }
+    let (line_text, col_text) = match text.split_once(':') {
+        Some((l, c)) => (l, Some(c)),
+        None => (text.as_str(), None),
+    };
+    let Ok(line) = line_text.trim().parse::<usize>() else {
+        let message = format!("'{}' is not a line number", line_text.trim());
+        state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+            pane_id,
+            buffer,
+            error: Some(message),
+        });
+        return true;
+    };
+    let col = col_text.and_then(|c| c.trim().parse::<usize>().ok());
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return true;
+    };
+    let landed = editor.goto_line(line.max(1), col);
+    record_editor_line_event(state, pane_id, "editor.goto", landed);
+    true
+}
+
+// -- find in file ---------------------------------------------------------
+
+/// `editor.find*`: the find bar of the active editor pane.
+///
+/// Every arm is unclaimed when the active pane is not an editor, so the
+/// chords keep falling through to the terminal.
+fn dispatch_editor_find(state: &mut AppState, command: FindCommand) -> bool {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    match command {
+        FindCommand::Open => {
+            // Ctrl+F on an already-open bar re-seeds the query from the
+            // selection rather than starting a new find session; recording
+            // it would break the open/closed pairing the sink is read for.
+            let was_closed = editor.find.is_none();
+            editor.find_open();
+            if !was_closed {
+                return true;
+            }
+            if record_on_diff_sink(editor, "diff.find_open", None) {
+                return true;
+            }
+            let path = editor.path.to_string_lossy().into_owned();
+            let correlation_id = editor.correlation_id.clone();
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.find_open",
+                level: "info",
+                correlation_id: &correlation_id,
+                path: Some(&path),
+                file_bytes: None,
+                line_count: None,
+                line: None,
+                reason: None,
+                os_error: None,
+            });
+        }
+        FindCommand::Close => {
+            // Nothing open: leave the key unclaimed so Escape can fall
+            // through to whatever else wants to close.
+            let Some(closed) = editor.find_close() else {
+                return false;
+            };
+            if record_on_diff_sink(editor, "diff.find_closed", None) {
+                return true;
+            }
+            let path = editor.path.to_string_lossy().into_owned();
+            let correlation_id = editor.correlation_id.clone();
+            record_editor_event(&EditorEventRecord {
+                timestamp_unix_ms: now_unix_ms(),
+                event: "editor.find_closed",
+                level: "info",
+                correlation_id: &correlation_id,
+                path: Some(&path),
+                file_bytes: None,
+                // The number of hits the session ended with — never the
+                // query, which is user text.
+                line_count: Some(closed.matches.len() as u64),
+                line: None,
+                reason: None,
+                os_error: None,
+            });
+        }
+        FindCommand::Next => {
+            editor.find_step(true);
+        }
+        FindCommand::Prev => {
+            editor.find_step(false);
+        }
+        FindCommand::ToggleCase => {
+            editor.find_toggle_case();
+        }
+        FindCommand::Query(text) => {
+            editor.find_set_query(text);
+        }
+    }
+    true
+}
+
+/// The find-bar verbs, so one handler covers six dispatch strings.
+enum FindCommand<'a> {
+    Open,
+    Close,
+    Next,
+    Prev,
+    ToggleCase,
+    Query(&'a str),
+}
+
+// -- diff review pane -----------------------------------------------------
+
+/// Everything one diff pane needs to exist and then fill itself in.
+struct DiffRequest {
+    spec: crate::diff::DiffSpec,
+    /// Where to run git. `None` means "resolve it from `start_dir` on the
+    /// worker thread" — `git rev-parse` costs a process spawn (~30 ms on
+    /// Windows) and must not run on the UI thread. The Flow hand-off
+    /// already knows the root and skips the spawn.
+    repo_root: Option<PathBuf>,
+    /// Directory the root is resolved from when `repo_root` is `None`.
+    start_dir: PathBuf,
+    /// Where the request came from, for telemetry: `dialog`, `palette`,
+    /// `flow`, `dispatch`.
+    origin: &'static str,
+    /// Scroll target applied once the document lands: a repo-relative
+    /// path and, when known, a line inside it (the Flow hand-off).
+    reveal: Option<(String, Option<u32>)>,
+}
+
+/// `diff.open`: open the "Diff against…" prompt, prefilled with `HEAD`.
+fn dispatch_diff_dialog(state: &mut AppState) -> bool {
+    state.ctx_menu = None;
+    state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+        buffer: "HEAD".to_string(),
+        error: None,
+    });
+    true
+}
+
+/// `dialog.diff_commit`: open the pane for the prompt's range. A range
+/// that does not parse reopens the dialog with the reason inline rather
+/// than toasting and discarding what was typed.
+fn dispatch_diff_commit(state: &mut AppState) -> bool {
+    let Some(ConfirmDialog::DiffRequest { buffer, error: _ }) = state.confirm_dialog.take() else {
+        return false;
+    };
+    match crate::diff::DiffSpec::parse(&buffer) {
+        Ok(spec) => {
+            open_diff_pane(state, spec, None, "dialog", None);
+        }
+        Err(message) => {
+            state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+                buffer,
+                error: Some(message),
+            });
+        }
+    }
+    true
+}
+
+/// `diff.open:<range>`: open the pane directly (startup dispatch, the
+/// palette, tests). A bad range toasts; nothing is created.
+fn dispatch_diff_open_range(state: &mut AppState, range: &str) -> bool {
+    match crate::diff::DiffSpec::parse(range) {
+        Ok(spec) => {
+            open_diff_pane(state, spec, None, "dispatch", None);
+        }
+        Err(message) => {
+            record_diff_rejected(&message);
+            push_error_toast(state, format!("Diff: {message}"));
+        }
+    }
+    true
+}
+
+fn record_diff_rejected(message: &str) {
+    use crate::diff::telemetry::{generate_job_id, record_diff_event, DiffEventRecord};
+    let job_id = generate_job_id();
+    let mut record = DiffEventRecord::new("diff.rejected", "warn", &job_id);
+    record.reason = Some("bad_range");
+    // The message names the *role* that failed ("base revision may not
+    // start with '-'"), never the text the user typed.
+    let _ = message;
+    record_diff_event(&record);
+}
+
+/// Create the pane for `spec` and start its git job. Returns the new
+/// pane's id, or `None` when there is no directory to run git in.
+///
+/// The pane appears immediately with a "Loading…" buffer so the tab is
+/// focusable, scrollable and closeable while git runs; the result is
+/// applied later under a brief state lock, or dropped if the pane went
+/// away meanwhile.
+fn open_diff_pane(
+    state: &mut AppState,
+    spec: crate::diff::DiffSpec,
+    repo_root: Option<PathBuf>,
+    origin: &'static str,
+    reveal: Option<(String, Option<u32>)>,
+) -> Option<PaneId> {
+    let start_dir = match repo_root.clone().or_else(|| active_workspace_cwd(state)) {
+        Some(dir) => dir,
+        None => {
+            push_error_toast(state, "Diff: the workspace has no directory");
+            return None;
+        }
+    };
+    spawn_diff_job(
+        state,
+        DiffRequest {
+            spec,
+            repo_root,
+            start_dir,
+            origin,
+            reveal,
+        },
+    )
+}
+
+fn spawn_diff_job(state: &mut AppState, request: DiffRequest) -> Option<PaneId> {
+    use crate::diff::telemetry::{generate_job_id, record_diff_event, DiffEventRecord};
+
+    let DiffRequest {
+        spec,
+        repo_root,
+        start_dir,
+        origin,
+        reveal,
+    } = request;
+
+    let job_id = generate_job_id();
+    let label = spec.label();
+    {
+        let root_display = start_dir.to_string_lossy().into_owned();
+        let mut record = DiffEventRecord::new("diff.request", "info", &job_id);
+        record.range = Some(&label);
+        record.repo_root = Some(&root_display);
+        record.origin = Some(origin);
+        record_diff_event(&record);
+    }
+
+    let (rows, cols) = editor_viewport_dims(state);
+    let colors = editor_colors(state);
+    let pane = crate::editor::EditorPane::diff_loading(
+        spec.clone(),
+        repo_root.clone().unwrap_or_else(|| start_dir.clone()),
+        job_id.clone(),
+        rows,
+        cols,
+        colors,
+    );
+    let pane_id = mutate_add_editor_tab(state, pane);
+    record_diagnostic_pty_event(
+        state,
+        format!("diff_open pane={} job={}", pane_id.0, job_id),
+    );
+
+    // No hooks means no shared state to write back into: unit tests, and
+    // any future headless caller. The pane stays in its Loading state,
+    // which is exactly what a test asserting "the tab was created"
+    // wants, and `set_diff_document` is covered directly.
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return Some(pane_id);
+    };
+
+    let thread_name = format!("git-diff-{job_id}");
+    let worker_job_id = job_id.clone();
+    let worker_label = label.clone();
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let root = match repo_root {
+                Some(root) => Some(root),
+                None => crate::git::repo_root(&start_dir),
+            };
+            let Some(root) = root else {
+                apply_diff_failure(
+                    &hooks,
+                    pane_id.0,
+                    &worker_job_id,
+                    &worker_label,
+                    "not_a_repo",
+                    format!("{} is not inside a git repository", start_dir.display()),
+                    0,
+                );
+                return;
+            };
+            let outcome = crate::diff::run_diff(&spec, &root);
+            apply_diff_outcome(
+                &hooks,
+                pane_id.0,
+                &worker_job_id,
+                &worker_label,
+                &root,
+                outcome,
+                reveal,
+            );
+        })
+        .is_ok();
+    if !spawned {
+        let mut record = DiffEventRecord::new("diff.failed", "error", &job_id);
+        record.range = Some(&label);
+        record.reason = Some("spawn");
+        record.pane_id = Some(pane_id.0);
+        record_diff_event(&record);
+        if let Some(editor) = state.editors.get_mut(&pane_id.0) {
+            editor.set_diff_error("could not start the diff worker thread".to_string());
+        }
+    }
+    Some(pane_id)
+}
+
+/// Write a finished job's result into its pane, or drop it when the pane
+/// is gone or has been reused for a different job.
+fn apply_diff_outcome(
+    hooks: &std::sync::Arc<EditorOpenHooks>,
+    pane_id: u32,
+    job_id: &str,
+    label: &str,
+    root: &std::path::Path,
+    outcome: crate::diff::DiffOutcome,
+    reveal: Option<(String, Option<u32>)>,
+) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    use crate::diff::DiffOutcome;
+
+    match outcome {
+        DiffOutcome::Ready {
+            document,
+            stdout_bytes,
+            stdout_truncated,
+            elapsed_ms,
+        } => {
+            // Ownership first, telemetry after, and neither the sink write
+            // nor the rebuild inside the lock: a worker that blocks on the
+            // state lock across a file append blocks the UI thread behind
+            // it. `diff.ready` then means exactly "a pane is showing this",
+            // so counting it answers "how many diffs did people see".
+            let applied = {
+                let mut guard = hooks.shared.lock_recover();
+                if diff_pane_still_ours(&guard, pane_id, job_id) {
+                    if let Some(editor) = guard.editors.get_mut(&pane_id) {
+                        // The worker resolved the real work tree; the pane
+                        // was created with the directory we started from.
+                        editor.path = root.to_path_buf();
+                        if let Some(view) = editor.kind.as_diff_mut() {
+                            view.repo_root = root.to_path_buf();
+                        }
+                        editor.set_diff_document(&document);
+                        if let Some((rel, line)) = reveal {
+                            editor.diff_reveal_location(&rel, line);
+                        }
+                    }
+                    sync_editor_pane_title(&mut guard, pane_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !applied {
+                record_diff_dropped(job_id, pane_id, label, Some(elapsed_ms));
+                return;
+            }
+
+            let mut record = DiffEventRecord::new("diff.ready", "info", job_id);
+            record.pane_id = Some(pane_id);
+            record.range = Some(label);
+            record.files = Some(document.files.len() as u64);
+            record.hunks = Some(document.hunk_count() as u64);
+            record.rows = Some(document.rows.len() as u64);
+            record.stdout_bytes = Some(stdout_bytes as u64);
+            record.elapsed_ms = Some(elapsed_ms);
+            record.truncated = Some(stdout_truncated || document.truncated);
+            record_diff_event(&record);
+            (hooks.request_rebuild)();
+        }
+        DiffOutcome::Failed {
+            reason,
+            message,
+            elapsed_ms,
+        } => {
+            apply_diff_failure(hooks, pane_id, job_id, label, reason, message, elapsed_ms);
+        }
+    }
+}
+
+fn apply_diff_failure(
+    hooks: &std::sync::Arc<EditorOpenHooks>,
+    pane_id: u32,
+    job_id: &str,
+    label: &str,
+    reason: &'static str,
+    message: String,
+    elapsed_ms: u64,
+) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+
+    // Same shape as the success path: a failure nobody is left to see is a
+    // drop, not a `diff.failed` naming a pane that no longer exists.
+    let applied = {
+        let mut guard = hooks.shared.lock_recover();
+        if diff_pane_still_ours(&guard, pane_id, job_id) {
+            if let Some(editor) = guard.editors.get_mut(&pane_id) {
+                editor.set_diff_error(message.clone());
+            }
+            push_error_toast(&mut guard, format!("Diff {label}: {message}"));
+            true
+        } else {
+            false
+        }
+    };
+    if !applied {
+        record_diff_dropped(job_id, pane_id, label, Some(elapsed_ms));
+        return;
+    }
+
+    let mut record = DiffEventRecord::new("diff.failed", "error", job_id);
+    record.pane_id = Some(pane_id);
+    record.range = Some(label);
+    record.reason = Some(reason);
+    record.elapsed_ms = Some(elapsed_ms);
+    record_diff_event(&record);
+    (hooks.request_rebuild)();
+}
+
+/// True when `pane_id` is still a diff pane waiting on exactly this job.
+/// Guards against the pane being closed, or its tab id being reused by a
+/// later pane, while git was running.
+fn diff_pane_still_ours(state: &AppState, pane_id: u32, job_id: &str) -> bool {
+    state
+        .editors
+        .get(&pane_id)
+        .and_then(|editor| editor.diff())
+        .is_some_and(|view| view.job_id == job_id)
+}
+
+/// The job finished but its pane is gone. `elapsed_ms` rides along so the
+/// sink can still answer "how much git time went to diffs nobody read".
+fn record_diff_dropped(job_id: &str, pane_id: u32, label: &str, elapsed_ms: Option<u64>) {
+    use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+    let mut record = DiffEventRecord::new("diff.dropped", "info", job_id);
+    record.pane_id = Some(pane_id);
+    record.range = Some(label);
+    record.reason = Some("pane_closed");
+    record.elapsed_ms = elapsed_ms;
+    record_diff_event(&record);
+}
+
+/// `diff.next_hunk` / `diff.prev_hunk` / `diff.next_file` /
+/// `diff.prev_file` on the active diff pane. Unclaimed when the active
+/// pane is not a diff, so the letter keys stay free everywhere else.
+fn dispatch_diff_nav(state: &mut AppState, forward: bool, hunk: bool) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get_mut(&pane_id) else {
+        return false;
+    };
+    if !editor.is_diff() {
+        return false;
+    }
+    let moved = if hunk {
+        editor.diff_step_hunk(forward)
+    } else {
+        editor.diff_step_file(forward)
+    };
+    if moved {
+        if let Some(view) = editor.kind.as_diff_mut() {
+            if hunk {
+                view.hunk_steps += 1;
+            } else {
+                view.file_steps += 1;
+            }
+        }
+    }
+    true
+}
+
+/// `diff.open_file`: open the file under the diff cursor in an editor,
+/// at the line the cursor sits on in the new version.
+fn dispatch_diff_open_file(state: &mut AppState) -> bool {
+    let pane_id = state.active_pane.0;
+    let Some(editor) = state.editors.get(&pane_id) else {
+        return false;
+    };
+    if !editor.is_diff() {
+        return false;
+    }
+    let Some((path, line)) = editor.diff_open_target() else {
+        // A header row, a spacer, a deleted file, or a path that would
+        // resolve outside the repository: there is nothing on disk to
+        // open. Say so rather than opening the repository root.
+        push_error_toast(state, "No file to open on this row");
+        return true;
+    };
+    {
+        use crate::diff::telemetry::{record_diff_event, DiffEventRecord};
+        if let Some(view) = state.editors.get(&pane_id).and_then(|e| e.diff()) {
+            let label = view.spec.label();
+            let path_display = path.to_string_lossy().into_owned();
+            let mut record = DiffEventRecord::new("diff.open_file", "info", &view.job_id);
+            record.pane_id = Some(pane_id);
+            record.range = Some(&label);
+            record.path = Some(&path_display);
+            record.line = Some(u64::from(line));
+            record_diff_event(&record);
+        }
+    }
+    dispatch_editor_open_at(
+        state,
+        &path.to_string_lossy(),
+        Some((line.max(1) as usize, None)),
+    )
+}
+
+// -- Flow hand-offs -------------------------------------------------------
+
+/// The Flow pane these commands act on: the active one.
+///
+/// `None` means the command was not meant for us, so the caller leaves it
+/// unclaimed rather than toasting at a terminal.
+fn active_flow_pane(state: &AppState) -> Option<std::sync::Arc<crate::flow_explorer::FlowPane>> {
+    state.flows.get(&state.active_pane.0).cloned()
+}
+
+/// One node's source location, by id.
+///
+/// Node ids contain `::` and `.`, so every `flow.*:<id>` command puts the
+/// id last and this is the only place that has to know it.
+fn flow_node_location(
+    pane: &crate::flow_explorer::FlowPane,
+    node_id: &str,
+) -> Option<crate::flow_explorer::Location> {
+    pane.flow.node(node_id)?.location.clone()
+}
+
+/// One `flow.handoff` record per `o` / `d`: which hand-off, and whether
+/// the node had a location to aim at. Never the node id or its label.
+fn record_flow_handoff(
+    pane: &crate::flow_explorer::FlowPane,
+    kind: &'static str,
+    aim: &'static str,
+) {
+    use crate::flow_explorer::telemetry::{record_flow_event, FlowEventRecord};
+    let mut record = FlowEventRecord::new("flow.handoff", "info", &pane.flow_id);
+    record.kind = Some(kind);
+    record.reason = Some(aim);
+    record_flow_event(&record);
+}
+
+/// `located` / `no_location` for a hand-off that named a node, `range` for
+/// one that did not. Folding the last two together would read as "most
+/// nodes have no source location", which is a different bug report.
+fn handoff_aim(node_id: Option<&str>, located: bool) -> &'static str {
+    match (node_id, located) {
+        (None, _) => "range",
+        (Some(_), true) => "located",
+        (Some(_), false) => "no_location",
+    }
+}
+
+/// `flow.edit:<id>`: open the node's file in an editor at its line.
+fn dispatch_flow_edit(state: &mut AppState, node_id: &str) -> bool {
+    let Some(pane) = active_flow_pane(state) else {
+        return false;
+    };
+    let location = flow_node_location(&pane, node_id);
+    record_flow_handoff(
+        &pane,
+        "edit",
+        handoff_aim(Some(node_id), location.is_some()),
+    );
+    let Some(location) = location else {
+        push_error_toast(state, "This node has no source location");
+        return true;
+    };
+    // A flow document is produced by an agent, so its `file` is untrusted
+    // input; `join` with an absolute one would discard the root entirely.
+    let Some(path) = crate::git::resolve_in_repo(&pane.repo_root, &location.file) else {
+        push_error_toast(state, "This node's source path is outside the repository");
+        return true;
+    };
+    dispatch_editor_open_at(
+        state,
+        &path.to_string_lossy(),
+        Some((location.line.max(1) as usize, None)),
+    )
+}
+
+/// `flow.diff` / `flow.diff:<id>`: open the flow's range as a diff pane,
+/// scrolled to the node's file (and its line) when an id is given.
+fn dispatch_flow_diff(state: &mut AppState, node_id: Option<&str>) -> bool {
+    let Some(pane) = active_flow_pane(state) else {
+        return false;
+    };
+    // An id that resolves to no location still opens the whole range:
+    // the user asked to see the diff, and the scroll target is a bonus.
+    let location = node_id.and_then(|id| flow_node_location(&pane, id));
+    record_flow_handoff(&pane, "diff", handoff_aim(node_id, location.is_some()));
+    let Some(range) = pane.flow.diff_range.as_ref() else {
+        push_error_toast(state, "This flow has no diff range");
+        return true;
+    };
+    let spec = match crate::diff::DiffSpec::from_flow_range(&range.base, &range.head) {
+        Ok(spec) => spec,
+        Err(message) => {
+            record_diff_rejected(&message);
+            push_error_toast(state, format!("Diff: {message}"));
+            return true;
+        }
+    };
+    // Flow paths are already repo-root-relative, which is exactly what a
+    // unified diff's headers carry.
+    let reveal = location.map(|loc| (loc.file, Some(loc.line)));
+    open_diff_pane(state, spec, Some(pane.repo_root.clone()), "flow", reveal);
     true
 }
 
@@ -6076,8 +7647,7 @@ pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
     let path = std::path::PathBuf::from(trimmed);
     match crate::flow_explorer::FlowPane::open(&path) {
         Ok(pane) => {
-            record_flow_pane_event(&pane, "flow.open", "info", None);
-            let pane_id = mutate_add_flow_tab(state, pane);
+            let pane_id = open_flow_tab(state, pane);
             record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
         }
         Err(err) => {
@@ -6421,9 +7991,53 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command == "review.patch_open" {
+        let start_dir = active_workspace_cwd(state);
+        return spawn_file_picker(
+            state,
+            "Open patch",
+            Some(("Patch files", &["patch", "diff"])),
+            start_dir,
+            |path| format!("review.patch:{}", path.display()),
+        );
+    }
+    if command.starts_with("review.") {
+        return crate::diff_review::dispatch(state, command);
+    }
     match command {
+        "processes.open" => {
+            let changed = !state.process_details_open;
+            state.process_details_open = true;
+            changed
+        }
+        "processes.close" => std::mem::take(&mut state.process_details_open),
         "modal.close" => {
+            // These surfaces render above the process dialog; Escape belongs
+            // to the visible top layer (for example the window-close prompt).
+            if state.confirm_dialog.is_none()
+                && !state.palette_open
+                && state.quick_prompt.is_none()
+                && std::mem::take(&mut state.process_details_open)
+            {
+                return true;
+            }
+            // The find bar is the innermost surface Escape can close, and
+            // it lives inside a pane rather than over the app. Close it
+            // first, but only when nothing is stacked on top: with a
+            // dialog or the palette open, focus is up there and Escape
+            // belongs to it.
+            let overlay_open = state.ctx_menu.is_some()
+                || state.settings_open
+                || state.confirm_dialog.is_some()
+                || state.palette_open
+                || state.quick_prompt.is_some();
+            if !overlay_open && dispatch_editor_find(state, FindCommand::Close) {
+                return true;
+            }
             let mut changed = false;
+            if state.diff_review.take().is_some() {
+                changed = true;
+            }
             if state.ctx_menu.is_some() {
                 state.ctx_menu = None;
                 changed = true;
@@ -6470,6 +8084,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             // RenameSession commits via `dialog.rename_commit` so the
             // handler can read the buffer before clearing. CloseEditor
             // resolves via `dialog.editor_save_close` / `_discard_close`.
+            // Every text-input dialog commits through its own
+            // `dialog.*_commit` for the same reason: the typed buffer has
+            // to be read before the dialog is cleared.
             if matches!(
                 dlg,
                 ConfirmDialog::CloseApp { .. }
@@ -6477,6 +8094,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                     | ConfirmDialog::CloseEditor { .. }
                     | ConfirmDialog::FlowRequest { .. }
                     | ConfirmDialog::UpdateAvailable
+                    | ConfirmDialog::GotoLine { .. }
+                    | ConfirmDialog::DiffRequest { .. }
             ) {
                 return false;
             }
@@ -6494,7 +8113,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 | ConfirmDialog::RenameSession { .. }
                 | ConfirmDialog::CloseEditor { .. }
                 | ConfirmDialog::FlowRequest { .. }
-                | ConfirmDialog::UpdateAvailable => {
+                | ConfirmDialog::UpdateAvailable
+                | ConfirmDialog::GotoLine { .. }
+                | ConfirmDialog::DiffRequest { .. } => {
                     unreachable!("filtered above")
                 }
             }
@@ -6634,6 +8255,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.keybinds.error = None;
             } else {
                 state.settings_open = true;
+                if state.settings_section == SettingsSection::AgentSkills {
+                    refresh_flow_skills(state);
+                }
             }
             true
         }
@@ -6834,7 +8458,33 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if let Some(path) = other.strip_prefix("editor.open:") => {
             dispatch_editor_open_path(state, path)
         }
+        other if let Some(arg) = other.strip_prefix("editor.open_at:") => {
+            dispatch_editor_open_at_command(state, arg)
+        }
         "editor.open" => dispatch_editor_open_dialog(state),
+        "editor.goto" => dispatch_editor_goto_dialog(state),
+        other if let Some(arg) = other.strip_prefix("editor.goto:") => {
+            dispatch_editor_goto(state, arg)
+        }
+        "dialog.goto_commit" => dispatch_goto_commit(state),
+        "editor.find" => dispatch_editor_find(state, FindCommand::Open),
+        "editor.find_close" => dispatch_editor_find(state, FindCommand::Close),
+        "editor.find_next" => dispatch_editor_find(state, FindCommand::Next),
+        "editor.find_prev" => dispatch_editor_find(state, FindCommand::Prev),
+        "editor.find_case" => dispatch_editor_find(state, FindCommand::ToggleCase),
+        other if let Some(text) = other.strip_prefix("editor.find_query:") => {
+            dispatch_editor_find(state, FindCommand::Query(text))
+        }
+        "diff.open" => dispatch_diff_dialog(state),
+        other if let Some(range) = other.strip_prefix("diff.open:") => {
+            dispatch_diff_open_range(state, range)
+        }
+        "dialog.diff_commit" => dispatch_diff_commit(state),
+        "diff.next_hunk" => dispatch_diff_nav(state, true, true),
+        "diff.prev_hunk" => dispatch_diff_nav(state, false, true),
+        "diff.next_file" => dispatch_diff_nav(state, true, false),
+        "diff.prev_file" => dispatch_diff_nav(state, false, false),
+        "diff.open_file" => dispatch_diff_open_file(state),
         other if let Some(handled) = dispatch_flow_command(state, other) => handled,
         other if let Some(path) = other.strip_prefix("flow.open:") => {
             dispatch_flow_open_path(state, path)
@@ -6852,7 +8502,15 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if let Some(range) = other.strip_prefix("flow.review:") => {
             dispatch_flow_launch_direct(state, crate::flow_explorer::FlowMode::Review, range)
         }
+        "flow.diff" => dispatch_flow_diff(state, None),
+        other if let Some(id) = other.strip_prefix("flow.diff:") => {
+            dispatch_flow_diff(state, Some(id))
+        }
+        other if let Some(id) = other.strip_prefix("flow.edit:") => dispatch_flow_edit(state, id),
         "dialog.flow_commit" => dispatch_flow_commit(state),
+        "editor.indent" => dispatch_editor_reindent(state, ReindentCommand::Indent),
+        "editor.outdent" => dispatch_editor_reindent(state, ReindentCommand::Outdent),
+        "editor.toggle_comment" => dispatch_editor_toggle_comment(state),
         "editor.save" => dispatch_editor_save(state),
         "tab.new_worktree" => {
             let repo_cwd = active_workspace_cwd(state)
@@ -6895,24 +8553,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             request_close_tab(state, idx);
             true
         }
-        "tab.next" => {
-            if state.tabs.len() <= 1 {
+        "tab.next" | "tab.prev" => {
+            let visible = visible_tab_indices(state);
+            if visible.len() <= 1 {
                 return false;
             }
-            let new_idx = (state.active_tab + 1) % state.tabs.len();
-            mutate_switch_tab(state, new_idx);
-            true
-        }
-        "tab.prev" => {
-            if state.tabs.len() <= 1 {
-                return false;
-            }
-            let new_idx = if state.active_tab == 0 {
-                state.tabs.len() - 1
+            let current = visible
+                .iter()
+                .position(|index| *index == state.active_tab)
+                .unwrap_or(0);
+            let next = if command == "tab.next" {
+                (current + 1) % visible.len()
             } else {
-                state.active_tab - 1
+                (current + visible.len() - 1) % visible.len()
             };
-            mutate_switch_tab(state, new_idx);
+            mutate_switch_tab(state, visible[next]);
             true
         }
         "pane.split_right" => {
@@ -6958,8 +8613,66 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.copy_relative" | "explorer.copy_absolute" => {
+            let Some(CtxMenuTarget::Explorer { path, root }) =
+                state.ctx_menu.as_ref().map(|menu| &menu.target)
+            else {
+                return false;
+            };
+            let result = crate::explorer::path_for_clipboard(
+                root,
+                path,
+                command == "explorer.copy_relative",
+            );
+            state.ctx_menu = None;
+            match result {
+                Ok(path) => {
+                    if let Err(error) = state.clipboard.write_text(path) {
+                        push_error_toast(state, format!("Could not copy path: {error}"));
+                    }
+                }
+                Err(error) => push_error_toast(state, error),
+            }
+            true
+        }
+        "explorer.reveal" => dispatch_explorer_reveal(state),
+        "explorer.collapse_all" => {
+            state.explorer.collapse_all();
+            state.explorer.keyboard_focus = true;
+            if let (Some(root), Some(hooks)) = (&state.explorer.root, EDITOR_OPEN_HOOKS.get()) {
+                (hooks.request_reveal)(crate::explorer::row_id(root));
+            }
+            true
+        }
+        "explorer.toggle" => {
+            if explorer_visible(state) {
+                state.explorer.keyboard_focus = false;
+                state.sidebar_collapsed = true;
+            } else {
+                show_explorer(state);
+                state.explorer.keyboard_focus = true;
+            }
+            true
+        }
+        "explorer.show" => {
+            show_explorer(state);
+            state.explorer.keyboard_focus = true;
+            true
+        }
+        "explorer.refresh" => {
+            state.explorer.refresh();
+            sync_explorer(state);
+            true
+        }
+        "sidebar.workspaces" => {
+            state.explorer.active = false;
+            state.sidebar_collapsed = false;
+            true
+        }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            state.explorer.keyboard_focus = false;
+            sync_explorer(state);
             true
         }
         "workspace.add" => {
@@ -7017,6 +8730,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        "palette.files" => dispatch_palette_files(state),
         "palette.close" => close_command_palette(state),
         other if other.starts_with("palette.query:") => {
             if !state.palette_open {
@@ -7058,10 +8772,14 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             let Ok(index) = other["palette.hover:".len()..].parse::<usize>() else {
                 return false;
             };
-            if index >= palette_result_count(state) {
+            // Cheapest check first: `palette_result_count` rebuilds the
+            // whole result set, which in Files mode ranks every indexed
+            // path, and a mouse moving across the list fires this arm at
+            // pointer-sample rate for the row that is already active.
+            if state.palette_active == index {
                 return false;
             }
-            if state.palette_active == index {
+            if index >= palette_result_count(state) {
                 return false;
             }
             state.palette_active = index;
@@ -7142,9 +8860,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             state.settings_open = true;
             state.settings_section = section;
-            if section == SettingsSection::Sessions {
-                refresh_sessions(state);
-            }
+            refresh_settings_section(state, section);
             true
         }
         other if other.starts_with("tab.switch:") => {
@@ -7417,6 +9133,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "agent.auto_resume.toggle" => dispatch_agent_auto_resume_toggle(state),
         "agent.recovery_hooks.remove" => dispatch_agent_recovery_hooks_remove(state),
+        "flow.skill.refresh" => {
+            refresh_flow_skills(state);
+            true
+        }
+        other if other.starts_with("flow.skill.install:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.install:".len()..], false)
+        }
+        other if other.starts_with("flow.skill.remove:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.remove:".len()..], true)
+        }
         "settings.start_at_login.toggle" => dispatch_start_at_login_toggle(state),
         "settings.start_at_login.remove" => dispatch_start_at_login_remove(state),
         other if other.starts_with("agent.resume:") => dispatch_agent_resume(state, other),
@@ -7804,6 +9530,15 @@ fn dispatch_terminal_export_info(state: &mut AppState) -> bool {
 /// clipboard payload cannot forge an "end of paste" mid-string.
 /// See the TODO on [`normalize_pasted_text`].
 fn dispatch_terminal_paste(state: &mut AppState) -> bool {
+    // Ctrl+V and friends are registered system bindings, so they reach
+    // this command even when the focused pane is an editor. Route those
+    // into the buffer instead of failing the PTY check below with
+    // "paste failed: no terminal in focus".
+    let active = state.active_pane.0;
+    if state.editors.contains_key(&active) {
+        dispatch_editor_paste(state, active);
+        return true;
+    }
     // Read first: if the system says no clipboard at all, surface that
     // before chasing pane / PTY issues.
     let raw = match state.clipboard.read_text() {
@@ -7965,6 +9700,12 @@ pub fn active_pane_has_selection(state: &AppState) -> bool {
 /// and the conditional `Ctrl+C`-with-selection path.
 fn dispatch_terminal_copy(state: &mut AppState) -> bool {
     let pane_id = state.active_pane.0;
+    // Ctrl+Shift+C is a registered system binding and reaches editor
+    // panes too; copy their buffer selection rather than looking for a
+    // terminal selection that can never exist.
+    if state.editors.contains_key(&pane_id) {
+        return dispatch_editor_copy(state, pane_id);
+    }
     let sel = match state.terminal_selections.get(&pane_id).copied() {
         Some(sel) if !sel.is_empty() => sel,
         _ => return false,
@@ -8273,13 +10014,204 @@ pub fn handle_terminal_drag(state: &mut AppState, pane: u32, cell: (u64, usize))
 }
 
 /// Finish a drag: drop a collapsed (empty) selection so a click-without-drag
-/// leaves no stale highlight.
+/// leaves no stale highlight, and close out any edge auto-scroll.
 pub fn finish_terminal_drag(state: &mut AppState, pane: u32) {
+    end_terminal_drag_autoscroll(state, pane, "released", std::time::Instant::now());
     if let Some(sel) = state.terminal_selections.get(&pane).copied() {
         if sel.is_empty() {
             clear_terminal_selection(state, pane);
         }
     }
+}
+
+// -- selection edge auto-scroll ---------------------------------------------
+//
+// Dragging a selection past the top or bottom edge of a pane scrolls its
+// scrollback toward the pointer, the way every desktop terminal does, so a
+// block longer than the viewport can be selected in one gesture. The
+// framework re-dispatches the drag update once per animation frame while
+// the pointer rests outside the grid (`ElementDef::with_drag_autorepeat`);
+// the rate below is wall-clock based so that cadence never sets the speed.
+// The selection itself is anchored to absolute lines, so scrolling under
+// it moves nothing: only the focus, pinned to the edge row by the clamped
+// hit-test, advances.
+
+/// Lines per second of edge auto-scroll per row of pointer overshoot: one
+/// row past the edge scrolls at this rate, each further row adds the same
+/// again.
+pub const AUTOSCROLL_LINES_PER_SEC_PER_ROW: f32 = 12.0;
+/// Ceiling on the auto-scroll rate however far the pointer travels.
+pub const AUTOSCROLL_MAX_LINES_PER_SEC: f32 = 120.0;
+
+/// Bookkeeping for one selection drag's edge auto-scroll, kept from the
+/// first overshooting drag update until the drag ends or the pointer comes
+/// back inside the pane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalDragAutoscroll {
+    pub pane: u32,
+    pub started_at: std::time::Instant,
+    /// Wall clock of the last rate computation.
+    pub last_tick: std::time::Instant,
+    /// Fractional lines owed to the next tick. Seeded at `1.0` so the
+    /// first overshooting update scrolls a line immediately.
+    pub carry: f32,
+    /// Signed lines applied so far (positive = toward older history).
+    pub lines: i64,
+    /// Set when the pane's program owns the viewport and auto-scroll was
+    /// refused; the refusal is recorded once per drag.
+    pub blocked: Option<&'static str>,
+}
+
+/// Rows the pointer sits past a pane's text grid: negative above the top
+/// edge, positive below the bottom edge (row `rows` counts as one past),
+/// zero inside. Pure.
+pub fn terminal_drag_overshoot_rows(local_y: f32, cell_h: f32, rows: usize) -> i32 {
+    if !local_y.is_finite() || !cell_h.is_finite() || cell_h <= 0.0 || rows == 0 {
+        return 0;
+    }
+    if local_y < 0.0 {
+        return -((-local_y / cell_h).ceil().clamp(1.0, 10_000.0) as i32);
+    }
+    let bottom = rows as f32 * cell_h;
+    if local_y >= bottom {
+        return ((local_y - bottom) / cell_h).floor().min(10_000.0) as i32 + 1;
+    }
+    0
+}
+
+/// [`terminal_drag_overshoot_rows`] for `pane`'s live grid using the
+/// renderer's published cell height. Zero when metrics are not ready or
+/// the pane has no terminal.
+pub fn terminal_drag_overshoot_rows_for_pane(state: &AppState, pane: u32, local_y: f32) -> i32 {
+    let cell_h = unshit::core::cell_grid::CellGrid::global_cell_h();
+    let Some(handle) = state.terminals.get(&pane) else {
+        return 0;
+    };
+    let rows = handle.lock_recover().grid().rows();
+    terminal_drag_overshoot_rows(local_y, cell_h, rows)
+}
+
+/// Edge auto-scroll step for a selection drag on `pane`. `overshoot_rows`
+/// is the pointer's distance past the grid in rows (negative = above the
+/// top edge, positive = below), as from [`terminal_drag_overshoot_rows`];
+/// zero is a no-op. Scrolls the scrollback toward the pointer at
+/// [`AUTOSCROLL_LINES_PER_SEC_PER_ROW`] per row of overshoot, capped at
+/// [`AUTOSCROLL_MAX_LINES_PER_SEC`], metered against `now` so the caller's
+/// cadence does not set the speed; the first overshooting update always
+/// scrolls one line so the gesture responds instantly. Returns the signed
+/// lines applied (positive = toward older history).
+///
+/// Refused — with a `terminal.selection_autoscroll_blocked` record once per
+/// drag — when the running program owns the mouse (DECSET 1000/1002/1003)
+/// or the alternate screen: such a program scrolls its own viewport by
+/// rewriting the same rows, so moving our scrollback would slide the
+/// highlight over content it never covered (and there is nothing of the
+/// program's content to reveal).
+pub fn terminal_drag_autoscroll(
+    state: &mut AppState,
+    pane: u32,
+    overshoot_rows: i32,
+    now: std::time::Instant,
+) -> i32 {
+    if overshoot_rows == 0 {
+        return 0;
+    }
+    let Some(handle) = state.terminals.get(&pane).cloned() else {
+        return 0;
+    };
+    let mut auto = match state.terminal_drag_autoscroll {
+        Some(auto) if auto.pane == pane => auto,
+        _ => TerminalDragAutoscroll {
+            pane,
+            started_at: now,
+            last_tick: now,
+            carry: 1.0,
+            lines: 0,
+            blocked: None,
+        },
+    };
+    let mut terminal = handle.lock_recover();
+    let refusal = if terminal.mouse_reporting_active() {
+        Some("mouse_reporting")
+    } else if terminal.alt_screen_active() {
+        Some("alt_screen")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        drop(terminal);
+        if auto.blocked.is_none() {
+            auto.blocked = Some(reason);
+            crate::terminal::telemetry::record_terminal_event(
+                &crate::terminal::telemetry::TerminalEventRecord {
+                    timestamp_unix_ms: crate::terminal::telemetry::now_unix_ms(),
+                    event: "terminal.selection_autoscroll_blocked",
+                    level: "info",
+                    pane,
+                    reason: Some(reason),
+                    ..Default::default()
+                },
+            );
+        }
+        state.terminal_drag_autoscroll = Some(auto);
+        return 0;
+    }
+    // Positive scrolls toward older history (pointer above the top edge).
+    let direction: i32 = if overshoot_rows < 0 { 1 } else { -1 };
+    let dt = now.saturating_duration_since(auto.last_tick).as_secs_f32();
+    let rate = (overshoot_rows.unsigned_abs() as f32 * AUTOSCROLL_LINES_PER_SEC_PER_ROW)
+        .min(AUTOSCROLL_MAX_LINES_PER_SEC);
+    // Bound the owed lines so a stalled frame cannot dump a screenful.
+    auto.carry = (auto.carry + rate * dt).min(AUTOSCROLL_MAX_LINES_PER_SEC);
+    let whole = auto.carry.floor() as i32;
+    auto.carry -= whole as f32;
+    auto.last_tick = now;
+    let applied = if whole > 0 {
+        terminal.scroll_view_by_lines((direction * whole) as f32)
+    } else {
+        0
+    };
+    drop(terminal);
+    auto.lines += applied as i64;
+    state.terminal_drag_autoscroll = Some(auto);
+    if applied != 0 {
+        mark_terminal_selection_dirty(state, pane);
+    }
+    applied
+}
+
+/// End `pane`'s selection edge auto-scroll (`reason`: `released` on
+/// drag end, `reentered` when the pointer came back inside the grid),
+/// summarizing it as one `terminal.selection_autoscroll` record when it
+/// scrolled anything. No-op without live bookkeeping for `pane`.
+pub fn end_terminal_drag_autoscroll(
+    state: &mut AppState,
+    pane: u32,
+    reason: &'static str,
+    now: std::time::Instant,
+) {
+    let Some(auto) = state
+        .terminal_drag_autoscroll
+        .take_if(|auto| auto.pane == pane)
+    else {
+        return;
+    };
+    if auto.lines == 0 {
+        return;
+    }
+    crate::terminal::telemetry::record_terminal_event(
+        &crate::terminal::telemetry::TerminalEventRecord {
+            timestamp_unix_ms: crate::terminal::telemetry::now_unix_ms(),
+            event: "terminal.selection_autoscroll",
+            level: "info",
+            pane,
+            direction: Some(if auto.lines > 0 { "up" } else { "down" }),
+            lines: Some(auto.lines),
+            duration_ms: Some(now.saturating_duration_since(auto.started_at).as_millis() as u64),
+            reason: Some(reason),
+            ..Default::default()
+        },
+    );
 }
 
 /// Parse `shell.set_default:<json>` and apply. The json must
@@ -8366,6 +10298,56 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
             "Automatic agent resume is on. Codex may ask you to trust the hook from /hooks."
         },
     );
+    true
+}
+
+/// Refresh only on settings navigation/actions; rendering reads the snapshot.
+fn refresh_flow_skills(state: &mut AppState) {
+    use crate::flow_explorer::skills::{
+        InstallStatus, SkillAgent, SkillInstallation, SkillInstaller,
+    };
+    state.flow_skill_installations = match SkillInstaller::for_current_user() {
+        Ok(installer) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| installer.inspect(agent))
+            .collect(),
+        Err(error) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| SkillInstallation {
+                agent,
+                path: std::path::PathBuf::from(agent.relative_dir()),
+                status: InstallStatus::Unavailable(error.to_string()),
+            })
+            .collect(),
+    };
+}
+
+/// Refresh whichever section's data goes stale while the settings page is
+/// closed. Call after navigating to `section`, whether or not it changed.
+pub fn refresh_settings_section(state: &mut AppState, section: SettingsSection) {
+    match section {
+        SettingsSection::Sessions => refresh_sessions(state),
+        SettingsSection::AgentSkills => refresh_flow_skills(state),
+        _ => {}
+    }
+}
+
+fn dispatch_flow_skill_change(state: &mut AppState, id: &str, remove: bool) -> bool {
+    use crate::flow_explorer::skills::{SkillAgent, SkillInstaller};
+    let Some(agent) = SkillAgent::from_id(id) else {
+        return false;
+    };
+    let result = SkillInstaller::for_current_user().and_then(|installer| {
+        if remove {
+            installer.remove(agent)
+        } else {
+            installer.install(agent)
+        }
+    });
+    if let Err(error) = result {
+        push_error_toast(state, format!("{} Flow skill: {error}", agent.label()));
+    }
+    refresh_flow_skills(state);
     true
 }
 
@@ -8953,11 +10935,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!(
                     "drag.end: extracting pane {:?} to tab index {}",
@@ -9024,11 +11006,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!("drag.end: reordering tab {} to {}", source_tab, index);
                 mutate_tab_reorder(state, &source_tab, index);
@@ -9410,6 +11392,7 @@ pub(crate) mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().to_string(),
             custom_theme: crate::theme::default_custom_theme(),
             last_terminal_theme_painted: String::new(),
@@ -9424,8 +11407,11 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            process_details_open: false,
+            diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -9439,6 +11425,8 @@ pub(crate) mod tests {
             terminals: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
             flows: std::collections::HashMap::new(),
+            file_index: None,
+            file_index_building: false,
             flow_pending: std::collections::HashMap::new(),
             agent_restarts: std::collections::HashMap::new(),
             pending_agent_resumes: std::collections::HashMap::new(),
@@ -9481,6 +11469,7 @@ pub(crate) mod tests {
             terminal_link_hover: None,
             terminal_link_hover_repaint: std::collections::HashSet::new(),
             terminal_click: None,
+            terminal_drag_autoscroll: None,
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
         }
@@ -9499,16 +11488,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_seven() {
+    fn settings_section_all_includes_agent_skills_and_updates() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
         assert_eq!(all[3], SettingsSection::Sessions);
         assert_eq!(all[4], SettingsSection::Notifications);
-        assert_eq!(all[5], SettingsSection::Updates);
-        assert_eq!(all[6], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::AgentSkills);
+        assert_eq!(all[6], SettingsSection::Updates);
+        assert_eq!(all[7], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -10006,6 +11996,26 @@ pub(crate) mod tests {
     fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
+
+    #[test]
+    fn escape_closes_confirmation_above_process_details_first() {
+        let mut state = seed_state();
+        dispatch(&mut state, "processes.open");
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.process_details_open);
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.process_details_open);
+    }
+
+    #[test]
+    fn process_details_open_and_escape_close() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "processes.open"));
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dispatch(&mut state, "processes.close"));
     }
 
     #[test]
@@ -10692,6 +12702,501 @@ pub(crate) mod tests {
         assert_eq!(state.toasts.len(), 1);
     }
 
+    /// Two buffers over one file would let two saves clobber each other,
+    /// and nothing in the UI would say which pane was stale. BACKLOG
+    /// "duplicate open" asks for exactly this.
+    #[test]
+    fn opening_the_same_file_twice_focuses_the_existing_pane() {
+        let mut state = test_state();
+        let path = editor_temp_file("dedupe", b"alpha\nbeta\ngamma\n");
+        let command = format!("editor.open:{}", path.display());
+
+        assert!(dispatch(&mut state, &command));
+        let first = state.active_pane.0;
+        assert_eq!(state.editors.len(), 1);
+
+        // Move somewhere else so "focused" is an observable change.
+        dispatch(&mut state, "tab.new");
+        assert_ne!(state.active_pane.0, first);
+
+        assert!(dispatch(&mut state, &command));
+        assert_eq!(state.editors.len(), 1, "no second buffer for the same file");
+        assert_eq!(state.active_pane.0, first, "the existing pane was focused");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The line comes before the path because a Windows path contains a
+    /// colon: `editor.open_at:12.5:C:\src\main.rs` has to split on the
+    /// *first* colon after the position, not the last.
+    #[test]
+    fn editor_open_at_jumps_to_a_line_and_column() {
+        let mut state = test_state();
+        let path = editor_temp_file("open_at", b"one\ntwo\nthree\nfour\nfive\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open_at:3.4:{}", path.display())
+        ));
+        let editor = &state.editors[&state.active_pane.0];
+        assert_eq!(editor.buffer.cursor().line, 2, "1-based line 3");
+        assert_eq!(editor.buffer.cursor().col, 3, "1-based column 4");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_open_at_focuses_an_open_pane_and_jumps_in_it() {
+        let mut state = test_state();
+        let path = editor_temp_file("open_at_existing", b"a\nb\nc\nd\ne\nf\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        dispatch(&mut state, "tab.new");
+
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open_at:5:{}", path.display())
+        ));
+        assert_eq!(state.editors.len(), 1);
+        assert_eq!(state.active_pane.0, pane_id);
+        assert_eq!(state.editors[&pane_id].buffer.cursor().line, 4);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_open_at_without_a_line_number_toasts() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "editor.open_at:nope:C:/x.txt"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn editor_goto_clamps_past_the_end_of_the_file() {
+        let mut state = test_state();
+        let path = editor_temp_file("goto", b"one\ntwo\nthree");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        assert!(dispatch(&mut state, "editor.goto:9999"));
+        let editor = &state.editors[&state.active_pane.0];
+        assert_eq!(editor.buffer.cursor().line, editor.max_top_line());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The chords are editor-local: on a terminal pane they must stay
+    /// unclaimed so the key reaches the shell.
+    #[test]
+    fn editor_navigation_commands_are_unclaimed_on_a_terminal_pane() {
+        let mut state = test_state();
+        for command in [
+            "editor.goto",
+            "editor.goto:3",
+            "editor.find",
+            "editor.find_next",
+            "editor.find_close",
+            "diff.next_hunk",
+            "diff.open_file",
+        ] {
+            assert!(
+                !dispatch(&mut state, command),
+                "{command} must fall through on a terminal pane"
+            );
+        }
+    }
+
+    /// Ctrl+F on an open bar re-seeds the query from the selection; it is
+    /// not a new find session, and must not be recorded as one or
+    /// `editor.find_open` stops pairing with `editor.find_closed`.
+    #[test]
+    fn reopening_the_find_bar_keeps_it_open_and_keeps_the_query() {
+        let mut state = test_state();
+        let path = editor_temp_file("find_reopen", b"alpha\nbeta\nalpha\n");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.find"));
+        assert!(dispatch(&mut state, "editor.find_query:alpha"));
+        assert!(
+            dispatch(&mut state, "editor.find"),
+            "a second open still claims the key"
+        );
+        let find = state.editors[&pane_id]
+            .find
+            .as_ref()
+            .expect("the bar stays open");
+        assert_eq!(find.query, "alpha", "the query survives the re-open");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The range chip hands off without naming a node at all, which is a
+    /// different signal from a node that carries no source location.
+    #[test]
+    fn handoff_aim_separates_a_range_request_from_a_node_without_a_location() {
+        assert_eq!(handoff_aim(None, false), "range");
+        assert_eq!(handoff_aim(None, true), "range");
+        assert_eq!(handoff_aim(Some("node-1"), true), "located");
+        assert_eq!(handoff_aim(Some("node-1"), false), "no_location");
+    }
+
+    #[test]
+    fn goto_dialog_reopens_with_an_error_for_a_bad_number() {
+        let mut state = test_state();
+        let path = editor_temp_file("goto_dialog", b"one\ntwo\nthree");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.goto"));
+        let Some(ConfirmDialog::GotoLine {
+            pane_id: dialog_pane,
+            ..
+        }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("go-to-line dialog expected, got {:?}", state.confirm_dialog);
+        };
+        assert_eq!(*dialog_pane, pane_id, "the dialog pins its pane");
+
+        if let Some(ConfirmDialog::GotoLine { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "abc".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.goto_commit"));
+        let Some(ConfirmDialog::GotoLine { buffer, error, .. }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("dialog should reopen with the typed text");
+        };
+        assert_eq!(buffer, "abc");
+        assert!(error.is_some(), "the reason is shown inline");
+
+        if let Some(ConfirmDialog::GotoLine { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "2".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.goto_commit"));
+        assert!(state.confirm_dialog.is_none());
+        assert_eq!(state.editors[&pane_id].buffer.cursor().line, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `dialog.confirm` must never resolve a dialog that carries typed
+    /// text: the commit handler has to read the buffer before the dialog
+    /// is cleared, and the `unreachable!` in that arm would fire.
+    #[test]
+    fn generic_confirm_ignores_the_text_prompt_dialogs() {
+        let mut state = test_state();
+        state.confirm_dialog = Some(ConfirmDialog::GotoLine {
+            pane_id: 1,
+            buffer: "3".to_string(),
+            error: None,
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some());
+
+        state.confirm_dialog = Some(ConfirmDialog::DiffRequest {
+            buffer: "HEAD".to_string(),
+            error: None,
+        });
+        assert!(!dispatch(&mut state, "dialog.confirm"));
+        assert!(state.confirm_dialog.is_some());
+    }
+
+    // -- diff review pane ---------------------------------------------------
+
+    /// A diff pane in tests: no `EDITOR_OPEN_HOOKS` are registered, so
+    /// `open_diff_pane` creates the tab and leaves it in its Loading
+    /// state instead of spawning git. That is the shape every state-level
+    /// assertion below needs; the git path is covered in `diff::job`.
+    fn open_loading_diff(state: &mut AppState, range: &str) -> u32 {
+        mutate_add_workspace_with_path(state, Some(std::env::temp_dir()));
+        assert!(dispatch(state, &format!("diff.open:{range}")));
+        state.active_pane.0
+    }
+
+    #[test]
+    fn diff_open_creates_a_read_only_pane_titled_after_the_range() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "main..feature");
+        let editor = &state.editors[&pane_id];
+        assert!(editor.is_diff());
+        assert!(editor.read_only);
+        assert_eq!(editor.display_name, "diff: main..feature");
+        assert_eq!(state.panes[0][0].subtitle, "diff");
+        assert!(state.toasts.is_empty());
+    }
+
+    /// The one that matters: a range must never become a git flag.
+    #[test]
+    fn diff_open_rejects_a_range_that_would_become_a_git_flag() {
+        let mut state = test_state();
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        assert!(dispatch(&mut state, "diff.open:--output=/tmp/pwned"));
+        assert!(state.editors.is_empty(), "no pane for a rejected range");
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn diff_dialog_keeps_the_typed_range_when_it_does_not_parse() {
+        let mut state = test_state();
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        assert!(dispatch(&mut state, "diff.open"));
+        let Some(ConfirmDialog::DiffRequest { buffer, .. }) = state.confirm_dialog.as_ref() else {
+            panic!("diff dialog expected");
+        };
+        assert_eq!(buffer, "HEAD", "prefilled with the uncommitted-work range");
+
+        if let Some(ConfirmDialog::DiffRequest { buffer, .. }) = state.confirm_dialog.as_mut() {
+            *buffer = "--output=x".to_string();
+        }
+        assert!(dispatch(&mut state, "dialog.diff_commit"));
+        let Some(ConfirmDialog::DiffRequest { buffer, error }) = state.confirm_dialog.as_ref()
+        else {
+            panic!("the dialog should reopen with the reason inline");
+        };
+        assert_eq!(buffer, "--output=x");
+        assert!(error.is_some());
+        assert!(state.editors.is_empty());
+    }
+
+    /// A diff pane is read-only end to end: the clipboard path, the key
+    /// handler's own arms, and `editor.save` all refuse it.
+    #[test]
+    fn a_diff_pane_refuses_edits_and_saves() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "HEAD");
+        let before = state.editors[&pane_id].buffer.to_text();
+
+        assert!(!dispatch_editor_paste(&mut state, pane_id));
+        assert!(!state
+            .editors
+            .get_mut(&pane_id)
+            .expect("diff pane")
+            .apply_edit(|b| b.insert_typed("x")));
+        assert!(dispatch(&mut state, "editor.save"), "the key is claimed");
+
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), before);
+        assert!(!state.editors[&pane_id].dirty);
+    }
+
+    /// A loaded diff pane, so navigation has somewhere to go.
+    fn open_ready_diff(state: &mut AppState) -> u32 {
+        let pane_id = open_loading_diff(state, "HEAD");
+        let text = [
+            "diff --git a/one.rs b/one.rs",
+            "--- a/one.rs",
+            "+++ b/one.rs",
+            "@@ -1,1 +1,1 @@",
+            "-a",
+            "+b",
+            "@@ -9,1 +9,1 @@",
+            "-c",
+            "+d",
+            "diff --git a/two.rs b/two.rs",
+            "--- a/two.rs",
+            "+++ b/two.rs",
+            "@@ -1,1 +1,1 @@",
+            "-e",
+            "+f",
+            "",
+        ]
+        .join("\n");
+        let document = crate::diff::parse_unified_diff(&text);
+        state
+            .editors
+            .get_mut(&pane_id)
+            .expect("diff pane")
+            .set_diff_document(&document);
+        pane_id
+    }
+
+    /// `n`/`p`/`]`/`[` are bare keys that auto-repeat, so they must not
+    /// each write a line to the sink. The counts ride on the pane and are
+    /// reported once, on `diff.closed`.
+    #[test]
+    fn walking_a_diff_counts_steps_on_the_pane() {
+        let mut state = test_state();
+        let pane_id = open_ready_diff(&mut state);
+        assert_eq!(state.editors[&pane_id].diff().expect("view").hunk_steps, 0);
+
+        assert!(dispatch(&mut state, "diff.next_hunk"));
+        assert!(dispatch(&mut state, "diff.next_hunk"));
+        assert!(dispatch(&mut state, "diff.next_file"));
+
+        let view = state.editors[&pane_id].diff().expect("view");
+        assert_eq!(view.hunk_steps, 2);
+        assert_eq!(view.file_steps, 1);
+
+        // A step that cannot move must not be counted. The fixture has
+        // two files and the cursor is already on the second, so this is
+        // claimed (the key must never reach a shell) but goes nowhere.
+        assert!(dispatch(&mut state, "diff.next_file"));
+        assert_eq!(
+            state.editors[&pane_id].diff().expect("view").file_steps,
+            1,
+            "a step that could not move must not be counted"
+        );
+    }
+
+    /// Removing a workspace used to tear down only the PTY half of its
+    /// panes, leaving an editor in `state.editors` that no tab could
+    /// reach — and that a diff job finishing later would still fill.
+    #[test]
+    fn removing_a_workspace_closes_the_editor_panes_inside_it() {
+        let mut state = test_state();
+        // Two: the last workspace is never removable.
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        mutate_add_workspace_with_path(&mut state, Some(std::env::temp_dir()));
+        let doomed = state.active_workspace;
+        assert_eq!(state.workspaces.len(), 2);
+        let path = editor_temp_file("ws_remove", b"alpha\nbeta");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        assert!(state.editors.contains_key(&pane_id));
+
+        mutate_remove_workspace(&mut state, doomed);
+
+        assert!(
+            !state.editors.contains_key(&pane_id),
+            "the pane outlived every tab that could reach it"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A palette row has no fall-through: the chord stays unclaimed so
+    /// Ctrl+F reaches the shell, but a click that does nothing and leaves
+    /// the palette open reads as a click that did not register.
+    #[test]
+    fn a_palette_pick_that_cannot_run_closes_the_palette_and_says_so() {
+        let mut state = test_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        assert!(state.palette_open);
+
+        // The active pane is a terminal, so `editor.find` is unclaimed.
+        assert!(dispatch(&mut state, "palette.execute:editor_find"));
+
+        assert!(!state.palette_open, "the palette must not stay open");
+        let message = state
+            .toasts
+            .iter()
+            .next()
+            .map(|toast| toast.message.clone())
+            .expect("a toast says why nothing happened");
+        assert!(message.contains("Find in file"), "{message:?}");
+    }
+
+    #[test]
+    fn indent_outdent_and_comment_are_unclaimed_off_a_writable_editor() {
+        let mut state = test_state();
+        for command in ["editor.indent", "editor.outdent", "editor.toggle_comment"] {
+            assert!(
+                !dispatch(&mut state, command),
+                "{command} must fall through on a terminal pane"
+            );
+        }
+
+        // A diff pane is read-only: the commands must not claim the key
+        // only to refuse the edit.
+        let _ = open_loading_diff(&mut state, "HEAD");
+        for command in ["editor.indent", "editor.outdent", "editor.toggle_comment"] {
+            assert!(!dispatch(&mut state, command), "{command} on a diff pane");
+        }
+    }
+
+    #[test]
+    fn the_editing_polish_commands_reach_the_buffer() {
+        let mut state = test_state();
+        let path = editor_temp_file("polish", b"fn main() {}\n");
+        // Opened as `.txt`, so re-point the pane at a language with a
+        // line comment by opening a real `.rs` file instead.
+        let rs = path.with_extension("rs");
+        std::fs::write(&rs, "fn main() {}\n").expect("write");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", rs.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(dispatch(&mut state, "editor.indent"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    fn main() {}\n"
+        );
+
+        assert!(dispatch(&mut state, "editor.toggle_comment"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    // fn main() {}\n"
+        );
+        assert!(dispatch(&mut state, "editor.toggle_comment"));
+        assert_eq!(
+            state.editors[&pane_id].buffer.to_text(),
+            "    fn main() {}\n"
+        );
+
+        assert!(dispatch(&mut state, "editor.outdent"));
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), "fn main() {}\n");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(rs);
+    }
+
+    /// JSON, CSS and Markdown have no line comment, so the chord is a
+    /// no-op — the one case here worth a telemetry line, because from the
+    /// user's side it is indistinguishable from a dead keybind.
+    #[test]
+    fn comment_toggle_is_claimed_but_inert_where_the_language_has_no_prefix() {
+        let mut state = test_state();
+        let path = editor_temp_file("nocomment", b"{}\n");
+        let json = path.with_extension("json");
+        std::fs::write(&json, "{}\n").expect("write");
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", json.display())
+        ));
+        let pane_id = state.active_pane.0;
+
+        assert!(
+            dispatch(&mut state, "editor.toggle_comment"),
+            "claimed, so the key does not reach anything else"
+        );
+        assert_eq!(state.editors[&pane_id].buffer.to_text(), "{}\n");
+        assert!(!state.editors[&pane_id].dirty);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(json);
+    }
+
+    #[test]
+    fn diff_navigation_claims_its_keys_on_a_diff_pane() {
+        let mut state = test_state();
+        let pane_id = open_loading_diff(&mut state, "HEAD");
+        // The placeholder document has no hunks, so nothing moves — but
+        // the commands must still be claimed so `n`/`p` never reach a
+        // shell that is not there.
+        for command in [
+            "diff.next_hunk",
+            "diff.prev_hunk",
+            "diff.next_file",
+            "diff.prev_file",
+        ] {
+            assert!(dispatch(&mut state, command), "{command}");
+        }
+        assert!(dispatch(&mut state, "diff.open_file"));
+        assert_eq!(
+            state.toasts.len(),
+            1,
+            "a placeholder row has no file to open"
+        );
+        assert!(state.editors[&pane_id].is_diff());
+    }
+
     #[test]
     fn dispatch_editor_save_round_trips_edits_to_disk() {
         let mut state = test_state();
@@ -10811,13 +13316,10 @@ pub(crate) mod tests {
         // dialog that would clobber the filename+dirty title.
         assert!(!dispatch(&mut state, "session.rename_active"));
         assert!(state.confirm_dialog.is_none());
-        // Paste writes to a PTY the editor pane does not have; the write
-        // fails internally without panicking or corrupting the buffer.
-        // The dispatch reads the real OS clipboard, so hold the guard.
-        let before = state.editors[&state.active_pane.0].buffer.to_text();
-        let _lock = clipboard_access_guard();
-        dispatch(&mut state, "terminal.paste");
-        assert_eq!(state.editors[&state.active_pane.0].buffer.to_text(), before);
+        // `terminal.paste` is deliberately NOT in this list: Ctrl+V is a
+        // registered system binding, so it is the only way a paste can
+        // reach an editor pane. It routes into the buffer instead — see
+        // `terminal_paste_in_an_editor_pane_inserts_into_the_buffer`.
         let _ = std::fs::remove_file(path);
     }
 
@@ -11018,6 +13520,99 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Open `contents` in an editor tab and return its pane id and path.
+    fn open_editor(state: &mut AppState, tag: &str, contents: &[u8]) -> (u32, std::path::PathBuf) {
+        let path = editor_temp_file(tag, contents);
+        assert!(dispatch(state, &format!("editor.open:{}", path.display())));
+        (state.active_pane.0, path)
+    }
+
+    /// REGRESSION: Ctrl+V / Ctrl+Shift+V / Shift+Insert are registered
+    /// system bindings, so the framework's shortcut resolver claims them
+    /// during keyboard capture and the editor's own key arm never runs.
+    /// `terminal.paste` used to fail its PTY check and toast "paste
+    /// failed: no terminal in focus", making paste impossible in an
+    /// editor pane. It must reach the buffer instead.
+    #[test]
+    fn terminal_paste_in_an_editor_pane_inserts_into_the_buffer() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "paste", b"alpha\n");
+        let _ = state.clipboard.write_text("beta");
+        let toasts_before = state.toasts.len();
+
+        assert!(dispatch(&mut state, "terminal.paste"));
+
+        let editor = &state.editors[&pane_id];
+        assert!(
+            editor.buffer.to_text().contains("beta"),
+            "clipboard text must land in the buffer, got {:?}",
+            editor.buffer.to_text()
+        );
+        assert!(editor.dirty, "a paste marks the buffer dirty");
+        assert_eq!(
+            state.toasts.len(),
+            toasts_before,
+            "paste into an editor must not toast a terminal focus error"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Terminal paste promotes newlines to CR for the shell; an editor
+    /// paste must not, or a multi-line clipboard payload would collapse
+    /// into one line.
+    #[test]
+    fn terminal_paste_in_an_editor_pane_keeps_multiple_lines() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "pastecrlf", b"");
+        let _ = state.clipboard.write_text("one\r\ntwo\nthree");
+
+        assert!(dispatch(&mut state, "terminal.paste"));
+
+        let editor = &state.editors[&pane_id];
+        assert_eq!(editor.buffer.line_count(), 3, "CRLF and LF both split");
+        assert_eq!(editor.buffer.line(0), Some("one"));
+        assert_eq!(editor.buffer.line(2), Some("three"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Ctrl+Shift+C is a registered system binding too, so `terminal.copy`
+    /// has to serve editor panes.
+    #[test]
+    fn terminal_copy_in_an_editor_pane_copies_the_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (pane_id, path) = open_editor(&mut state, "copy", b"gamma\n");
+        let _ = state.clipboard.write_text("stale");
+        state.editors.get_mut(&pane_id).expect("editor").apply(|b| {
+            b.select_all();
+            crate::editor::Damage::None
+        });
+
+        assert!(dispatch(&mut state, "terminal.copy"));
+
+        let copied = state.clipboard.read_text().unwrap_or_default();
+        assert!(
+            copied.contains("gamma"),
+            "selection must reach the clipboard, got {copied:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With nothing selected the chord stays unclaimed, matching the
+    /// terminal path, so it can fall through to other handlers.
+    #[test]
+    fn terminal_copy_in_an_editor_pane_without_selection_is_unclaimed() {
+        let _lock = clipboard_access_guard();
+        let mut state = test_state();
+        let (_pane_id, path) = open_editor(&mut state, "copynone", b"delta\n");
+
+        assert!(!dispatch(&mut state, "terminal.copy"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn generic_dialog_confirm_does_not_consume_close_editor() {
         let mut state = test_state();
@@ -11085,6 +13680,96 @@ pub(crate) mod tests {
         state.active_tab = 1;
         assert!(dispatch(&mut state, "tab.close.active"));
         assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn tab_groups_drop_maps_visible_slots_to_workspace_order() {
+        let bar = crate::drag::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 40.0,
+        };
+        let visible = [1, 3];
+        assert_eq!(grouped_tab_drop_index(0.0, 20.0, bar, &visible), Some(1));
+        assert_eq!(grouped_tab_drop_index(200.0, 20.0, bar, &visible), Some(3));
+        assert_eq!(grouped_tab_drop_index(900.0, 20.0, bar, &visible), Some(4));
+        assert_eq!(grouped_tab_drop_index(200.0, 80.0, bar, &visible), None);
+    }
+
+    #[test]
+    fn tab_groups_update_when_agent_returns_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        classify_pane_title(&mut state, id, "Claude Code");
+        assert_eq!(visible_tab_indices(&state), vec![1]);
+        classify_pane_title(&mut state, id, "PowerShell");
+        assert_eq!(visible_tab_indices(&state), vec![0, 1]);
+    }
+
+    #[test]
+    fn tab_groups_single_agent_does_not_cycle_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        state.pane_agents.insert(
+            id,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(!dispatch(&mut state, "tab.next"));
+        assert!(!dispatch(&mut state, "tab.prev"));
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn tab_groups_keep_agent_focus_when_entering_mixed_split() {
+        let mut state = test_state();
+        mutate_split_right(&mut state, PaneId(1));
+        let agent = state.panes[0][1].id;
+        state.pane_agents.insert(
+            agent.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        state.active_pane = PaneId(1);
+        mutate_add_tab(&mut state);
+        let other = state.active_pane;
+        state.pane_agents.insert(
+            other.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_pane, agent);
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_pane, other);
+    }
+
+    #[test]
+    fn tab_groups_cycle_only_matching_panes() {
+        let mut state = test_state();
+        for _ in 0..3 {
+            mutate_add_tab(&mut state);
+        }
+        for index in [1, 3] {
+            let id = state.tabs[index].active_pane.0;
+            state.pane_agents.insert(
+                id,
+                crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+            );
+        }
+        mutate_switch_tab(&mut state, 0);
+        for (command, expected) in [
+            ("tab.next", 2),
+            ("tab.next", 0),
+            ("tab.prev", 2),
+            ("tab.switch:1", 1),
+            ("tab.prev", 3),
+            ("tab.next", 1),
+        ] {
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.active_tab, expected);
+        }
     }
 
     #[test]
@@ -11181,6 +13866,138 @@ pub(crate) mod tests {
             state.sidebar_width, MAX_SIDEBAR_WIDTH,
             "rejected input leaves width alone"
         );
+    }
+
+    #[test]
+    fn explorer_automatic_refresh_tracks_create_rename_delete_and_pauses_when_hidden() {
+        let root = std::env::temp_dir().join(format!("tm-explorer-poll-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let file = root.join("folder").join("before.txt");
+        std::fs::write(&file, "before").unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(seed_state()));
+        {
+            let mut state = shared.lock_recover();
+            state.workspaces[0].path = Some(root.clone());
+            dispatch(&mut state, "explorer.show");
+            let generation = state.explorer.generation;
+            state.explorer.accept(
+                generation,
+                root.clone(),
+                crate::explorer::read_directory(&root),
+            );
+            state.explorer.expanded.insert(root.join("folder"));
+            state.explorer.accept(
+                generation,
+                root.join("folder"),
+                crate::explorer::read_directory(&root.join("folder")),
+            );
+            state.explorer.selected = Some(file.clone());
+            dispatch_editor_open_path(&mut state, &file.to_string_lossy());
+        }
+        assert!(
+            !refresh_explorer_once(&shared),
+            "quiet folders must not rebuild"
+        );
+        std::fs::write(root.join("new.txt"), "new").unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(shared.lock_recover().explorer.selected, Some(file.clone()));
+        assert!(shared
+            .lock_recover()
+            .explorer
+            .expanded
+            .contains(&root.join("folder")));
+        std::fs::write(&file, "changed externally").unwrap();
+        assert!(
+            !refresh_explorer_once(&shared),
+            "content-only changes do not change the tree"
+        );
+        assert_eq!(
+            shared
+                .lock_recover()
+                .editors
+                .values()
+                .next()
+                .unwrap()
+                .buffer
+                .line(0),
+            Some("before")
+        );
+        std::fs::rename(&file, root.join("folder").join("after.txt")).unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(
+            shared.lock_recover().explorer.selected,
+            Some(root.join("folder"))
+        );
+        assert_eq!(
+            shared.lock_recover().editors.len(),
+            1,
+            "tree refresh must keep editor buffers open"
+        );
+        shared.lock_recover().sidebar_collapsed = true;
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(!refresh_explorer_once(&shared));
+        shared.lock_recover().sidebar_collapsed = false;
+        assert!(
+            refresh_explorer_once(&shared),
+            "reopening catches up with hidden changes"
+        );
+        assert!(!refresh_explorer_once(&shared));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn explorer_copy_uses_context_path_instead_of_current_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = seed_state();
+        let root = std::env::temp_dir().join("copy-project");
+        let path = root.join("folder name").join("example.rs");
+        state.explorer.selected = Some(root.join("different.rs"));
+        for (command, expected) in [
+            (
+                "explorer.copy_relative",
+                "folder name/example.rs".to_string(),
+            ),
+            (
+                "explorer.copy_absolute",
+                path.to_string_lossy().into_owned(),
+            ),
+        ] {
+            state.ctx_menu = Some(CtxMenu {
+                x: 0.0,
+                y: 0.0,
+                target: CtxMenuTarget::Explorer {
+                    path: path.clone(),
+                    root: root.clone(),
+                },
+            });
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.clipboard.read_text().unwrap(), expected);
+            assert!(state.ctx_menu.is_none());
+        }
+        assert!(
+            !dispatch(&mut state, "explorer.copy_relative"),
+            "no menu target means no copy"
+        );
+    }
+
+    #[test]
+    fn explorer_toggle_preserves_workspace_access_and_browses_active_root() {
+        let mut state = seed_state();
+        state.workspaces[0].path = Some(PathBuf::from("project"));
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.explorer.active);
+        assert!(!state.sidebar_collapsed);
+        assert_eq!(
+            state.explorer.root.as_deref(),
+            Some(std::path::Path::new("project"))
+        );
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(!state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "sidebar.workspaces"));
+        assert!(!state.explorer.active);
+        assert!(!state.sidebar_collapsed);
     }
 
     #[test]
@@ -16085,6 +18902,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_way_into_files_mode_asks_for_an_index() {
+        // `palette.files`, the `/ files` pill (`palette.query:/`) and
+        // simply typing `/` all reach Files mode; only the first used to
+        // build an index, so the other two showed "Indexing…" forever.
+        for query in ["/", "/main", "/src/state.rs", "  /x"] {
+            assert!(query_wants_file_index(query), "{query:?} is Files mode");
+        }
+        for query in ["", "diff", ">save", "@tab", "#agent"] {
+            assert!(!query_wants_file_index(query), "{query:?} is not");
+        }
+    }
+
+    #[test]
+    fn switching_workspaces_drops_the_previous_file_index() {
+        let mut state = seed_state();
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-a")));
+        let a = state.active_workspace;
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-b")));
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-b"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        mutate_switch_workspace(&mut state, a);
+        assert!(
+            state.file_index.is_none(),
+            "quick open would have listed the other workspace's files"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_hides_an_index_built_for_another_root() {
+        let mut state = seed_state();
+        mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/ws-a")));
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-elsewhere"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        assert!(
+            state.ui_snapshot().file_index.is_none(),
+            "an index for another root must not reach the palette"
+        );
+        state.file_index = Some(std::sync::Arc::new(crate::file_index::FileIndex {
+            root: PathBuf::from("/tmp/ws-a"),
+            entries: Vec::new(),
+            source: crate::file_index::IndexSource::Git,
+            truncated: false,
+            built_at: std::time::Instant::now(),
+        }));
+        assert!(
+            state.ui_snapshot().file_index.is_some(),
+            "the real one does"
+        );
+    }
+
+    #[test]
     fn active_workspace_cwd_returns_path_when_set() {
         let mut state = seed_state();
         let path = PathBuf::from("/tmp/ws");
@@ -17870,6 +20748,77 @@ mod flow_pane_tests {
         state.active_pane.0
     }
 
+    fn open_review_fixture(state: &mut AppState) -> u32 {
+        use crate::flow_explorer::test_support::review_fixture_path;
+        assert!(dispatch(
+            state,
+            &format!("flow.open:{}", review_fixture_path().display())
+        ));
+        state.active_pane.0
+    }
+
+    // -- hand-offs to the editor and the diff pane --------------------------
+
+    #[test]
+    fn flow_edit_opens_the_node_file_at_its_line() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+
+        assert!(dispatch(&mut state, "flow.edit:Editor.tsx::handleKeyDown"));
+        let pane_id = state.active_pane.0;
+        let editor = state.editors.get(&pane_id).expect("editor pane opened");
+        assert!(editor.path.ends_with("Editor.tsx"), "{:?}", editor.path);
+        // The fixture node points at line 93 of a 101-line file, so the
+        // clamp never fires and 92 is the only correct answer. `<= 92`
+        // was also satisfied by a cursor left at line 0, i.e. by the jump
+        // not happening at all.
+        assert_eq!(editor.buffer.cursor().line, 92);
+        assert!(state.toasts.is_empty());
+    }
+
+    /// Node ids carry `::` and `.`, so the id is the last segment of the
+    /// command and must not be split on either.
+    #[test]
+    fn flow_edit_on_a_node_without_a_location_toasts() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.edit:ui.cmd-enter"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    #[test]
+    fn flow_diff_opens_the_flows_range_as_a_diff_pane() {
+        let mut state = test_state();
+        open_review_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.diff"));
+        let editor = state
+            .editors
+            .get(&state.active_pane.0)
+            .expect("diff pane opened");
+        assert!(editor.is_diff());
+        // The producer's head is a branch, so the range stays two-sided.
+        assert_eq!(editor.display_name, "diff: main..feat/prompt-restore");
+    }
+
+    #[test]
+    fn flow_diff_without_a_range_toasts_instead_of_opening_a_pane() {
+        let mut state = test_state();
+        open_fixture(&mut state);
+        assert!(dispatch(&mut state, "flow.diff"));
+        assert!(state.editors.is_empty());
+        assert_eq!(state.toasts.len(), 1);
+    }
+
+    /// On a terminal pane these are not flow commands at all: leaving
+    /// them unclaimed keeps the key reaching the shell.
+    #[test]
+    fn flow_handoffs_are_unclaimed_without_a_flow_pane() {
+        let mut state = test_state();
+        assert!(!dispatch(&mut state, "flow.diff"));
+        assert!(!dispatch(&mut state, "flow.edit:whatever"));
+    }
+
     #[test]
     fn dispatch_flow_open_creates_flow_tab() {
         let mut state = test_state();
@@ -18760,5 +21709,170 @@ mod agents_tab_tests {
         restore_layout(&mut state, &persisted);
         assert_eq!(state.pane_agents[&1].profile, "aider");
         assert!(state.custom_titled_panes.contains(&1));
+    }
+}
+
+#[cfg(test)]
+mod drag_autoscroll_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A state whose pane `pane` holds a 3x5 terminal with `lines` lines of
+    /// output, i.e. `lines - 3` lines of scrollback above the live grid.
+    fn state_with_scrollback(pane: u32, lines: usize) -> AppState {
+        let mut st = seed_state();
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        for i in 0..lines {
+            term.process_bytes(format!("L{i}\r\n").as_bytes());
+        }
+        st.terminals.insert(pane, Arc::new(Mutex::new(term)));
+        st
+    }
+
+    fn offset(st: &AppState, pane: u32) -> usize {
+        st.terminals[&pane].lock().unwrap().scroll_offset()
+    }
+
+    #[test]
+    fn overshoot_rows_maps_pixels_past_the_grid_to_signed_rows() {
+        assert_eq!(terminal_drag_overshoot_rows(10.0, 20.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(59.9, 20.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(60.0, 20.0, 3), 1);
+        assert_eq!(terminal_drag_overshoot_rows(85.0, 20.0, 3), 2);
+        assert_eq!(terminal_drag_overshoot_rows(-0.5, 20.0, 3), -1);
+        assert_eq!(terminal_drag_overshoot_rows(-20.5, 20.0, 3), -2);
+        // Degenerate metrics never count as overshoot.
+        assert_eq!(terminal_drag_overshoot_rows(-5.0, 0.0, 3), 0);
+        assert_eq!(terminal_drag_overshoot_rows(-5.0, 20.0, 0), 0);
+        assert_eq!(terminal_drag_overshoot_rows(f32::NAN, 20.0, 3), 0);
+    }
+
+    #[test]
+    fn first_overshoot_scrolls_one_line_at_once_then_meters_by_wall_clock() {
+        let mut st = state_with_scrollback(1, 40);
+        set_terminal_selection(&mut st, 1, TermSelection::new((39, 0), SelectMode::Cell));
+        st.terminal_selection_repaint.clear();
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 1);
+        assert_eq!(offset(&st, 1), 1);
+        // Same instant: nothing owed yet.
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 0);
+        // One row of overshoot is 12 lines/s: half a second owes 6 lines.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -1, t0 + Duration::from_millis(500)),
+            6
+        );
+        assert_eq!(offset(&st, 1), 7);
+        assert!(
+            st.terminal_selection_repaint.contains(&1),
+            "scrolling under a selection must repaint its highlight"
+        );
+        assert_eq!(st.terminal_drag_autoscroll.map(|auto| auto.lines), Some(7));
+    }
+
+    #[test]
+    fn rate_grows_with_overshoot_and_is_capped() {
+        let mut st = state_with_scrollback(1, 500);
+        let t0 = Instant::now();
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -4, t0), 1);
+        // Four rows past the edge is 48 lines/s: a quarter second owes 12.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -4, t0 + Duration::from_millis(250)),
+            12
+        );
+        // A hundred rows would be 1200 lines/s; capped at 120, half a
+        // second owes 60.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -100, t0 + Duration::from_millis(750)),
+            60
+        );
+        assert_eq!(offset(&st, 1), 73);
+    }
+
+    #[test]
+    fn below_the_bottom_scrolls_toward_live_and_stops_at_the_bottom() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1].lock().unwrap().scroll_view_up(5);
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, 1, t0), -1);
+        assert_eq!(offset(&st, 1), 4);
+        // A second at 12 lines/s owes 12, but only 4 remain above the live
+        // bottom.
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, 1, t0 + Duration::from_secs(1)),
+            -4
+        );
+        assert_eq!(offset(&st, 1), 0);
+        assert_eq!(st.terminal_drag_autoscroll.map(|auto| auto.lines), Some(-5));
+    }
+
+    #[test]
+    fn refused_while_the_program_owns_the_mouse_and_recorded_once() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1]
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1000h");
+        let t0 = Instant::now();
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 0);
+        assert_eq!(
+            terminal_drag_autoscroll(&mut st, 1, -1, t0 + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(offset(&st, 1), 0);
+        assert_eq!(
+            st.terminal_drag_autoscroll.map(|auto| auto.blocked),
+            Some(Some("mouse_reporting"))
+        );
+        assert!(!st.terminal_selection_repaint.contains(&1));
+    }
+
+    #[test]
+    fn refused_in_the_alternate_screen() {
+        let mut st = state_with_scrollback(1, 40);
+        st.terminals[&1]
+            .lock()
+            .unwrap()
+            .process_bytes(b"\x1b[?1049h");
+
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, Instant::now()), 0);
+        assert_eq!(
+            st.terminal_drag_autoscroll.map(|auto| auto.blocked),
+            Some(Some("alt_screen"))
+        );
+    }
+
+    #[test]
+    fn ending_clears_bookkeeping_and_finishing_the_drag_ends_it() {
+        let mut st = state_with_scrollback(1, 40);
+        let t0 = Instant::now();
+
+        terminal_drag_autoscroll(&mut st, 1, -1, t0);
+        end_terminal_drag_autoscroll(&mut st, 1, "reentered", t0);
+        assert!(st.terminal_drag_autoscroll.is_none());
+
+        // A fresh overshoot after re-entry responds immediately again.
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, -1, t0), 1);
+        finish_terminal_drag(&mut st, 1);
+        assert!(st.terminal_drag_autoscroll.is_none());
+
+        // Another pane's bookkeeping is left alone.
+        terminal_drag_autoscroll(&mut st, 1, -1, t0);
+        end_terminal_drag_autoscroll(&mut st, 2, "released", t0);
+        assert!(st.terminal_drag_autoscroll.is_some());
+    }
+
+    #[test]
+    fn missing_pane_or_zero_overshoot_is_a_no_op() {
+        let mut st = state_with_scrollback(1, 40);
+        let t0 = Instant::now();
+        assert_eq!(terminal_drag_autoscroll(&mut st, 1, 0, t0), 0);
+        assert_eq!(terminal_drag_autoscroll(&mut st, 99, -1, t0), 0);
+        assert!(st.terminal_drag_autoscroll.is_none());
+        assert_eq!(offset(&st, 1), 0);
     }
 }

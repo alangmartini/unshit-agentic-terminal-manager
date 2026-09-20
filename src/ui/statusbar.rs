@@ -1,8 +1,8 @@
 use unshit::core::element::*;
 
-use crate::state::{Pane, TabStatus, UiSnapshot};
+use crate::state::{dispatch, mutate_with, Pane, SharedState, TabStatus, UiSnapshot};
 
-pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
+pub fn build_statusbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     if state.settings_open {
         return build_settings_statusbar(state);
     }
@@ -16,7 +16,7 @@ pub fn build_statusbar(state: &UiSnapshot) -> ElementDef {
         // groups flush, so the left group's last item ("k/s") collides with
         // the right group's first ("tab ...") -> the unreadable "k/stab".
         .with_child(ElementDef::new(Tag::Span).with_class("sb-spacer"))
-        .with_child(build_statusbar_right(state))
+        .with_child(build_statusbar_right(state, shared))
 }
 
 fn build_settings_statusbar(state: &UiSnapshot) -> ElementDef {
@@ -220,13 +220,19 @@ pub(crate) fn shell_label(program: &str) -> String {
     }
 }
 
-fn build_statusbar_right(state: &UiSnapshot) -> ElementDef {
+fn build_statusbar_right(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let shared = shared.clone();
     ElementDef::new(Tag::Div)
         .with_class("statusbar-right")
         .with_child(
-            ElementDef::new(Tag::Span)
+            ElementDef::new(Tag::Button)
                 .with_class("status-item")
                 .with_id("status-tab-usage")
+                .on_click(move || {
+                    mutate_with(&shared, |state| {
+                        dispatch(state, "processes.open");
+                    });
+                })
                 .with_child(ElementDef::new(Tag::Span).with_text("tab "))
                 .with_child(
                     ElementDef::new(Tag::Span)
@@ -273,12 +279,28 @@ mod tests {
     use crate::state::{seed_state, Pane, PaneId, SettingsSection, TerminalTab};
     use std::collections::BTreeMap;
 
+    fn shared_state() -> SharedState {
+        std::sync::Arc::new(std::sync::Mutex::new(seed_state()))
+    }
+
+    #[test]
+    fn clicking_tab_usage_opens_process_details() {
+        let shared = shared_state();
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let right = build_statusbar_right(&snap, &shared);
+        let button = &right.children[0];
+        assert_eq!(button.tag, Tag::Button);
+        button.on_click.as_ref().expect("click handler")();
+        assert!(shared.lock().unwrap().process_details_open);
+    }
+
     fn snapshot_from_seed() -> UiSnapshot {
         seed_state().ui_snapshot()
     }
 
     fn minimal_snapshot() -> UiSnapshot {
         UiSnapshot {
+            diff_review: None,
             workspaces: vec![],
             active_workspace: 0,
             tabs: vec![],
@@ -294,6 +316,7 @@ mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().into(),
             custom_theme: crate::theme::default_custom_theme(),
             config_font_size_pt: crate::state::DEFAULT_CONFIG_FONT_SIZE_PT,
@@ -307,8 +330,10 @@ mod tests {
             tab_width_px: crate::state::DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            process_details_open: false,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -348,6 +373,9 @@ mod tests {
             pending_agent_resumes: BTreeMap::new(),
             editor_panes: std::collections::HashSet::new(),
             flow_panes: std::collections::HashMap::new(),
+            file_index: None,
+            file_index_building: false,
+            editor_find_bars: std::collections::HashMap::new(),
         }
     }
 
@@ -365,20 +393,20 @@ mod tests {
     #[test]
     fn build_statusbar_does_not_panic() {
         let snap = snapshot_from_seed();
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
     fn build_statusbar_returns_div() {
         let snap = snapshot_from_seed();
-        let elem = build_statusbar(&snap);
+        let elem = build_statusbar(&snap, &shared_state());
         assert!(matches!(elem.tag, Tag::Div));
     }
 
     #[test]
     fn build_statusbar_has_left_spacer_and_right() {
         let snap = snapshot_from_seed();
-        let elem = build_statusbar(&snap);
+        let elem = build_statusbar(&snap, &shared_state());
         // left group, flex spacer, right group
         assert_eq!(elem.children.len(), 3);
         assert!(elem.children[1].classes.contains(&"sb-spacer".to_string()));
@@ -391,7 +419,7 @@ mod tests {
         snap.settings_section = SettingsSection::Appearance;
         snap.theme = "amber".into();
 
-        let elem = build_statusbar(&snap);
+        let elem = build_statusbar(&snap, &shared_state());
 
         assert!(elem.classes.contains(&"settings-statusbar".to_string()));
         assert_eq!(elem.children.len(), 3);
@@ -411,14 +439,14 @@ mod tests {
     #[test]
     fn build_statusbar_right_does_not_panic() {
         let snap = snapshot_from_seed();
-        let _elem = build_statusbar_right(&snap);
+        let _elem = build_statusbar_right(&snap, &shared_state());
     }
 
     #[test]
     fn statusbar_with_no_tabs_shows_zero_active() {
         let snap = minimal_snapshot();
         // Should not panic even with zero tabs
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
@@ -495,35 +523,35 @@ mod tests {
             },
         ];
         // Should not panic, running count should be 2
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
     fn statusbar_with_high_cpu() {
         let mut snap = minimal_snapshot();
         snap.cpu_pct = Some(99.9);
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
     fn statusbar_with_high_mem() {
         let mut snap = minimal_snapshot();
         snap.mem_gb = Some(128.55);
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
     fn statusbar_with_high_net() {
         let mut snap = minimal_snapshot();
         snap.net_kbps = Some(9999.9);
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
     fn statusbar_with_custom_clock() {
         let mut snap = minimal_snapshot();
         snap.clock_hhmm = "23:59".into();
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     #[test]
@@ -532,7 +560,7 @@ mod tests {
         snap.cpu_pct = Some(0.0);
         snap.mem_gb = Some(0.0);
         snap.net_kbps = Some(0.0);
-        let _elem = build_statusbar(&snap);
+        let _elem = build_statusbar(&snap, &shared_state());
     }
 
     fn item_text(el: &ElementDef, id: &str) -> String {
@@ -567,7 +595,7 @@ mod tests {
     #[test]
     fn statusbar_right_has_static_items() {
         let snap = minimal_snapshot();
-        let elem = build_statusbar_right(&snap);
+        let elem = build_statusbar_right(&snap, &shared_state());
         // Four items: active tab usage, focused shell + pid, dimensions, clock.
         assert_eq!(elem.children.len(), 4);
     }
@@ -578,7 +606,7 @@ mod tests {
         snap.panes[0][0].pid = 0;
         snap.panes[0][0].subtitle = "bash".into();
         snap.active_pane = snap.panes[0][0].id;
-        let right = build_statusbar_right(&snap);
+        let right = build_statusbar_right(&snap, &shared_state());
         assert_eq!(item_text(&right, "status-tab-usage"), "tab --");
         assert_eq!(item_text(&right, "status-shell"), "bash \u{00B7} pid --");
     }
@@ -600,9 +628,10 @@ mod tests {
                 mem_bytes: 164 << 20,
                 process_count: 5,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
-        let right = build_statusbar_right(&snap);
+        let right = build_statusbar_right(&snap, &shared_state());
         assert_eq!(
             item_text(&right, "status-tab-usage"),
             "tab 4.2% \u{00B7} 164 MiB \u{00B7} 5 procs"
@@ -612,7 +641,7 @@ mod tests {
         // A seeded "bash" subtitle loses to the image the sampler saw.
         snap.panes[0][0].subtitle = "bash".into();
         snap.resource_trees.get_mut(&16192).unwrap().root_exe = Some("powershell.exe".into());
-        let right = build_statusbar_right(&snap);
+        let right = build_statusbar_right(&snap, &shared_state());
         assert_eq!(
             item_text(&right, "status-shell"),
             "powershell \u{00B7} pid 16192"
@@ -640,6 +669,7 @@ mod tests {
                     mem_bytes: 0,
                     process_count: count,
                     root_exe: None,
+                    processes: Default::default(),
                 },
             );
         }

@@ -70,7 +70,7 @@ pub fn build_flow_pane_body(
         );
     }
     let body = body
-        .with_child(build_header(pane))
+        .with_child(build_header(pane, shared))
         .with_child(build_toolbar(pane, shared));
     let body = match pane.view {
         FlowView::CallStack => body.with_child(build_call_stack(pane, shared)),
@@ -93,8 +93,41 @@ pub(crate) fn handle_flow_key(
     if !st.flows.contains_key(&pane_id) || st.active_pane.0 != pane_id {
         return None;
     }
+    // `o` and `d` carry the selected node's id, so they cannot come out
+    // of the static key table below.
+    if let Some(verb) = flow_handoff_key(kb) {
+        let Some(id) = st
+            .flows
+            .get(&pane_id)
+            .and_then(|pane| pane.selected_node_id())
+            .map(str::to_owned)
+        else {
+            // Nothing selected: claim the key anyway so `o` does not
+            // fall through and start typing somewhere.
+            return Some(false);
+        };
+        return Some(crate::state::dispatch(st, &format!("{verb}:{id}")));
+    }
     let command = flow_key_command(kb)?;
     Some(crate::state::dispatch(st, command))
+}
+
+/// `o` / `d` on a Flow pane: open the selected node's file in an editor,
+/// or show it inside the flow's range diff. Returns the command *prefix*;
+/// the caller appends the selected node id, which always comes last
+/// because ids contain `::` and `.`.
+pub(crate) fn flow_handoff_key(kb: &KeyboardEvent) -> Option<&'static str> {
+    if kb.modifiers.contains(Modifiers::CTRL)
+        || kb.modifiers.contains(Modifiers::ALT)
+        || kb.modifiers.contains(Modifiers::SHIFT)
+    {
+        return None;
+    }
+    match kb.key {
+        Key::Char('o') | Key::Char('O') => Some("flow.edit"),
+        Key::Char('d') | Key::Char('D') => Some("flow.diff"),
+        _ => None,
+    }
 }
 
 /// Pure key → command mapping (plain digits stay free for the global
@@ -128,7 +161,7 @@ pub(crate) fn flow_key_command(kb: &KeyboardEvent) -> Option<&'static str> {
     })
 }
 
-fn build_header(pane: &FlowPane) -> ElementDef {
+fn build_header(pane: &FlowPane, shared: &SharedState) -> ElementDef {
     let flow = &pane.flow;
     let mut header = ElementDef::new(Tag::Div)
         .with_class("flow-header")
@@ -144,11 +177,24 @@ fn build_header(pane: &FlowPane) -> ElementDef {
                 .with_text(flow.summary.clone()),
         );
     }
-    header.with_child(
+    header = header.with_child(
         ElementDef::new(Tag::Span)
             .with_class("flow-meta")
             .with_text(meta_line(pane)),
-    )
+    );
+    // The range is a control rather than a caption: clicking it opens the
+    // whole change as a diff pane, which is the reason a review flow
+    // carries a range at all.
+    if let Some(range) = &flow.diff_range {
+        header = header.with_child(dispatch_on_click(
+            ElementDef::new(Tag::Button)
+                .with_class("flow-range-chip")
+                .with_text(format!("{}..{}", range.base, range.head)),
+            shared,
+            "flow.diff".to_string(),
+        ));
+    }
+    header
 }
 
 /// `11 nodes · 10 edges · explain · main@a1b2c3d`
@@ -161,9 +207,6 @@ fn meta_line(pane: &FlowPane) -> String {
     ];
     if let Some(git_ref) = &flow.git_ref {
         parts.push(git_ref.clone());
-    }
-    if let Some(range) = &flow.diff_range {
-        parts.push(format!("{}..{}", range.base, range.head));
     }
     parts.join(" \u{00B7} ")
 }
@@ -850,6 +893,26 @@ fn build_row(
             shared,
             format!("flow.src:{}", node.id),
         ));
+        // Hand-offs out of the flow: the file in an editor, or the
+        // flow's own range diff scrolled to this node.
+        row = row.with_child(dispatch_on_click(
+            ElementDef::new(Tag::Button)
+                .with_class("flow-src")
+                .with_class("flow-edit")
+                .with_text("edit"),
+            shared,
+            format!("flow.edit:{}", node.id),
+        ));
+        if pane.flow.diff_range.is_some() {
+            row = row.with_child(dispatch_on_click(
+                ElementDef::new(Tag::Button)
+                    .with_class("flow-src")
+                    .with_class("flow-diff")
+                    .with_text("diff"),
+                shared,
+                format!("flow.diff:{}", node.id),
+            ));
+        }
     }
     row
 }
@@ -985,6 +1048,25 @@ mod tests {
         assert!(meta.contains("11 nodes"), "{meta}");
         assert!(meta.contains("10 edges"), "{meta}");
         assert!(meta.contains("explain"), "{meta}");
+    }
+
+    #[test]
+    fn conceptual_flow_renders_all_views_without_source_locations() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut pane = FlowPane::open(&path).unwrap();
+        assert!(pane.flow.git_ref.is_none());
+        assert!(pane.flow.nodes.iter().all(|node| node.location.is_none()));
+        for view in [FlowView::CallStack, FlowView::Panes, FlowView::Graph] {
+            pane.set_view(view);
+            let body = build_flow_pane_body(PaneId(1), false, &pane, &shared());
+            assert!(text_of(&body).contains("How a cache serves a request"));
+            assert!(all(&body, &["flow-src"]).is_empty());
+            assert!(!text_of(&body).contains("source unavailable"));
+        }
+        let graph = build_flow_pane_body(PaneId(1), false, &pane, &shared());
+        assert_eq!(all(&graph, &["flow-graph-node"]).len(), 6);
+        assert!(text_of(&graph).contains("Cache miss"));
     }
 
     #[test]
@@ -1378,7 +1460,10 @@ mod tests {
         let body = build_flow_pane_body(PaneId(1), false, &p, &shared());
         let meta = text_of(first(&body, &["flow-meta"]).unwrap());
         assert!(meta.contains("review"), "{meta}");
-        assert!(meta.contains("main..feat/prompt-restore"), "{meta}");
+        // The range is its own control now, not part of the meta line:
+        // clicking it opens the whole change as a diff pane.
+        let chip = first(&body, &["flow-range-chip"]).expect("range chip");
+        assert_eq!(text_of(chip), "main..feat/prompt-restore");
         assert_eq!(all(&body, &["flow-legend-row"]).len(), 3);
         let chips: Vec<String> = [
             "flow-chip-diff-added",

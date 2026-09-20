@@ -7,6 +7,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-13
+
+Two ways of reading code land together. The file editor becomes one worth
+using — syntax colours, quick open, find in file, go to line, auto-indent
+and indent/outdent/comment chords — and gains a read-only **diff pane**
+that renders a git range as a stacked unified diff, steps hunks and files,
+and opens the file under the cursor at its new line. Beside it, **Review
+Git diff** is a full-window overlay for a range of committed work: the
+last N commits, everything ahead of the push target, or everything since
+the merge base with a branch, shown unified or side by side with viewed
+tracking, hunk navigation and path filtering. Dragging a selection past a
+pane's edge now scrolls the scrollback toward the pointer — except while
+the running program owns the mouse, which is exactly why it never worked
+in a Claude Code pane — and terminal mode changes land in a new
+`terminal-events.jsonl` sink. Editor panes finally paste, copy and follow
+the theme, and read-only panes are genuinely read-only.
+
+### Added
+
+- **Git diff review.** "Review Git diff" in the titlebar and the command
+  palette opens a review overlay over a range of committed work: the last
+  N commits along first-parent history, the commits ahead of the locally
+  known push target, or everything since the merge base with a base
+  branch or ref. The overlay lists the changed files with their
+  additions and deletions and shows one file's patch at a time, with old
+  and new line numbers, rename paths, binary-file notices and the exact
+  resolved range spelled out. Unified and side-by-side views both keep
+  the loaded range, file and selected hunk when you switch between them;
+  side by side pairs contiguous deletion and addition blocks by position
+  and shares vertical scrolling. `Previous`/`Next hunk` move within the
+  open file and say which hunk of how many you are on, filtering narrows
+  the file list by a case-insensitive substring of either the current or
+  the pre-rename path, and files can be marked viewed — with undo — so
+  progress across the range is visible. Long patches page rather than
+  render whole.
+
+  Review is read-only: it never fetches, pushes, stages or touches the
+  working directory, and it excludes staged and working-tree edits by
+  design. Git runs on a background worker with request coalescing, stale
+  responses discarded after a selection or close, and runtime and output
+  limits, so the overlay stays closeable while a large range resolves.
+  The range is taken from the focused session's recorded launch
+  directory — worktree tabs included — captured when the overlay opens.
+
+  Commands live under the `review.*` prefix (`review.open`,
+  `review.viewed`, `review.hunk_next` and the rest); the editor's own
+  diff pane keeps `diff.*`.
+
+- **Diff review pane.** `Ctrl+Shift+G` (or the palette's "Diff against…" /
+  "Show uncommitted changes") opens a read-only pane showing a git range as
+  a stacked unified diff, with old/new line numbers, `+`/`-` markers and
+  syntax colours per file. The range accepts `HEAD`, a single revision,
+  `base..head` and `base...head` (merge base); anything that is not
+  plausibly a revision — anything starting with `-`, or carrying
+  whitespace or shell punctuation — is refused before git runs, so a range
+  can never turn into a git flag. `git diff` runs on a named worker thread
+  and the pane is scrollable and closeable while it does; output is capped
+  at 8 MiB and 200 000 rows. Inside the pane, `n`/`p` step hunks, `]`/`[`
+  step files, and `Enter` opens the file under the cursor at its new line
+  number. Lifecycle events (`diff.request`, `diff.ready`, `diff.failed`,
+  `diff.nav`, `diff.open_file`) land in the profile's `diff-events.jsonl`,
+  carrying the range, counts and timings — never diff content.
+
+- **Editing polish in the file editor.** `Enter` carries the line's indent
+  onto the new line, keeping tabs as tabs. `Home` goes to the first
+  non-blank character and to column 0 on a second press. `Tab` and
+  `Shift+Tab` indent and outdent the selected lines as one undo step,
+  keeping the selection so the chord repeats; with nothing selected `Tab`
+  lands on the next tab stop. `Ctrl+/` comments or uncomments the selected
+  lines with the language's own line comment, aligned at the shallowest
+  indent of the block and leaving blank lines alone. All three are also
+  palette commands (`editor.indent`, `editor.outdent`,
+  `editor.toggle_comment`). Languages with no line comment — JSON, CSS,
+  Markdown — have nothing for `Ctrl+/` to toggle, so there it does
+  nothing; the editor sink records `editor.comment_unsupported` when it
+  happens so the inert chord is tellable from a broken one.
+
+- **Quick open.** `Ctrl+Shift+E` opens the command palette in a new Files
+  mode (`/` prefix) that fuzzy-matches every file in the workspace,
+  weighting the file name above the rest of the path. The list comes from
+  `git ls-files` where the workspace is a checkout and from a bounded walk
+  where it is not, built on a background thread and refreshed when it is
+  older than 30 seconds. Each row is the file name with its directory
+  beside it, so seventeen `mod.rs` rows are still tellable apart.
+
+- **Go to line and open-at.** `editor.goto` (palette: "Go to line…") jumps
+  in the focused editor, and `editor.open_at:<line>[.<col>]:<path>` opens a
+  file straight at a position — the line comes first because a Windows path
+  contains a colon. Jumps centre the target when it is off screen.
+
+- **Find in file.** `editor.find` and friends drive a per-pane search over
+  the focused document, with `editor.find_next` / `editor.find_prev` /
+  `editor.find_case` stepping and configuring it. Escape closes the bar
+  before any other surface.
+
+- **Flow hand-offs.** A Flow Explorer node with a source location can now be
+  opened in the editor (`flow.edit:<id>`) or shown inside the flow's own
+  range diff, scrolled to that file and hunk (`flow.diff:<id>`). The Flow
+  pane still never runs git itself; the diff pane it opens does, on a
+  worker thread.
+
+- **Selection drags auto-scroll past a pane's edge.** Dragging a selection
+  past the top or bottom of a pane scrolls its scrollback toward the
+  pointer (12 lines per second per row of overshoot, capped at 120, the
+  first line immediately) while the anchor stays on the text it was
+  pressed on; holding the pointer still keeps it scrolling. Auto-scroll is
+  refused — once per drag, and recorded — while the running program owns
+  the mouse (DECSET 1000/1002/1003) or the alternate screen: such a
+  program scrolls its own viewport by repainting the same rows, so moving
+  our scrollback would slide the highlight over content it never covered.
+  That is the case behind the report this fixes, a selection in a Claude
+  Code pane. A new bounded `terminal-events.jsonl` sink records
+  `terminal.mode_changed` on real DECSET 1049/1000/1002/1003/1006
+  transitions, keyed by pane, plus `terminal.selection_autoscroll` /
+  `terminal.selection_autoscroll_blocked` summaries.
+
+- Framework: elements can opt into drag auto-repeat
+  (`ElementDef::with_drag_autorepeat`). While their drag is active and the
+  pointer sits outside the content box, `DragPhase::Update` is
+  re-dispatched once per animation frame with the last pointer position
+  and zero deltas, so a handler can keep scrolling toward the pointer
+  without further mouse motion. The armed state counts as animation work,
+  so the existing frame chain carries it, and it disarms once the pointer
+  returns or the button is released.
+
+- **Telemetry covers the new surfaces.** `quickopen.pick`,
+  `editor.find_open` and `editor.find_closed` land in `editor-events.jsonl`,
+  `flow.handoff` (with `kind` = `edit` or `diff`) in `flow-events.jsonl`, and
+  closing a diff pane is recorded as `diff.closed` in `diff-events.jsonl`
+  beside the request that opened it, instead of an `editor.close` naming a
+  repository root as a file. Event names and counts only — never a
+  query string, a node label, or diff content.
+
+### Changed
+
+- **Opening a file that is already open focuses that pane** instead of
+  creating a second buffer over the same path, in any workspace, jumping to
+  the requested line if one was given. Two buffers over one file meant two
+  saves that could silently clobber each other.
+
+- **Editor panes follow the theme.** Colours are re-resolved on every theme
+  change instead of being frozen at the palette the pane opened with.
+
+### Fixed
+
+- **Paste and copy in editor panes.** `Ctrl+V`, `Ctrl+Shift+V` and
+  `Shift+Insert` are registered application bindings, so the shortcut
+  resolver claimed them before the focused editor pane could see the key:
+  the paste looked for a terminal, found none, and every attempt ended in a
+  `paste failed: no terminal in focus` toast with the clipboard never
+  reaching the document. `Ctrl+Shift+C` copied nothing for the same reason.
+  Both commands now recognise an editor pane and act on its buffer — paste
+  lands as one undo step and keeps multi-line clipboard payloads on
+  separate lines (terminal paste promotes newlines to carriage returns for
+  the shell, which would otherwise collapse them), copy takes the buffer
+  selection. Pastes are recorded as `editor.paste` (path and counts only)
+  in the profile's `editor-events.jsonl`.
+
+- **Read-only panes are genuinely read-only.** Typing, Enter, Tab,
+  Backspace, Delete, undo/redo, paste and `Ctrl+S` all went through the
+  unguarded mutation path, so a diff pane could be edited and — because its
+  `path` is the repository root — a save would have tried to write the
+  rendered diff over a directory. Every mutating path now goes through the
+  guarded one, and `save` refuses as a last line of defence.
+
 ## [0.4.0] - 2026-09-05
 
 Three agent-workflow features land together. Flow Explorer is a new kind of
@@ -665,7 +830,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.1...v0.3.2

@@ -146,7 +146,16 @@ pub fn build_terminal_grid(
                 .and_then(|r| r.get(col_idx))
                 .copied()
                 .unwrap_or(1.0);
-            let capture_keyboard = is_active && !state.settings_open && !state.palette_open;
+            // A confirm dialog counts as much as the palette or settings:
+            // the grid keeps capturing otherwise, so any keystroke the
+            // modal does not hold focus for is typed into the document
+            // underneath it. The Git review overlay is modal the same way.
+            let capture_keyboard = is_active
+                && !state.settings_open
+                && !state.palette_open
+                && !state.process_details_open
+                && state.confirm_dialog.is_none()
+                && state.diff_review.is_none();
             let pane_el = build_pane(
                 pane,
                 is_active,
@@ -328,6 +337,7 @@ fn build_pane(
             pane.id,
             capture_keyboard,
             state.terminal_font_size_pt,
+            state.editor_find_bars.get(&pane.id.0),
             shared,
             grids,
         )
@@ -1127,35 +1137,66 @@ fn build_pane_body(
 
         let sel_drag_shared = shared.clone();
         let sel_drag_pane = pane_id;
-        grid_el = grid_el.on_drag(move |ev| {
-            if ev.button != MouseButton::Left {
-                return;
-            }
-            let (lx, ly) = (ev.local_x, ev.local_y);
-            match ev.phase {
-                DragPhase::Start | DragPhase::Update => {
-                    mutate_with(&sel_drag_shared, |st| {
-                        let x_offset = terminal_content_x_offset();
-                        let scale = terminal_cell_width_scale();
-                        if let Some(cell) = crate::state::terminal_cell_at(
-                            st,
-                            sel_drag_pane.0,
-                            lx,
-                            ly,
-                            x_offset,
-                            scale,
-                        ) {
-                            crate::state::handle_terminal_drag(st, sel_drag_pane.0, cell);
-                        }
-                    });
+        grid_el = grid_el
+            .on_drag(move |ev| {
+                if ev.button != MouseButton::Left {
+                    return;
                 }
-                DragPhase::End => {
-                    mutate_with(&sel_drag_shared, |st| {
-                        crate::state::finish_terminal_drag(st, sel_drag_pane.0);
-                    });
+                let (lx, ly) = (ev.local_x, ev.local_y);
+                match ev.phase {
+                    DragPhase::Start | DragPhase::Update => {
+                        mutate_with(&sel_drag_shared, |st| {
+                            let x_offset = terminal_content_x_offset();
+                            let scale = terminal_cell_width_scale();
+                            // Past the top or bottom edge: scroll the
+                            // scrollback toward the pointer first (rate
+                            // limited; the framework re-dispatches this
+                            // update every frame while the pointer rests
+                            // outside the grid), then let the clamped
+                            // hit-test below pin the focus to the edge row.
+                            let overshoot = crate::state::terminal_drag_overshoot_rows_for_pane(
+                                st,
+                                sel_drag_pane.0,
+                                ly,
+                            );
+                            let now = std::time::Instant::now();
+                            if overshoot != 0 {
+                                crate::state::terminal_drag_autoscroll(
+                                    st,
+                                    sel_drag_pane.0,
+                                    overshoot,
+                                    now,
+                                );
+                            } else {
+                                crate::state::end_terminal_drag_autoscroll(
+                                    st,
+                                    sel_drag_pane.0,
+                                    "reentered",
+                                    now,
+                                );
+                            }
+                            if let Some(cell) = crate::state::terminal_cell_at(
+                                st,
+                                sel_drag_pane.0,
+                                lx,
+                                ly,
+                                x_offset,
+                                scale,
+                            ) {
+                                crate::state::handle_terminal_drag(st, sel_drag_pane.0, cell);
+                            }
+                        });
+                    }
+                    DragPhase::End => {
+                        mutate_with(&sel_drag_shared, |st| {
+                            crate::state::finish_terminal_drag(st, sel_drag_pane.0);
+                        });
+                    }
                 }
-            }
-        });
+            })
+            // Keep the drag update flowing while the pointer rests past the
+            // pane edge so the auto-scroll above runs without mouse motion.
+            .with_drag_autorepeat();
 
         // Right-click pastes into this pane (classic Windows console
         // behavior). Focus the pane first so the paste targets it even when
@@ -2009,6 +2050,61 @@ mod tests {
         assert!(
             !content.captures_keyboard,
             "active pane must not capture keyboard while command palette is open"
+        );
+    }
+
+    #[test]
+    fn process_details_prevent_terminal_keyboard_capture() {
+        let mut state = seed_state();
+        state.process_details_open = true;
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(!find_terminal_content(&el).unwrap().captures_keyboard);
+    }
+
+    #[test]
+    fn diff_review_prevents_terminal_keyboard_capture() {
+        let mut state = seed_state();
+        state.diff_review = Some(crate::diff_review::Review::new(".".into()));
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(!find_terminal_content(&el).unwrap().captures_keyboard);
+    }
+
+    /// A confirm dialog is as modal as the palette or settings. While it
+    /// is up, any keystroke it does not hold focus for used to reach the
+    /// capturing grid and be typed into the pane behind it.
+    #[test]
+    fn active_pane_does_not_capture_keyboard_when_a_confirm_dialog_is_open() {
+        let mut state = seed_state();
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        state.confirm_dialog = Some(crate::state::ConfirmDialog::GotoLine {
+            pane_id: pane.id.0,
+            buffer: "abc".to_string(),
+            error: Some("Not a line number".to_string()),
+        });
+        let snap = state.ui_snapshot();
+        let shared = make_shared();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        let content = find_terminal_content(&el)
+            .expect("terminal-content element should exist when grid is present");
+        assert!(
+            !content.captures_keyboard,
+            "active pane must not capture keyboard while a confirm dialog is open"
         );
     }
 

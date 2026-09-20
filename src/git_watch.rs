@@ -139,14 +139,54 @@ mod tests {
         Arc::new(Mutex::new(state))
     }
 
+    /// A repository of our own, on a branch we made.
+    ///
+    /// Not `CARGO_MANIFEST_DIR`: `actions/checkout` leaves a pull request
+    /// build on a detached HEAD, and [`crate::git::detect_git_branch`]
+    /// reports that as no branch at all — correctly, because that is what
+    /// the sidebar should show. A test that asserts on the branch of
+    /// whatever checkout it happens to be compiled in fails in CI for a
+    /// reason that has nothing to do with the code it covers.
+    fn repo_on_a_branch() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "tm-git-watch-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp repo");
+        for args in [
+            &["init", "-q", "-b", "test-branch"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test"][..],
+            &["config", "commit.gpgsign", "false"][..],
+            &["commit", "--allow-empty", "-q", "-m", "x"][..],
+        ] {
+            let status = crate::git::git_command(&dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {dir:?}");
+        }
+        dir
+    }
+
     #[test]
     fn distinct_paths_are_resolved_once_each() {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo = repo_on_a_branch();
+        // A directory that is no repository at all, to prove Absent is
+        // reported for the path that earned it and not inherited from a
+        // sibling that shares the resolver pass.
+        let plain = repo.with_extension("plain");
+        std::fs::create_dir_all(&plain).expect("create plain dir");
         let targets = vec![
             (1, repo.clone()),
             (2, repo.clone()),
             (3, repo.clone()),
-            (4, std::env::temp_dir()),
+            (4, plain.clone()),
         ];
 
         let resolved = resolve(&targets);
@@ -157,7 +197,21 @@ mod tests {
             2,
             "shared repositories must not be probed once per workspace"
         );
-        assert!(matches!(resolved[&repo], GitBranch::Known(_)));
+        assert_eq!(resolved[&repo], GitBranch::Known("test-branch".into()));
+        assert_eq!(resolved[&plain], GitBranch::Absent);
+        // CI checks out a detached merge commit. Branch detection must still
+        // resolve each path, reporting Absent for that repository.
+        assert!(crate::git::git_command(&repo)
+            .args(["checkout", "--detach", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let detached = resolve(&targets);
+        assert_eq!(detached.len(), 2);
+        assert_eq!(detached[&repo], GitBranch::Absent);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     #[test]
