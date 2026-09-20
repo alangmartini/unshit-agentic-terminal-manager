@@ -4,10 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, feat/rust-terminal-manager, feat/macos-terminal-manager]
+    branches: [main]
 
 concurrency:
-  group: pr-quality-gate-${{ github.head_ref || github.ref }}
+  group: pr-quality-gate-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -268,7 +268,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/rust-terminal-manager')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, X64, local-windows]
     timeout-minutes: 25
     env:
