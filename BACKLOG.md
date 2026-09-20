@@ -23,6 +23,13 @@ The audit surfaced adjacent hazards that are not yet fixed:
 - [ ] **Atlas shelf-height slack** — a freed shelf keeps its original height
   forever, so short glyphs revived onto tall shelves waste vertical space and
   accelerate exhaustion. Consider shelf splitting or best-fit selection.
+- [ ] **Terminal primitive path has no telemetry** — block, quadrant, shade
+  and box glyphs are emitted as quads by `emit_terminal_cell_primitive` and
+  never produce a `CellGlyphOutcome`, so a dropped primitive would not count
+  in `GLYPH_RASTER_FAILURES` or surface in `renderer.glyph_drop`. The one
+  silent-drop branch is `push_terminal_rounded_quad` on zero size or alpha.
+  Count primitive drops and fold them into the renderer telemetry (surfaced
+  by the 2026-09 block-ink capture re-inspection on PR #200).
 
 ## File editor follow-ups (post-MVP; from the 2026-07 feature review)
 
