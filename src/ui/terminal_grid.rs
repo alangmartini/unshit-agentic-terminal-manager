@@ -197,6 +197,7 @@ pub fn build_terminal_grid_with_event_sink(
             let capture_keyboard = is_active
                 && !state.settings_open
                 && !state.palette_open
+                && !state.process_details_open
                 && state.confirm_dialog.is_none()
                 && state.diff_review.is_none();
             let pane_el = build_pane_with_event_sink(
@@ -2204,6 +2205,20 @@ mod tests {
             !content.captures_keyboard,
             "active pane must not capture keyboard while command palette is open"
         );
+    }
+
+    #[test]
+    fn process_details_prevent_terminal_keyboard_capture() {
+        let mut state = seed_state();
+        state.process_details_open = true;
+        let pane = state.panes[0][0].clone();
+        state.active_pane = pane.id;
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(pane.id.0, CellGrid::new(24, 80));
+        let el = build_terminal_grid(&snap, &shared, &grids);
+        assert!(!find_terminal_content(&el).unwrap().captures_keyboard);
     }
 
     #[test]

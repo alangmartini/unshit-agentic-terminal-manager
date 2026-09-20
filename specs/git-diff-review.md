@@ -5,6 +5,17 @@ Use the focused session's recorded launch directory (including worktree tabs),
 falling back to the active workspace directory. Capture it when opening.
 
 ## Behavior
+- Open a UTF-8 Git-format `.patch`/`.diff` file using **Open patch...**, or drop
+  one file onto the open review. IntelliJ and format-patch preambles are ignored;
+  paths, hunks, renames, additions/deletions and binary notices reuse the shared
+  diff parser. No repository or target files are required and nothing is applied.
+- Imported files use the same filter, unified/split views, hunk navigation and
+  viewed marks. Show the patch path instead of a repository/range. Refresh rereads
+  the patch; selecting a Git mode returns to the captured repository. Imports run
+  on the existing worker with stale-result rejection and a 4 MiB file limit.
+  Unsupported/empty formats, invalid UTF-8 and oversized files show errors.
+  Long lines use the shared parser's visible clipping notice; row-limit overflow
+  is rejected. Counts refer to displayed changes.
 - Previous/Next hunk controls navigate within the open file, highlight the target,
   and show its ordinal/total. A jump starts a bounded row window at the hunk header
   in either view, without another Git query. Switching views keeps a selected hunk.
@@ -23,6 +34,17 @@ falling back to the active workspace directory. Capture it when opening.
   width with horizontal scrolling on narrow windows. Default remains unified.
 - Last N commits (first-parent history), unpushed commits against the locally
   known push target, and a base branch/ref comparison using merge-base.
+- An empty base ref automatically uses the locally recorded `origin/HEAD`,
+  falling back to an existing local `main` or `master`. If none is available,
+  ask for an explicit ref. Never assume that `main` exists or fetch to discover
+  the default. Invalid explicit refs identify the input and explain how to fix it.
+- Compare branches accepts separate From and To refs (local branches, remote
+  tracking refs, tags, or commits). From defaults to the automatic base and To
+  to `HEAD`. Compare the two committed tips directly, including differences
+  unique to either side, without switching branches or requiring shared history.
+  Show both chosen refs and the exact resolved commit IDs. Keep Compare base's
+  common-ancestor behavior separate. These follow Git's documented
+  [two-commit and merge-base comparisons](https://git-scm.com/docs/git-diff).
 - Show the exact resolved range, file list, additions/deletions, and a unified
   patch with old/new line numbers. Load only the selected file's patch.
 - Preserve rename paths, binary notices, empty states and actionable Git errors.
@@ -55,3 +77,6 @@ and `cargo run` under an isolated `TM_PROFILE`.
 Always preserve PTY lifecycle and render invariants. No changes to dependencies,
 daemon ownership, persistence or framework behavior are needed. Publication and
 remote Git operations are outside this feature's scope.
+
+Set `TM_DIFF_VISUAL_PATCH` with `TM_DIFF_VISUAL_DUMP` to capture an imported patch
+through the existing GPU review screenshot test.

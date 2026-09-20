@@ -38,6 +38,7 @@ pub enum KeybindAction {
     QuickOpen,
     DiffOpen,
     EditorSave,
+    ToggleExplorer,
     ToggleSidebar,
     OpenSettings,
     ZoomIn,
@@ -93,6 +94,7 @@ impl KeybindAction {
         Self::QuickOpen,
         Self::DiffOpen,
         Self::EditorSave,
+        Self::ToggleExplorer,
         Self::ToggleSidebar,
         Self::OpenSettings,
         Self::ZoomIn,
@@ -123,6 +125,7 @@ impl KeybindAction {
             Self::QuickOpen => "quick_open",
             Self::DiffOpen => "diff_open",
             Self::EditorSave => "editor_save",
+            Self::ToggleExplorer => "toggle_explorer",
             Self::ToggleSidebar => "toggle_sidebar",
             Self::OpenSettings => "open_settings",
             Self::ZoomIn => "zoom_in",
@@ -159,6 +162,7 @@ impl KeybindAction {
             Self::QuickOpen => "Quick open",
             Self::DiffOpen => "Diff against…",
             Self::EditorSave => "Save file",
+            Self::ToggleExplorer => "Toggle file explorer",
             Self::ToggleSidebar => "Toggle sidebar",
             Self::OpenSettings => "Settings",
             Self::ZoomIn => "Zoom in",
@@ -192,6 +196,7 @@ impl KeybindAction {
             Self::QuickOpen => "Find a file in the workspace by name and open it",
             Self::DiffOpen => "Review a git range as a read-only diff pane",
             Self::EditorSave => "Save the focused editor pane",
+            Self::ToggleExplorer => "Show or hide the file explorer",
             Self::ToggleSidebar => "Show or hide the workspace sidebar",
             Self::OpenSettings => "Open the settings window",
             Self::ZoomIn => "Scale the whole interface up, terminal and chrome together",
@@ -223,6 +228,7 @@ impl KeybindAction {
             Self::DiffOpen
             | Self::OpenFile
             | Self::EditorSave
+            | Self::ToggleExplorer
             | Self::ToggleSidebar
             | Self::OpenSettings
             | Self::ZoomIn
@@ -257,6 +263,7 @@ impl KeybindAction {
             Self::QuickOpen => "palette.files",
             Self::DiffOpen => "diff.open",
             Self::EditorSave => "editor.save",
+            Self::ToggleExplorer => "explorer.toggle",
             Self::ToggleSidebar => "sidebar.toggle",
             Self::OpenSettings => "modal.open",
             // Zoom is framework-owned: `zoom.*` is handled inside
@@ -298,7 +305,8 @@ impl KeybindAction {
             Self::QuickOpen => "Meta+P",
             Self::DiffOpen => "Shift+Meta+G",
             Self::EditorSave => "Meta+S",
-            Self::ToggleSidebar => "Meta+B",
+            Self::ToggleExplorer => "Meta+B",
+            Self::ToggleSidebar => "Shift+Meta+B",
             Self::OpenSettings => "Meta+,",
             Self::ZoomIn => "Meta+=",
             Self::ZoomOut => "Meta+-",
@@ -339,7 +347,8 @@ impl KeybindAction {
             // Ctrl+Shift+G is Source Control in VS Code.
             Self::DiffOpen => "Ctrl+Shift+G",
             Self::EditorSave => "Ctrl+Shift+S",
-            Self::ToggleSidebar => "Ctrl+B",
+            Self::ToggleExplorer => "Ctrl+B",
+            Self::ToggleSidebar => "Ctrl+Shift+B",
             Self::OpenSettings => "Ctrl+,",
             Self::ZoomIn => "Ctrl+=",
             Self::ZoomOut => "Ctrl+-",
@@ -364,8 +373,23 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_twenty_five_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 25);
+    fn all_has_twenty_six_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 26);
+    }
+
+    #[test]
+    fn explorer_owns_primary_b_without_conflicting_with_sidebar() {
+        let (explorer, sidebar) = if cfg!(target_os = "macos") {
+            ("Meta+B", "Shift+Meta+B")
+        } else {
+            ("Ctrl+B", "Ctrl+Shift+B")
+        };
+        assert_eq!(KeybindAction::ToggleExplorer.default_combo_str(), explorer);
+        assert_eq!(
+            KeybindAction::ToggleExplorer.dispatch_command(),
+            "explorer.toggle"
+        );
+        assert_eq!(KeybindAction::ToggleSidebar.default_combo_str(), sidebar);
     }
 
     #[test]

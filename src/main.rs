@@ -17,6 +17,7 @@ pub mod diff;
 pub mod diff_review;
 pub mod drag;
 pub mod editor;
+pub mod explorer;
 pub mod file_index;
 pub mod flow_explorer;
 pub mod git;
@@ -308,13 +309,19 @@ fn build_tree(
     if snap.settings_open && snap.diff_review.is_none() {
         root = root
             .with_child(build_settings_page(snap, shared))
-            .with_child(with_custom_surface_style(build_statusbar(snap), snap));
+            .with_child(with_custom_surface_style(
+                build_statusbar(snap, shared),
+                snap,
+            ));
     } else if snap.diff_review.is_none() {
+        let sidebar_width = if snap.sidebar_collapsed {
+            48.0
+        } else {
+            snap.sidebar_width
+        };
         let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
-            .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
-            .with_style(StyleDeclaration::MinWidth(Dimension::Px(
-                snap.sidebar_width,
-            )));
+            .with_style(StyleDeclaration::Width(Dimension::Px(sidebar_width)))
+            .with_style(StyleDeclaration::MinWidth(Dimension::Px(sidebar_width)));
         let drag_shared = shared.clone();
         let sidebar_resizer = ElementDef::new(Tag::Div)
             .with_class("sidebar-resizer")
@@ -356,7 +363,10 @@ fn build_tree(
                             grids,
                             window_events,
                         ))
-                        .with_child(with_custom_surface_style(build_statusbar(snap), snap)),
+                        .with_child(with_custom_surface_style(
+                            build_statusbar(snap, shared),
+                            snap,
+                        )),
                 ),
         );
     }
@@ -374,6 +384,7 @@ fn build_tree(
         root: root
             .with_child(crate::ui::diff_review::build(snap, shared))
             .with_child(build_ctx_menu_overlay(snap, shared))
+            .with_child(crate::ui::process_details::build(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
@@ -1214,13 +1225,11 @@ fn main() {
                 true
             })),
             on_file_drop: Some(Arc::new(move |paths: &[std::path::PathBuf]| -> bool {
-                // Native drag-and-drop. When the Quick Prompt overlay is
-                // open, attach any dropped image files as chips (the
-                // drag-and-drop counterpart to Ctrl+V). When it is closed,
-                // `attach_dropped_images` is a no-op and we request no
-                // rebuild, leaving terminal drops untouched.
+                // The review overlay accepts one patch; Quick Prompt accepts
+                // images. Both handlers are no-ops while their overlay is closed.
                 let mut guard = file_drop_shared.lock_recover();
-                crate::state::attach_dropped_images(&mut guard, paths)
+                crate::diff_review::accept_drop(&mut guard, paths)
+                    || crate::state::attach_dropped_images(&mut guard, paths)
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
@@ -1460,14 +1469,21 @@ fn main() {
     {
         let hooks_shared = shared.clone();
         let hooks_sink = window_event_sink.clone();
+        let reveal_sink = window_event_sink.clone();
         crate::state::register_editor_open_hooks(crate::state::EditorOpenHooks {
             shared: hooks_shared,
+            request_reveal: Box::new(move |id| {
+                if let Some(sink) = reveal_sink.get() {
+                    let _ = sink.send(unshit::app::ExternalEvent::ScrollIntoView(id));
+                }
+            }),
             request_rebuild: Box::new(move || {
                 if let Some(sink) = hooks_sink.get() {
                     let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
                 }
             }),
         });
+        crate::state::start_explorer_refresh();
     }
 
     // Set up PTY output subscriptions.
@@ -1663,6 +1679,54 @@ mod tests {
                 snap.layout_rect.x >= 0.0 && snap.layout_rect.x + snap.layout_rect.width <= 1280.0,
                 "{selector} should be horizontally visible, got {:?}",
                 snap.layout_rect
+            );
+        }
+    }
+
+    #[test]
+    fn conceptual_flow_rows_have_visible_layout() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut state = seed_state();
+        crate::state::mutate_add_flow_tab(
+            &mut state,
+            crate::flow_explorer::FlowPane::open(&path).unwrap(),
+        );
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let grids = std::collections::HashMap::new();
+        let rebuild_snap = snap.clone();
+        let rebuild_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&snap, &shared, &grids, None),
+            1400.0,
+            950.0,
+        );
+        harness.set_scale_factor(1.25);
+        harness.step();
+        harness.rebuild(move || {
+            build_tree(
+                &rebuild_snap,
+                &rebuild_shared,
+                &std::collections::HashMap::new(),
+                None,
+            )
+        });
+        harness.step();
+        let tree = harness.query(".flow-tree").unwrap().layout_rect;
+        let rows = harness.query_all(".flow-row");
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            assert!(
+                row.layout_rect.width >= 100.0 && row.layout_rect.height >= 12.0,
+                "row collapsed: {:?}; tree: {tree:?}",
+                row.layout_rect
+            );
+            assert!(
+                row.layout_rect.y >= tree.y && row.layout_rect.y < tree.y + tree.height,
+                "row outside viewport: {:?}; tree: {tree:?}",
+                row.layout_rect
             );
         }
     }

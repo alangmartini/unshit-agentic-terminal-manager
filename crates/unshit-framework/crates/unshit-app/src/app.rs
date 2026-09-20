@@ -634,6 +634,7 @@ struct AppState {
     dw_rasterizer: DwRasterizer,
     interaction: InteractionState,
     needs_rebuild: bool,
+    pending_scroll_into_view: Option<String>,
     needs_restyle: bool,
     needs_relayout: bool,
     /// Most recent native surface metrics observed since the last paint.
@@ -792,6 +793,26 @@ struct AppState {
     /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
     /// unused otherwise.
     frame_arena: FrameArena,
+}
+
+/// Reveal an element by its HTML id in its nearest scroll container, and
+/// cancel any in-flight smooth-scroll animation that would move it away
+/// again. No-op when the id has no live element or no scrollable ancestor.
+fn reveal_element_by_id(state: &mut AppState, id: &str) {
+    let Some(target) = state
+        .arena
+        .iter()
+        .find(|(_, element)| element.id.as_deref() == Some(id))
+        .map(|(node, _)| node)
+    else {
+        return;
+    };
+    let Some(container) = scroll::scroll_into_view(&mut state.arena, &state.taffy, target) else {
+        return;
+    };
+    if state.smooth_scroll.is_some_and(|animation| animation.node_id == container) {
+        state.smooth_scroll = None;
+    }
 }
 
 const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
@@ -3494,6 +3515,7 @@ impl AppHandler {
             dw_rasterizer,
             interaction: InteractionState::default(),
             needs_rebuild: false,
+            pending_scroll_into_view: None,
             needs_restyle: false,
             needs_relayout: false,
             pending_surface_metrics: None,
@@ -3676,6 +3698,10 @@ impl ApplicationHandler for AppHandler {
         for event in self.event_rx.try_iter() {
             match event {
                 ExternalEvent::RequestRebuild => {
+                    coalescer.observe(true);
+                }
+                ExternalEvent::ScrollIntoView(id) => {
+                    state.pending_scroll_into_view = Some(id);
                     coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
@@ -4439,6 +4465,9 @@ impl ApplicationHandler for AppHandler {
                             ) {
                                 state.smooth_scroll = None;
                                 match hit.part {
+                                    ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                                        scroll::scroll_from_arrow(&mut state.arena, &hit);
+                                    }
                                     ScrollbarPart::Thumb => {
                                         let grab_offset = match hit.axis {
                                             ScrollbarAxis::Vertical => {
@@ -5023,6 +5052,7 @@ impl ApplicationHandler for AppHandler {
                                         modifiers: combo.modifiers,
                                         text: event.text.as_ref().map(|t| t.to_string()),
                                     });
+                                    let mut reveal_id = None;
                                     if let Some(element) = state.arena.get(focused_id) {
                                         let mut saw_keyboard_handler = false;
                                         let mut capture_requires_rebuild = false;
@@ -5034,11 +5064,19 @@ impl ApplicationHandler for AppHandler {
                                                     keyboard_capture_requires_rebuild(
                                                         response.as_deref(),
                                                     );
+                                                if let Some(response) = response {
+                                                    if let Ok(request) = response.downcast::<unshit_core::event::RequestScrollIntoView>() {
+                                                        reveal_id = Some(request.0);
+                                                    }
+                                                }
                                             }
                                         }
                                         if !saw_keyboard_handler || capture_requires_rebuild {
                                             state.needs_rebuild = true;
                                         }
+                                    }
+                                    if let Some(id) = reveal_id {
+                                        reveal_element_by_id(state, &id);
                                     }
                                     state.window.request_redraw();
                                 }
@@ -5735,6 +5773,9 @@ impl ApplicationHandler for AppHandler {
                             state.measure_cache.len().saturating_sub(measure_entries_before);
                     }
 
+                    if let Some(id) = state.pending_scroll_into_view.take() {
+                        reveal_element_by_id(state, &id);
+                    }
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
                     state.needs_restyle = false;
@@ -7627,6 +7668,9 @@ mod tests {
         let rebuild: Box<dyn std::any::Any> = Box::new(unshit_core::event::RequestRebuild);
         assert!(keyboard_capture_requires_rebuild(Some(rebuild.as_ref())));
         assert!(keyboard_capture_requires_rebuild(None));
+        let reveal: Box<dyn std::any::Any> =
+            Box::new(unshit_core::event::RequestScrollIntoView("selected-file".into()));
+        assert!(keyboard_capture_requires_rebuild(Some(reveal.as_ref())));
     }
 
     #[test]

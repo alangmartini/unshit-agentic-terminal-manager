@@ -30,6 +30,11 @@ pub const ENV_AGENT_RESTORE_CORRELATION_ID: &str = "TM_AGENT_RESTORE_CORRELATION
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotificationIpcRequest {
+    OpenFlow {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<u32>,
+    },
     Notify {
         title: String,
         text: String,
@@ -69,6 +74,11 @@ pub struct NotificationTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
+    OpenFlow {
+        socket: PathBuf,
+        path: PathBuf,
+        workspace_id: Option<u32>,
+    },
     Notify {
         socket: PathBuf,
         title: String,
@@ -94,6 +104,7 @@ pub enum CliCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliMode {
+    OpenFlow,
     Notify,
     Activate,
     SessionHook(crate::agent_restore::AgentKind),
@@ -102,6 +113,7 @@ enum CliMode {
 
 #[derive(Default)]
 struct CliFields {
+    path: Option<PathBuf>,
     title: Option<String>,
     text: Option<String>,
     socket: Option<PathBuf>,
@@ -135,6 +147,22 @@ where
     };
 
     let result = match command {
+        CliCommand::OpenFlow {
+            socket,
+            path,
+            workspace_id,
+        } => {
+            // Resolve relative paths in the caller's directory. Validation here
+            // gives the CLI a useful error; the receiving app validates again.
+            path.canonicalize().and_then(|path| {
+                crate::flow_explorer::ingest_file(&path)
+                    .map_err(|error| io::Error::other(error.message(&path)))?;
+                send_cli_request_blocking(
+                    &socket,
+                    NotificationIpcRequest::OpenFlow { path, workspace_id },
+                )
+            })
+        }
         CliCommand::Notify {
             socket,
             title,
@@ -234,6 +262,12 @@ where
     };
 
     let mode = match first.as_str() {
+        "flow" => {
+            if args.next().as_deref() != Some("open") {
+                return Err("usage: terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]".into());
+            }
+            CliMode::OpenFlow
+        }
         "notify" | "--notify" => CliMode::Notify,
         "activate" | "--activate" => CliMode::Activate,
         "session-hook" => {
@@ -284,6 +318,9 @@ where
                 return Err(format!("unknown flag {other:?}"));
             }
             positional => match mode {
+                CliMode::OpenFlow if fields.path.is_none() => {
+                    fields.path = Some(PathBuf::from(positional));
+                }
                 CliMode::Notify if fields.title.is_none() => {
                     fields.title = Some(positional.to_string());
                 }
@@ -323,6 +360,22 @@ where
     };
 
     match mode {
+        CliMode::OpenFlow => {
+            if fields.title.is_some() || fields.text.is_some() || fields.pane_id.is_some() {
+                return Err("flow open accepts only a path, --workspace-id, and --socket".into());
+            }
+            let path = fields
+                .path
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(|| "flow open requires a JSON path".to_string())?;
+            Ok(Some(CliCommand::OpenFlow {
+                socket,
+                path,
+                workspace_id: fields
+                    .workspace_id
+                    .or_else(|| parse_env_u32(&get_env, ENV_WORKSPACE_ID)),
+            }))
+        }
         CliMode::Notify => {
             let target = NotificationTarget {
                 workspace_id: fields
@@ -411,7 +464,7 @@ fn require_non_empty(value: Option<String>, field: &str) -> Result<String, Strin
 }
 
 fn notification_usage() -> &'static str {
-    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>"
+    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>"
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -710,6 +763,37 @@ fn apply_ipc_request(
 ) -> IpcEffect {
     let mut effect = IpcEffect::default();
     match request {
+        NotificationIpcRequest::OpenFlow { path, workspace_id } => {
+            // File parsing runs in the IPC subscription, before the state lock.
+            // A relative IPC path would accidentally use the UI process's cwd.
+            if !path.is_absolute() {
+                return effect;
+            }
+            match crate::flow_explorer::FlowPane::open(&path) {
+                Ok(pane) => {
+                    let opened = mutate_with(shared, |state| {
+                        let target = resolve_workspace_index(state, workspace_id)
+                            .filter(|&i| i < state.workspaces.len());
+                        let Some(target) = target else {
+                            return false;
+                        };
+                        if target != state.active_workspace {
+                            crate::state::mutate_switch_workspace(state, target);
+                        }
+                        crate::state::open_flow_tab(state, pane);
+                        state.settings_open = false;
+                        state.diff_review = None;
+                        true
+                    });
+                    effect.accepted = opened;
+                    effect.rebuild = opened;
+                    effect.activate_window = opened;
+                }
+                Err(error) => {
+                    log::warn!("flow CLI open rejected: {}", error.message(&path));
+                }
+            }
+        }
         NotificationIpcRequest::Notify {
             title,
             text,
@@ -825,6 +909,18 @@ fn apply_ipc_request(
     effect
 }
 
+/// Resolve a `--workspace-id`/`workspace_id` argument to an index, or the
+/// caller's active workspace when absent.
+fn resolve_workspace_index(
+    state: &crate::state::AppState,
+    workspace_id: Option<u32>,
+) -> Option<usize> {
+    match workspace_id {
+        Some(id) => state.workspaces.iter().position(|w| w.num == id),
+        None => Some(state.active_workspace),
+    }
+}
+
 /// Resolve and run a `NewAgent` IPC request against live state. Returns
 /// the machine-readable rejection reason so both the log line and the
 /// telemetry record name the same cause.
@@ -838,11 +934,7 @@ fn apply_new_agent_request(
         crate::agents::telemetry::AgentEventRecord::new("agent.cli", "info", &correlation_id);
     event.source = Some("cli");
     event.workspace_id = workspace_id;
-    let ws_idx = match workspace_id {
-        Some(id) => state.workspaces.iter().position(|w| w.num == id),
-        None => Some(state.active_workspace),
-    };
-    let Some(ws_idx) = ws_idx else {
+    let Some(ws_idx) = resolve_workspace_index(state, workspace_id) else {
         event.level = "warn";
         event.outcome = Some("rejected");
         event.reason = Some("workspace_not_found");
@@ -1205,6 +1297,100 @@ mod tests {
     fn parse_activate_requires_target() {
         let err = parse_cli_args(["activate"], env_map(&[])).expect_err("target required");
         assert!(err.contains(ENV_WORKSPACE_ID), "{err}");
+    }
+
+    #[test]
+    fn parse_flow_open_is_a_cli_command_without_a_pane_target() {
+        let command = parse_cli_args(
+            ["flow", "open", "C:/my diagrams/caching.json"],
+            env_map(&[]),
+        )
+        .unwrap();
+        assert!(
+            matches!(command, Some(CliCommand::OpenFlow { path, workspace_id: None, .. })
+            if path == Path::new("C:/my diagrams/caching.json"))
+        );
+    }
+
+    #[test]
+    fn parse_flow_open_routes_to_the_callers_workspace_and_rejects_bad_arguments() {
+        let command = parse_cli_args(
+            ["flow", "open", "diagram.json"],
+            env_map(&[(ENV_WORKSPACE_ID, "42"), (ENV_NOTIFY_SOCKET, "test.sock")]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            command,
+            CliCommand::OpenFlow {
+                path: PathBuf::from("diagram.json"),
+                socket: PathBuf::from("test.sock"),
+                workspace_id: Some(42),
+            }
+        );
+        for args in [
+            vec!["flow"],
+            vec!["flow", "open"],
+            vec!["flow", "delete", "x.json"],
+            vec!["flow", "open", "x.json", "y.json"],
+            vec!["flow", "open", "x.json", "--title", "title"],
+            vec!["flow", "open", "x.json", "--pane-id", "1"],
+        ] {
+            assert!(parse_cli_args(args, env_map(&[])).is_err());
+        }
+    }
+
+    #[test]
+    fn flow_open_ipc_validates_and_routes_before_changing_the_ui() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut state = crate::state::seed_state();
+        state.settings_open = true;
+        let target = state.workspaces[1].num;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        for request in [
+            NotificationIpcRequest::OpenFlow {
+                path: path.clone(),
+                workspace_id: Some(u32::MAX),
+            },
+            NotificationIpcRequest::OpenFlow {
+                path: PathBuf::from("relative.json"),
+                workspace_id: None,
+            },
+            NotificationIpcRequest::OpenFlow {
+                path: path.with_file_name("missing.json"),
+                workspace_id: Some(target),
+            },
+            NotificationIpcRequest::OpenFlow {
+                path: Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+                workspace_id: Some(target),
+            },
+        ] {
+            let effect = apply_ipc_request(&shared, request, Path::new("unused.sock"));
+            assert!(!effect.accepted && !effect.rebuild && !effect.activate_window);
+            let state = shared.lock().unwrap();
+            assert_eq!(state.active_workspace, 0);
+            assert!(state.settings_open);
+            assert!(state.flows.is_empty());
+        }
+        let request = NotificationIpcRequest::OpenFlow {
+            path,
+            workspace_id: Some(target),
+        };
+        let wire = serde_json::to_vec(&request).unwrap();
+        let effect = apply_ipc_request(
+            &shared,
+            serde_json::from_slice(&wire).unwrap(),
+            Path::new("unused.sock"),
+        );
+        assert!(effect.accepted && effect.rebuild && effect.activate_window);
+        let state = shared.lock().unwrap();
+        assert_eq!(state.active_workspace, 1);
+        assert!(!state.settings_open);
+        assert_eq!(
+            state.flows[&state.active_pane.0].title(),
+            "How a cache serves a request"
+        );
     }
 
     #[test]

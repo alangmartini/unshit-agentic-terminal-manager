@@ -7,6 +7,21 @@ use crate::state::{
 use crate::ui::icons::*;
 
 pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let mut sidebar = ElementDef::new(Tag::Div)
+        .with_class("sidebar")
+        .with_class("role-aside")
+        .with_id("sidebar");
+    if state.sidebar_collapsed {
+        sidebar = sidebar.with_class("collapsed");
+    }
+    if state.explorer.active {
+        if state.sidebar_collapsed {
+            return sidebar;
+        }
+        return sidebar
+            .with_child(super::explorer::build_tabs(state, shared))
+            .with_child(super::explorer::build_explorer(state, shared));
+    }
     let mut scroll = ElementDef::new(Tag::Div).with_class("sidebar-scroll");
     for (w_idx, workspace) in state.workspaces.iter().enumerate() {
         scroll = scroll.with_child(build_workspace(
@@ -18,15 +33,12 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         ));
     }
 
-    let mut sidebar = ElementDef::new(Tag::Div)
-        .with_class("sidebar")
-        .with_class("role-aside")
-        .with_id("sidebar");
-    if state.sidebar_collapsed {
-        sidebar = sidebar.with_class("collapsed");
-    }
     sidebar
-        .with_child(build_sidebar_head(shared))
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_child(super::explorer::build_tabs(state, shared))
+                .with_child(build_sidebar_head(shared)),
+        )
         .with_child(scroll)
         .with_child(build_sidebar_footer(state))
 }
@@ -484,6 +496,18 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         });
 
     let menu = match &ctx.target {
+        crate::state::CtxMenuTarget::Explorer { .. } => ElementDef::new(Tag::Div)
+            .with_class("ctx-menu")
+            .with_child(ctx_menu_item(
+                "Copy relative path",
+                shared,
+                "explorer.copy_relative".into(),
+            ))
+            .with_child(ctx_menu_item(
+                "Copy path",
+                shared,
+                "explorer.copy_absolute".into(),
+            )),
         crate::state::CtxMenuTarget::Workspace { idx } => {
             let installed = crate::shell::discover_installed();
             let agents = crate::agents::menu_profiles();
@@ -1240,6 +1264,23 @@ mod tests {
     }
 
     #[test]
+    fn hidden_explorer_has_no_keyboard_capture() {
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            crate::state::dispatch(&mut state, "explorer.show");
+            crate::state::dispatch(&mut state, "explorer.toggle");
+            assert!(!state.explorer.keyboard_focus);
+        }
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let sidebar = build_sidebar(&snapshot, &shared);
+        assert!(
+            sidebar.children.is_empty(),
+            "hidden tree must not intercept terminal keys"
+        );
+    }
+
+    #[test]
     fn build_sidebar_collapsed() {
         let shared = make_shared();
         {
@@ -1596,6 +1637,7 @@ mod tests {
                     mem_bytes: 163 << 20,
                     process_count: 4,
                     root_exe: None,
+                    processes: Default::default(),
                 },
             );
         }
@@ -1808,6 +1850,7 @@ mod tests {
                 mem_bytes: 164 << 20,
                 process_count: 5,
                 root_exe: None,
+                processes: Default::default(),
             }),
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
@@ -1822,6 +1865,7 @@ mod tests {
             mem_bytes: 1 << 30,
             process_count: 1,
             root_exe: None,
+            processes: Default::default(),
         };
         assert_eq!(usage_chip_text(&baseline_pending), "--% \u{00B7} 1.0G");
     }
