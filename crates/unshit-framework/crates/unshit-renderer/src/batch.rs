@@ -7727,11 +7727,11 @@ mod tests {
         let mut buffer = Buffer::new(&mut fs, metrics);
         buffer.set_size(&mut fs, Some(400.0), None);
         let retried = set_text_with_symbol_fallback(
-            buffer,
+            &mut buffer,
             &mut fs,
             "\u{2733} Workspace",
             text_attrs("Segoe UI", FontWeight::Normal, FontStyle::Normal),
-            Shaping::Advanced,
+            cosmic_text::Shaping::Advanced,
         );
         assert!(retried, "the label must hit the color-emoji fallback and retry");
 
