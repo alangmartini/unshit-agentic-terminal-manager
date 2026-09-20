@@ -980,6 +980,7 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
@@ -1294,6 +1295,7 @@ impl AppState {
             tab_width_px: self.tab_width_px,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
+            process_details_open: self.process_details_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
             sidebar_collapsed: self.sidebar_collapsed,
@@ -1436,6 +1438,7 @@ pub struct UiSnapshot {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
     pub sidebar_collapsed: bool,
@@ -1652,6 +1655,7 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        process_details_open: false,
         diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
@@ -7737,7 +7741,22 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         return crate::diff_review::dispatch(state, command);
     }
     match command {
+        "processes.open" => {
+            let changed = !state.process_details_open;
+            state.process_details_open = true;
+            changed
+        }
+        "processes.close" => std::mem::take(&mut state.process_details_open),
         "modal.close" => {
+            // These surfaces render above the process dialog; Escape belongs
+            // to the visible top layer (for example the window-close prompt).
+            if state.confirm_dialog.is_none()
+                && !state.palette_open
+                && state.quick_prompt.is_none()
+                && std::mem::take(&mut state.process_details_open)
+            {
+                return true;
+            }
             // The find bar is the innermost surface Escape can close, and
             // it lives inside a pane rather than over the app. Close it
             // first, but only when nothing is stacked on top: with a
@@ -10993,6 +11012,7 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            process_details_open: false,
             diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
@@ -11577,6 +11597,26 @@ pub(crate) mod tests {
     fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
+
+    #[test]
+    fn escape_closes_confirmation_above_process_details_first() {
+        let mut state = seed_state();
+        dispatch(&mut state, "processes.open");
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.process_details_open);
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.process_details_open);
+    }
+
+    #[test]
+    fn process_details_open_and_escape_close() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "processes.open"));
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dispatch(&mut state, "processes.close"));
     }
 
     #[test]

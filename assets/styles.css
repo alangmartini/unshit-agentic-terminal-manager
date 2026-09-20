@@ -8252,3 +8252,18 @@ body.dragging-pane {
   color: var(--fg-primary);
   background: var(--bg-hover);
 }
+
+/* Active tab process breakdown. */
+#status-tab-usage { cursor: pointer; background: transparent; border: none; }
+#status-tab-usage:hover, #status-tab-usage:focus { background: var(--bg-hover); }
+.process-dialog { display: flex; width: 560px; min-width: 0; max-width: 90%; max-height: 80%; }
+.process-list { display: flex; flex-direction: column; min-height: 0; overflow-y: auto; flex-shrink: 1; }
+.process-row { display: flex; flex-shrink: 0; align-items: center; gap: 12px; padding: 8px 0; color: var(--fg-primary); font-size: 12px; }
+.process-head { border-bottom: 1px solid var(--border-default); color: var(--fg-secondary); }
+.process-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.process-pid { width: 64px; text-align: right; }
+.process-ram { width: 88px; text-align: right; }
+.process-share { width: 56px; text-align: right; }
+.process-note { color: var(--fg-secondary); font-size: 11px; margin-top: 12px; margin-bottom: 16px; flex-shrink: 0; }
+
+.process-dialog .confirm-dialog-buttons { display: flex; flex-shrink: 0; }
