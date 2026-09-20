@@ -128,7 +128,7 @@ cargo build --release -p unshit-ptyd --bin unshit-ptyd
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.5.0-setup.exe`.
+The result is `dist\terminal-manager-0.6.0-setup.exe`.
 
 ## Usage
 
@@ -169,6 +169,7 @@ On macOS, the application data root is `~/Library/Application Support/com.godly.
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
 | Agent tab classification, launch, kill and detection-rule reload events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
+| Update checks, downloads, digest verification and installer hand-off | `%APPDATA%\com.godly.terminal\update-events.jsonl` |
 | Terminal mode changes (alternate screen, mouse reporting) and selection auto-scroll events | `%APPDATA%\com.godly.terminal\terminal-events.jsonl` |
 | Editor pane opens, saves, pastes, find and quick open events | `%APPDATA%\com.godly.terminal\editor-events.jsonl` |
 | Diff pane requests, navigation and file opens | `%APPDATA%\com.godly.terminal\diff-events.jsonl` |

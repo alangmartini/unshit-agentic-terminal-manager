@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-20
+
+The biggest release since the Rust rewrite. **macOS** joins Windows on one
+shared codebase: the same app, daemon, file explorer, process details and
+scrollbars, with platform modules for native shortcuts, Unix sockets,
+diagnostics, Metal rendering and an application bundle built by
+`scripts/package-macos.sh`. The app now **updates itself** from GitHub
+Releases — a startup prompt and **Settings › Updates** download the
+installer, verify its SHA-256 digest, save the layout, stop the daemon and
+hand off to the installer, which relaunches the app. An agent started by
+typing `codex` or `claude` into a plain terminal is finally filed under
+**agents** because the resource monitor recognises its process, and
+`agent-detection.json` teaches it new harnesses. A **workspace file
+explorer** opens with `Ctrl+B`, the tab status opens a live **process
+breakdown**, the diff review loads **patch files** and compares **branch
+tips**, skill flows export to standalone HTML and install into local
+agents, and scrollbars grew visible tracks with arrow controls.
+
+### Added
+
+- **Self-update.** The app checks GitHub Releases shortly after startup and,
+  once per new version, offers to install it; **Settings › Updates** shows the
+  running version with *check for updates*, *install and restart* and a switch
+  for the startup check. Installing downloads the release installer, verifies
+  its size and SHA-256 digest, saves the workspace layout, stops the session
+  daemon and hands off to the installer, which waits for the app to exit,
+  installs silently and relaunches it. Workspaces and tabs come back with
+  fresh shells; the prompt says so and nothing installs without a click.
+  A release whose installer carries no published SHA-256 checksum is never
+  installed automatically; Settings shows why and points at the release
+  page. Copies not set up by the installer (source builds) get *open release
+  page* instead. Dev and test profiles never poll GitHub unless
+  `TM_UPDATE_FEED_URL` points them at a feed; `TM_UPDATE_STARTUP_DELAY_MS`
+  and `TM_UPDATE_INSTALL_SCOPE` cover the other knobs. Every step is
+  recorded in the profile's `update-events.jsonl`. The installer side of the
+  hand-off ships with this release and is first used when the *next* release
+  is installed through the app.
+
+- **macOS support.** Windows and macOS share one application codebase.
+  Platform modules cover native shortcuts and `Cmd` modifiers, Unix-socket
+  daemon transport (the daemon reaps terminated children outside PTY
+  teardown, where a Bash session's exit used to deadlock), diagnostics and
+  resource monitoring, and the renderer bounds Metal frame submissions and
+  reaps completed work before a resize.
+  `scripts/package-macos.sh` builds **Terminal Manager.app** with both
+  executables under `Contents/MacOS/`; macOS 11 or newer, Apple silicon is
+  the verified target. The quality gate now checks both platforms and
+  builds the macOS bundle. Development CI bundles are not a signed or
+  notarized public release; the Windows installer remains the shipped
+  artifact of this version.
+- **Custom agent detection rules.** `agent-detection.json` beside
+  `workspaces.json` in the profile's config directory lists extra
+  harnesses to recognise by executable basename and, optionally, an exact
+  argument prefix. The monitor re-reads the file once a second, an invalid
+  edit keeps the last valid rules active, and deleting the file removes
+  custom detection. Each reload transition lands in `agent-events.jsonl`
+  as `agent.rules_loaded` (with the rule count) or `agent.rules_rejected`
+  (with the fixed-template reason, never the file's contents), so a rule
+  that is not taking effect can be diagnosed from telemetry alone.
+  Built-in detection wins over custom
+  rules and the outermost detected harness wins when agents launch other
+  agents. Rules classify panes only; they add no launch command or
+  conversation recovery. `assets/agent-detection.example.json` shows the
+  format and the README documents the limits.
+- **Workspace file explorer.** `Ctrl+B` opens a file tree for the active
+  workspace with keyboard selection, opening files in editor panes and a
+  background directory refresh; selected rows are revealed through the
+  framework's scrolling. Daemon-owned terminal sessions are untouched.
+- **Process breakdown from the tab status.** The active tab's resource
+  summary opens a live list of its processes with names, PIDs, working-set
+  memory and percentage shares per split pane, fed by the background
+  sampler; nothing is rebuilt while the dialog is closed.
+- **Patch files in the diff review.** The review pane loads a local
+  `.patch`/`.diff` file with bounded parsing, file navigation and the
+  existing unified and split views, beside the branch comparison controls.
+- **Branch comparison in the diff review.** Independent *From* and *To*
+  inputs compare committed branch tips directly while merge-base comparison
+  stays available; an empty base resolves to the local default-branch ref
+  and invalid refs produce actionable errors. Git stays read-only and off
+  the UI thread.
+- **Skill flow HTML and flow skills for local agents.** A standalone
+  skill-flow HTML exporter with progressive navigation, readable graph cards,
+  source inspection and a connection drawer, plus a schema document and an
+  example; **Settings › Agent skills** installs and updates the flow
+  visualization skills for supported local clients without overwriting
+  customised copies, and the CLI hand-off opens generated diagrams in the
+  running app.
+- **Visible scrollbars with arrow controls.** Scrollbar tracks and thumbs
+  are visible on light and dark surfaces and both axes gained bounded arrow
+  controls, keeping thumb dragging and track navigation.
+
+### Fixed
+
+- **Manually started agents are filed under `agents`.** Typing `codex`,
+  `claude`, `gemini`, `opencode`, `aider` or `copilot` into a plain
+  terminal used to leave the pane under `terminals` unless the harness
+  happened to set a recognisable window title. The Windows background
+  resource monitor now recognises native agent executables and the known
+  runtime entrypoints the npm-installed CLIs run through inside each
+  session's process tree, moves the pane to `agents` on the next
+  successful scan (normally within a second) and clears the tag again
+  when the harness exits. Explicit launches and session hooks keep their
+  priority, titles remain a fallback for harnesses the scan does not
+  recognise, and a scan that cannot read a runtime's command line leaves
+  the pane's membership unchanged rather than claiming the agent exited.
+  Restored layouts drop persisted process tags until a fresh scan confirms
+  them. Each transition lands in `agent-events.jsonl` as `agent.classified`
+  / `agent.untagged` with `"source":"process"`.
+- **Text selection after spaces and punctuation.** Selection offsets are
+  preserved across shaping runs, so a selection that crosses a space or a
+  punctuation mark no longer drifts.
+- **Stale wrapped-text measurements.** Widening a pane no longer reuses the
+  narrow layout's wrapped text as its intrinsic size.
+- **Glyph stroke tearing at fractional pixel positions.** Unscaled
+  grayscale and subpixel glyph quads snap to device pixels after
+  translation; scaled and rotated text keeps its affine transform. GPU
+  readback regressions cover fractional baselines, translation offsets and
+  1x/4x MSAA.
+- **Agent and terminal tab navigation.** The tab bar and keyboard cycling
+  follow the focused pane group, mixed splits keep matching focus, and drag
+  slots translate to workspace tab positions.
+- **Terminal state across reattachment and scrolling.** Mouse-protocol
+  modes survive the UI reattaching to a daemon session and older snapshots
+  without them stay readable; alternate-screen scrolling no longer leaks
+  rows into history, and a top-anchored history region keeps its
+  scrollback.
+
+### Changed
+
+- **Coalesced grid updates and live resize.** External event sinks keep
+  only the latest frame from high-rate grid producers instead of queueing
+  obsolete ones, the startup splash rasterises the small static UI text set
+  and primes the text-measure and glyph-atlas caches so a rarely opened
+  route no longer pays that cost on first open, and live resizes report the
+  time spent reconfiguring the GPU surface.
+- **`main` is the integration branch** for both platforms; feature and fix
+  branches start from it and pull requests target it. `docs/DEVELOPMENT.md`
+  describes the branch and release policy. The `v0.5.0` tag and the old
+  platform branches are retained.
+
 ## [0.5.0] - 2026-09-13
 
 Two ways of reading code land together. The file editor becomes one worth
@@ -830,7 +970,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.2...v0.3.3
