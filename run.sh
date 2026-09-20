@@ -7,6 +7,11 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
 
-export SDKROOT="$(xcrun --sdk macosx26.5 --show-sdk-path)"
+if [[ "$(uname -s)" == Darwin && -z "${SDKROOT:-}" ]]; then
+    # Prefer the SDK compatible with this development machine when installed;
+    # other Macs use their selected SDK, and explicit SDKROOT always wins.
+    SDKROOT="$(xcrun --sdk macosx26.5 --show-sdk-path 2>/dev/null || xcrun --sdk macosx --show-sdk-path)"
+    export SDKROOT
+fi
 
 exec cargo run "$@"

@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, feat/rust-terminal-manager]
+    branches: [main, feat/rust-terminal-manager, feat/macos-terminal-manager]
 
 concurrency:
   group: pr-quality-gate-${{ github.head_ref || github.ref }}
@@ -59,6 +59,35 @@ jobs:
       # configuration that gives a signal a reviewer can trust.
       - name: Run tests
         run: cargo test --all -- --test-threads=1
+
+  macos-checks:
+    name: macOS Checks
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy lints
+        run: cargo clippy -- -D warnings
+      - name: Run tests
+        run: cargo test --all -- --test-threads=1
+      - name: Check development cleanup
+        run: python3 scripts/tests/test_kill_all.py
+      - name: Build application bundle
+        run: |
+          scripts/package-macos.sh
+          ditto -c -k --sequesterRsrc --keepParent "dist/Terminal Manager.app" dist/terminal-manager-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-manager-macos
+          path: dist/*.zip
+          if-no-files-found: error
 
   repair-failing-checks:
     name: Repair Failing Checks
