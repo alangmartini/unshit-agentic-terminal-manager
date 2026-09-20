@@ -3007,9 +3007,11 @@ fn walk_for_batch(
         let (v_geom, h_geom) =
             scroll::compute_scrollbar_geometry(arena, node_id, render_x, render_y);
 
-        const TRACK_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.0];
+        // Neutral controls remain visible even when a dark container inherits
+        // the default black text color and only its children style their text.
+        const TRACK_COLOR: [f32; 4] = [0.5, 0.5, 0.5, 0.12];
         const CORNER_RADIUS: f32 = 4.0;
-        const THUMB_INSET: f32 = 4.0;
+        const THUMB_INSET: f32 = 2.0;
 
         let mut push_scrollbar_quad =
             |pos: [f32; 2], size: [f32; 2], color: [f32; 4], radius: f32| {
@@ -3039,7 +3041,7 @@ fn walk_for_batch(
 
         for geom in [v_geom.as_ref(), h_geom.as_ref()].into_iter().flatten() {
             let alpha = scrollbar_state.thumb_alpha(node_id, geom.axis);
-            let thumb_color = [1.0, 1.0, 1.0, alpha];
+            let thumb_color = [0.55, 0.55, 0.55, alpha];
             let (thumb_pos, thumb_size) = match geom.axis {
                 scroll::ScrollbarAxis::Vertical => (
                     [geom.thumb_x + THUMB_INSET, geom.thumb_y],
@@ -3050,13 +3052,60 @@ fn walk_for_batch(
                     [geom.thumb_w, (geom.thumb_h - THUMB_INSET * 2.0).max(1.0)],
                 ),
             };
-            push_scrollbar_quad(
-                [geom.track_x, geom.track_y],
-                [geom.track_w, geom.track_h],
-                TRACK_COLOR,
-                CORNER_RADIUS,
-            );
+            let (track_pos, track_size) = match geom.axis {
+                scroll::ScrollbarAxis::Vertical => (
+                    [geom.track_x, geom.track_y - geom.button_size],
+                    [geom.track_w, geom.track_h + 2.0 * geom.button_size],
+                ),
+                scroll::ScrollbarAxis::Horizontal => (
+                    [geom.track_x - geom.button_size, geom.track_y],
+                    [geom.track_w + 2.0 * geom.button_size, geom.track_h],
+                ),
+            };
+            push_scrollbar_quad(track_pos, track_size, TRACK_COLOR, 0.0);
             push_scrollbar_quad(thumb_pos, thumb_size, thumb_color, CORNER_RADIUS);
+            // Small filled arrows, built from scanlines so they share the
+            // scrollbar's quad clipping and need no font glyphs or atlas work.
+            if geom.button_size >= 8.0 {
+                let arrow_color = [0.55, 0.55, 0.55, 0.9];
+                for end in [false, true] {
+                    for row in 0..4 {
+                        let width = 1.0 + row as f32 * 2.0;
+                        let direction = if end { -1.0 } else { 1.0 };
+                        let (pos, size) = match geom.axis {
+                            scroll::ScrollbarAxis::Vertical => {
+                                let center = if end {
+                                    geom.track_y + geom.track_h + geom.button_size / 2.0
+                                } else {
+                                    geom.track_y - geom.button_size / 2.0
+                                };
+                                (
+                                    [
+                                        geom.track_x + (geom.track_w - width) / 2.0,
+                                        center + direction * (row as f32 - 1.5),
+                                    ],
+                                    [width, 1.0],
+                                )
+                            }
+                            scroll::ScrollbarAxis::Horizontal => {
+                                let center = if end {
+                                    geom.track_x + geom.track_w + geom.button_size / 2.0
+                                } else {
+                                    geom.track_x - geom.button_size / 2.0
+                                };
+                                (
+                                    [
+                                        center + direction * (row as f32 - 1.5),
+                                        geom.track_y + (geom.track_h - width) / 2.0,
+                                    ],
+                                    [1.0, width],
+                                )
+                            }
+                        };
+                        push_scrollbar_quad(pos, size, arrow_color, 0.0);
+                    }
+                }
+            }
         }
     }
 

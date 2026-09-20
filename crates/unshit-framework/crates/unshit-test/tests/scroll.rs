@@ -405,6 +405,113 @@ fn scroll_container_found_from_child() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn scrollbar_arrow_buttons_step_and_clamp() {
+    let mut h = make_harness(scroll_css());
+    h.step();
+    let snap = h.query(".scroll-container").unwrap();
+    let x = snap.layout_rect.x + snap.layout_rect.width - 6.0;
+    let top = snap.layout_rect.y + 9.0;
+    let bottom = snap.layout_rect.y + snap.layout_rect.height - 9.0;
+    h.click(x, bottom);
+    let offset = h.query(".scroll-container").unwrap().scroll_y;
+    assert!(offset > 0.0 && offset < 200.0, "arrow should scroll a small step");
+    h.click(x, top);
+    assert_eq!(h.query(".scroll-container").unwrap().scroll_y, 0.0);
+    h.click(x, top);
+    assert_eq!(h.query(".scroll-container").unwrap().scroll_y, 0.0);
+    for _ in 0..30 {
+        h.click(x, bottom);
+    }
+    assert_eq!(h.query(".scroll-container").unwrap().scroll_y, 390.0);
+}
+
+#[test]
+fn scrollbar_horizontal_arrows_preserve_vertical_position() {
+    let css = ".root { width: 200px; height: 200px; overflow: auto; }
+               .item { width: 500px; height: 500px; }";
+    let mut h = TestHarness::new(
+        css,
+        || ElementTree {
+            root: ElementDef::new(Tag::Div)
+                .with_class("root")
+                .with_child(ElementDef::new(Tag::Div).with_class("item")),
+        },
+        200.0,
+        200.0,
+    );
+    h.step();
+    h.mouse_wheel(50.0, 50.0, 0.0, -100.0);
+    h.click(179.0, 194.0);
+    let snap = h.query(".root").unwrap();
+    assert_eq!((snap.scroll_x, snap.scroll_y), (40.0, 100.0));
+    h.click(9.0, 194.0);
+    let snap = h.query(".root").unwrap();
+    assert_eq!((snap.scroll_x, snap.scroll_y), (0.0, 100.0));
+    // The shared bottom-right corner belongs to neither scrollbar.
+    assert!(unshit_core::scroll::find_scrollbar_at(h.arena(), h.root(), 194.0, 194.0).is_none());
+}
+
+#[test]
+fn scrollbar_geometry_stays_inside_small_containers() {
+    use unshit_core::scroll::compute_scrollbar_geometry;
+    for size in [12.0, 20.0, 36.0, 48.0, 200.0] {
+        let css = format!(
+            ".root {{ width: {size}px; height: {size}px; overflow: auto; }}
+                           .item {{ width: 500px; height: 500px; }}"
+        );
+        let mut h = TestHarness::new(
+            &css,
+            || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("root")
+                    .with_child(ElementDef::new(Tag::Div).with_class("item")),
+            },
+            200.0,
+            200.0,
+        );
+        h.step();
+        let (v, horizontal) = compute_scrollbar_geometry(h.arena(), h.root(), 0.0, 0.0);
+        let v = v.unwrap();
+        let horizontal = horizontal.unwrap();
+        assert!(v.track_y - v.button_size >= 0.0);
+        assert!(v.track_y + v.track_h + v.button_size <= horizontal.track_y);
+        assert!(horizontal.track_x - horizontal.button_size >= 0.0);
+        assert!(horizontal.track_x + horizontal.track_w + horizontal.button_size <= v.track_x);
+        assert!(v.thumb_h <= v.track_h && horizontal.thumb_w <= horizontal.track_w);
+    }
+}
+
+#[test]
+fn scrollbar_is_visible_on_light_and_dark_surfaces() {
+    for (background, light) in [("#ffffff", true), ("#111111", false)] {
+        let css = format!(
+            ".root {{ width: 200px; height: 200px; overflow: auto; background: {background}; }}
+                           .item {{ width: 100px; height: 600px; }}"
+        );
+        let mut h = TestHarness::new(
+            &css,
+            || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("root")
+                    .with_child(ElementDef::new(Tag::Div).with_class("item")),
+            },
+            200.0,
+            200.0,
+        )
+        .with_gpu();
+        h.step();
+        let pixels = h.render();
+        let sample = |x: usize, y: usize| pixels[(y * 200 + x) * 4] as i32;
+        let background = sample(180, 40);
+        let contrast = |value: i32| if light { background - value } else { value - background };
+        assert!(contrast(sample(194, 40)) >= 40, "idle thumb should be visible");
+        assert!(contrast(sample(194, 150)) >= 10, "track should be visible");
+        assert!(contrast(sample(194, 9)) >= 60, "top arrow should be visible");
+        assert!(contrast(sample(194, 190)) >= 60, "bottom arrow should be visible");
+    }
+}
+
+#[test]
 fn scrollbar_thumb_drag_scrolls() {
     let mut h = make_harness(scroll_css());
     h.step();

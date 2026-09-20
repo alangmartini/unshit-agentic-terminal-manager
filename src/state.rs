@@ -190,6 +190,8 @@ pub struct CtxMenu {
 /// set the overlay renders and which dispatch commands it emits.
 #[derive(Clone, Debug)]
 pub enum CtxMenuTarget {
+    /// File/folder menu retains its original workspace root across navigation.
+    Explorer { path: PathBuf, root: PathBuf },
     /// Menu opened on a workspace row in the sidebar.
     Workspace { idx: usize },
     /// Menu opened on a tab in the tabbar. Carries the active pane id
@@ -352,6 +354,7 @@ pub enum SettingsSection {
     Keybinds,
     Sessions,
     Notifications,
+    AgentSkills,
     DangerZone,
 }
 
@@ -363,17 +366,19 @@ impl SettingsSection {
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::AgentSkills => "agent skills",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 6] {
+    pub fn all() -> [SettingsSection; 7] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
             SettingsSection::Notifications,
+            SettingsSection::AgentSkills,
             SettingsSection::DangerZone,
         ]
     }
@@ -954,6 +959,7 @@ pub struct AppState {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     /// Theme id that was last published to visible terminal grids. Empty
@@ -980,9 +986,11 @@ pub struct AppState {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub diff_review: Option<crate::diff_review::Review>,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Last window maximized state reported by the framework.
@@ -1281,6 +1289,7 @@ impl AppState {
             active_pane: self.active_pane,
             settings_open: self.settings_open,
             settings_section: self.settings_section,
+            flow_skill_installations: self.flow_skill_installations.clone(),
             theme: self.theme.clone(),
             custom_theme: self.custom_theme,
             config_font_size_pt: self.config_font_size_pt,
@@ -1294,8 +1303,10 @@ impl AppState {
             tab_width_px: self.tab_width_px,
             toggles: self.toggles.clone(),
             palette_open: self.palette_open,
+            process_details_open: self.process_details_open,
             palette_query: self.palette_query.clone(),
             palette_active: self.palette_active,
+            explorer: self.explorer.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             window_maximized: self.window_maximized,
@@ -1422,6 +1433,7 @@ pub struct UiSnapshot {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     pub config_font_size_pt: u32,
@@ -1436,8 +1448,10 @@ pub struct UiSnapshot {
     pub tab_width_px: u32,
     pub toggles: BTreeMap<ToggleKey, bool>,
     pub palette_open: bool,
+    pub process_details_open: bool,
     pub palette_query: String,
     pub palette_active: usize,
+    pub explorer: crate::explorer::Explorer,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     /// Mirrors `AppState::window_maximized` so titlebar controls can
@@ -1638,6 +1652,7 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
+        flow_skill_installations: Vec::new(),
         theme: theme::default_theme_id().to_string(),
         custom_theme: theme::default_custom_theme(),
         last_terminal_theme_painted: String::new(),
@@ -1652,9 +1667,11 @@ pub fn seed_state() -> AppState {
         tab_width_px: DEFAULT_TAB_WIDTH_PX,
         toggles,
         palette_open: false,
+        process_details_open: false,
         diff_review: None,
         palette_query: String::new(),
         palette_active: 0,
+        explorer: crate::explorer::Explorer::default(),
         sidebar_collapsed: false,
         sidebar_width: 252.0,
         window_maximized: false,
@@ -1762,13 +1779,80 @@ fn load_tab_state(state: &mut AppState) {
     state.col_ratios = tab.col_ratios.clone();
 }
 
+/// Workspace tab indices belonging to the focused pane's group. Mixed
+/// splits belong to both groups; the active tab uses its live pane layout.
+pub fn grouped_tab_indices(
+    tabs: &[TerminalTab],
+    active_tab: usize,
+    live_panes: &[Vec<Pane>],
+    active_pane: PaneId,
+    is_agent: impl Fn(u32) -> bool,
+) -> Vec<usize> {
+    let active_is_agent = is_agent(active_pane.0);
+    tabs.iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            let panes = if index == active_tab {
+                live_panes
+            } else {
+                &tab.panes
+            };
+            (index == active_tab
+                || panes
+                    .iter()
+                    .flatten()
+                    .any(|pane| is_agent(pane.id.0) == active_is_agent))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn visible_tab_indices(state: &AppState) -> Vec<usize> {
+    grouped_tab_indices(
+        &state.tabs,
+        state.active_tab,
+        &state.panes,
+        state.active_pane,
+        |id| is_agent_pane(state, id),
+    )
+}
+
+/// Translate a visible insertion slot back into the workspace's tab order.
+fn grouped_tab_drop_index(
+    cursor_x: f32,
+    cursor_y: f32,
+    rect: crate::drag::Rect,
+    visible: &[usize],
+) -> Option<usize> {
+    let slot = crate::drag::resolve_tabbar_drop(cursor_x, cursor_y, rect, visible.len())?;
+    Some(
+        visible
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| visible.last().map_or(0, |index| index + 1)),
+    )
+}
+
 pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     if new_index >= state.tabs.len() || new_index == state.active_tab {
         return;
     }
+    let agents = is_agent_pane(state, state.active_pane.0);
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+    // A mixed split may have last focused the other group.
+    if is_agent_pane(state, state.active_pane.0) != agents {
+        if let Some(pane) = state
+            .panes
+            .iter()
+            .flatten()
+            .find(|pane| is_agent_pane(state, pane.id.0) == agents)
+        {
+            state.active_pane = pane.id;
+            state.tabs[new_index].active_pane = pane.id;
+        }
+    }
 }
 
 fn save_workspace_state(state: &mut AppState) {
@@ -1810,6 +1894,7 @@ pub fn mutate_switch_workspace(state: &mut AppState, new_index: usize) {
     // The index describes the workspace we just left.
     state.file_index = None;
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn focus_workspace_pane_by_num(state: &mut AppState, workspace_id: u32, pane_id: u32) -> bool {
@@ -2011,6 +2096,12 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
     pane_id
+}
+
+/// Record the `flow.open` lifecycle event and open the pane as a new tab.
+pub(crate) fn open_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    record_flow_pane_event(&pane, "flow.open", "info", None);
+    mutate_add_flow_tab(state, pane)
 }
 
 /// Open a Flow Explorer pane as a new single-pane tab. Mirrors
@@ -3150,6 +3241,7 @@ pub fn mutate_remove_workspace(state: &mut AppState, idx: usize) {
         old_active
     };
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 pub fn find_pane_coord(state: &AppState, target: PaneId) -> Option<(usize, usize)> {
@@ -4369,6 +4461,7 @@ fn prune_close_layout_to_kept_panes(state: &mut AppState, kept_pane_ids: &BTreeS
         }
     }
     load_workspace_state(state);
+    sync_explorer(state);
 }
 
 /// Resolve the close-button click against the persisted preference
@@ -5299,6 +5392,161 @@ fn dispatch_palette_files(state: &mut AppState) -> bool {
     true
 }
 
+/// Whether the explorer tree is the visible sidebar panel.
+fn explorer_visible(state: &AppState) -> bool {
+    state.explorer.active && !state.sidebar_collapsed
+}
+
+/// Open the explorer panel on the active workspace's root, without moving
+/// keyboard focus into its tree.
+fn show_explorer(state: &mut AppState) {
+    state.explorer.active = true;
+    state.sidebar_collapsed = false;
+    sync_explorer(state);
+}
+
+pub fn sync_explorer(state: &mut AppState) {
+    let root = active_workspace_cwd(state);
+    state.explorer.set_root(root.clone());
+    if explorer_visible(state) {
+        if let Some(root) = root {
+            load_explorer_directory(state, root);
+        }
+        continue_explorer_restore(state);
+    }
+}
+
+fn load_expanded_explorer_directories(state: &mut AppState) {
+    if !explorer_visible(state) {
+        return;
+    }
+    let pending: Vec<_> = state
+        .explorer
+        .expanded
+        .iter()
+        .filter(|path| {
+            state.explorer.directory_visible(path)
+                && state.explorer.is_directory(path)
+                && !state.explorer.listings.contains_key(*path)
+        })
+        .cloned()
+        .collect();
+    for path in pending {
+        load_explorer_directory(state, path);
+    }
+}
+
+fn continue_explorer_restore(state: &mut AppState) {
+    load_expanded_explorer_directories(state);
+    if !explorer_visible(state) || !state.explorer.restore_selection {
+        return;
+    }
+    if let (Some(selected), Some(hooks)) =
+        (state.explorer.selected.clone(), EDITOR_OPEN_HOOKS.get())
+    {
+        if state.explorer.visible_paths().contains(&selected) {
+            state.explorer.restore_selection = false;
+            (hooks.request_reveal)(crate::explorer::row_id(&selected));
+        }
+    }
+}
+
+fn dispatch_explorer_reveal(state: &mut AppState) -> bool {
+    let Some(editor) = state.editors.get(&state.active_pane.0) else {
+        push_error_toast(state, "Open a file in the editor to reveal it in Explorer.");
+        return true;
+    };
+    let target = editor.path.clone();
+    let Some(root) = active_workspace_cwd(state) else {
+        push_error_toast(state, "This workspace has no folder to reveal files in.");
+        return true;
+    };
+    show_explorer(state);
+    let generation = state.explorer.generation;
+    let selected = state.explorer.selected.clone();
+    state.explorer.reveal_revision = state.explorer.reveal_revision.wrapping_add(1);
+    let revision = state.explorer.reveal_revision;
+    let pane = state.active_pane;
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return true;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-reveal".into())
+        .spawn(move || {
+            let result = crate::explorer::reveal_path(&root, &target);
+            let mut state = hooks.shared.lock_recover();
+            if state.explorer.generation != generation
+                || state.explorer.reveal_revision != revision
+                || state.active_pane != pane
+                || state.explorer.selected != selected
+                || !explorer_visible(&state)
+            {
+                return;
+            }
+            match result {
+                Ok((target, listings)) => {
+                    for (path, listing) in listings {
+                        state.explorer.expanded.insert(path.clone());
+                        state.explorer.accept(generation, path, listing);
+                    }
+                    state.explorer.selected = Some(target.clone());
+                    drop(state);
+                    (hooks.request_reveal)(crate::explorer::row_id(&target));
+                }
+                Err(error) => {
+                    push_error_toast(&mut state, format!("Could not reveal file: {error}"));
+                    drop(state);
+                    (hooks.request_rebuild)();
+                }
+            }
+        })
+    {
+        push_error_toast(state, format!("Could not reveal file: {error}"));
+    }
+    true
+}
+
+pub fn load_explorer_directory(state: &mut AppState, path: PathBuf) {
+    use crate::explorer::Listing;
+    if state.explorer.listings.contains_key(&path) {
+        return;
+    }
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    let generation = state.explorer.generation;
+    let pending = Arc::new(Listing::Loading);
+    state
+        .explorer
+        .listings
+        .insert(path.clone(), pending.clone());
+    let worker_path = path.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-list".into())
+        .spawn(move || {
+            let listing = crate::explorer::read_directory(&worker_path);
+            {
+                let mut state = hooks.shared.lock_recover();
+                if state.explorer.generation != generation {
+                    return;
+                }
+                if !state
+                    .explorer
+                    .update_listing(generation, worker_path, &pending, listing)
+                {
+                    return;
+                }
+                continue_explorer_restore(&mut state);
+            }
+            (hooks.request_rebuild)();
+        })
+    {
+        state
+            .explorer
+            .accept(generation, path, Listing::Error(error.to_string()));
+    }
+}
+
 /// Build (or rebuild) the quick-open index for the active workspace on a
 /// worker thread, unless a fresh one for the same root is already here.
 ///
@@ -5618,6 +5866,7 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "tabs.worktree_mode.toggle"
             | "pane.close"
             | "sidebar.toggle"
+            | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
             | "editor.open"
@@ -5782,6 +6031,7 @@ fn editor_viewport_dims(state: &AppState) -> (usize, usize) {
 pub struct EditorOpenHooks {
     pub shared: SharedState,
     pub request_rebuild: Box<dyn Fn() + Send + Sync>,
+    pub request_reveal: Box<dyn Fn(String) + Send + Sync>,
 }
 
 static EDITOR_OPEN_HOOKS: std::sync::OnceLock<std::sync::Arc<EditorOpenHooks>> =
@@ -5791,6 +6041,58 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
     let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+}
+
+/// Polls visible explorer folders for filesystem changes about once a
+/// second (see `refresh_explorer_once`). No-op if hooks are not registered.
+pub fn start_explorer_refresh() {
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-refresh".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if refresh_explorer_once(&hooks.shared) {
+                (hooks.request_rebuild)();
+            }
+        })
+    {
+        log::warn!("Could not start explorer refresh: {error}");
+    }
+}
+
+/// Filesystem work runs only on the refresh worker, outside the state lock.
+/// One batch produces at most one rebuild, and quiet/hidden trees produce none.
+fn refresh_explorer_once(shared: &SharedState) -> bool {
+    let (generation, targets) = {
+        let state = shared.lock_recover();
+        if !explorer_visible(&state) {
+            return false;
+        }
+        (state.explorer.generation, state.explorer.refresh_targets())
+    };
+    let updates: Vec<_> = targets
+        .into_iter()
+        .map(|(path, previous)| {
+            let listing = crate::explorer::read_directory(&path);
+            (path, previous, listing)
+        })
+        .collect();
+    let mut state = shared.lock_recover();
+    if !explorer_visible(&state) {
+        return false;
+    }
+    let mut changed = false;
+    for (path, previous, listing) in updates {
+        changed |= state
+            .explorer
+            .update_listing(generation, path, &previous, listing);
+    }
+    if changed {
+        continue_explorer_restore(&mut state);
+    }
+    changed
 }
 
 /// Handle `editor.open` (no path): native file picker, routed back
@@ -7321,8 +7623,7 @@ pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
     let path = std::path::PathBuf::from(trimmed);
     match crate::flow_explorer::FlowPane::open(&path) {
         Ok(pane) => {
-            record_flow_pane_event(&pane, "flow.open", "info", None);
-            let pane_id = mutate_add_flow_tab(state, pane);
+            let pane_id = open_flow_tab(state, pane);
             record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
         }
         Err(err) => {
@@ -7666,11 +7967,36 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command == "review.patch_open" {
+        let start_dir = active_workspace_cwd(state);
+        return spawn_file_picker(
+            state,
+            "Open patch",
+            Some(("Patch files", &["patch", "diff"])),
+            start_dir,
+            |path| format!("review.patch:{}", path.display()),
+        );
+    }
     if command.starts_with("review.") {
         return crate::diff_review::dispatch(state, command);
     }
     match command {
+        "processes.open" => {
+            let changed = !state.process_details_open;
+            state.process_details_open = true;
+            changed
+        }
+        "processes.close" => std::mem::take(&mut state.process_details_open),
         "modal.close" => {
+            // These surfaces render above the process dialog; Escape belongs
+            // to the visible top layer (for example the window-close prompt).
+            if state.confirm_dialog.is_none()
+                && !state.palette_open
+                && state.quick_prompt.is_none()
+                && std::mem::take(&mut state.process_details_open)
+            {
+                return true;
+            }
             // The find bar is the innermost surface Escape can close, and
             // it lives inside a pane rather than over the app. Close it
             // first, but only when nothing is stacked on top: with a
@@ -7903,6 +8229,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.keybinds.error = None;
             } else {
                 state.settings_open = true;
+                if state.settings_section == SettingsSection::AgentSkills {
+                    refresh_flow_skills(state);
+                }
             }
             true
         }
@@ -8198,24 +8527,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             request_close_tab(state, idx);
             true
         }
-        "tab.next" => {
-            if state.tabs.len() <= 1 {
+        "tab.next" | "tab.prev" => {
+            let visible = visible_tab_indices(state);
+            if visible.len() <= 1 {
                 return false;
             }
-            let new_idx = (state.active_tab + 1) % state.tabs.len();
-            mutate_switch_tab(state, new_idx);
-            true
-        }
-        "tab.prev" => {
-            if state.tabs.len() <= 1 {
-                return false;
-            }
-            let new_idx = if state.active_tab == 0 {
-                state.tabs.len() - 1
+            let current = visible
+                .iter()
+                .position(|index| *index == state.active_tab)
+                .unwrap_or(0);
+            let next = if command == "tab.next" {
+                (current + 1) % visible.len()
             } else {
-                state.active_tab - 1
+                (current + visible.len() - 1) % visible.len()
             };
-            mutate_switch_tab(state, new_idx);
+            mutate_switch_tab(state, visible[next]);
             true
         }
         "pane.split_right" => {
@@ -8261,8 +8587,66 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         other if other.starts_with("tab.reorder:") => {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
+        "explorer.copy_relative" | "explorer.copy_absolute" => {
+            let Some(CtxMenuTarget::Explorer { path, root }) =
+                state.ctx_menu.as_ref().map(|menu| &menu.target)
+            else {
+                return false;
+            };
+            let result = crate::explorer::path_for_clipboard(
+                root,
+                path,
+                command == "explorer.copy_relative",
+            );
+            state.ctx_menu = None;
+            match result {
+                Ok(path) => {
+                    if let Err(error) = state.clipboard.write_text(path) {
+                        push_error_toast(state, format!("Could not copy path: {error}"));
+                    }
+                }
+                Err(error) => push_error_toast(state, error),
+            }
+            true
+        }
+        "explorer.reveal" => dispatch_explorer_reveal(state),
+        "explorer.collapse_all" => {
+            state.explorer.collapse_all();
+            state.explorer.keyboard_focus = true;
+            if let (Some(root), Some(hooks)) = (&state.explorer.root, EDITOR_OPEN_HOOKS.get()) {
+                (hooks.request_reveal)(crate::explorer::row_id(root));
+            }
+            true
+        }
+        "explorer.toggle" => {
+            if explorer_visible(state) {
+                state.explorer.keyboard_focus = false;
+                state.sidebar_collapsed = true;
+            } else {
+                show_explorer(state);
+                state.explorer.keyboard_focus = true;
+            }
+            true
+        }
+        "explorer.show" => {
+            show_explorer(state);
+            state.explorer.keyboard_focus = true;
+            true
+        }
+        "explorer.refresh" => {
+            state.explorer.refresh();
+            sync_explorer(state);
+            true
+        }
+        "sidebar.workspaces" => {
+            state.explorer.active = false;
+            state.sidebar_collapsed = false;
+            true
+        }
         "sidebar.toggle" => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            state.explorer.keyboard_focus = false;
+            sync_explorer(state);
             true
         }
         "workspace.add" => {
@@ -8441,9 +8825,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             state.settings_open = true;
             state.settings_section = section;
-            if section == SettingsSection::Sessions {
-                refresh_sessions(state);
-            }
+            refresh_settings_section(state, section);
             true
         }
         other if other.starts_with("tab.switch:") => {
@@ -8716,6 +9098,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "agent.auto_resume.toggle" => dispatch_agent_auto_resume_toggle(state),
         "agent.recovery_hooks.remove" => dispatch_agent_recovery_hooks_remove(state),
+        "flow.skill.refresh" => {
+            refresh_flow_skills(state);
+            true
+        }
+        other if other.starts_with("flow.skill.install:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.install:".len()..], false)
+        }
+        other if other.starts_with("flow.skill.remove:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.remove:".len()..], true)
+        }
         "settings.start_at_login.toggle" => dispatch_start_at_login_toggle(state),
         "settings.start_at_login.remove" => dispatch_start_at_login_remove(state),
         other if other.starts_with("agent.resume:") => dispatch_agent_resume(state, other),
@@ -9874,6 +10266,56 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
     true
 }
 
+/// Refresh only on settings navigation/actions; rendering reads the snapshot.
+fn refresh_flow_skills(state: &mut AppState) {
+    use crate::flow_explorer::skills::{
+        InstallStatus, SkillAgent, SkillInstallation, SkillInstaller,
+    };
+    state.flow_skill_installations = match SkillInstaller::for_current_user() {
+        Ok(installer) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| installer.inspect(agent))
+            .collect(),
+        Err(error) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| SkillInstallation {
+                agent,
+                path: std::path::PathBuf::from(agent.relative_dir()),
+                status: InstallStatus::Unavailable(error.to_string()),
+            })
+            .collect(),
+    };
+}
+
+/// Refresh whichever section's data goes stale while the settings page is
+/// closed. Call after navigating to `section`, whether or not it changed.
+pub fn refresh_settings_section(state: &mut AppState, section: SettingsSection) {
+    match section {
+        SettingsSection::Sessions => refresh_sessions(state),
+        SettingsSection::AgentSkills => refresh_flow_skills(state),
+        _ => {}
+    }
+}
+
+fn dispatch_flow_skill_change(state: &mut AppState, id: &str, remove: bool) -> bool {
+    use crate::flow_explorer::skills::{SkillAgent, SkillInstaller};
+    let Some(agent) = SkillAgent::from_id(id) else {
+        return false;
+    };
+    let result = SkillInstaller::for_current_user().and_then(|installer| {
+        if remove {
+            installer.remove(agent)
+        } else {
+            installer.install(agent)
+        }
+    });
+    if let Err(error) = result {
+        push_error_toast(state, format!("{} Flow skill: {error}", agent.label()));
+    }
+    refresh_flow_skills(state);
+    true
+}
+
 /// Hydrate the runtime mirror from Windows before the first UI snapshot. The
 /// registry remains authoritative; a failed read keeps the existing safe
 /// default and is recorded without exposing paths or localized OS messages.
@@ -10458,11 +10900,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!(
                     "drag.end: extracting pane {:?} to tab index {}",
@@ -10529,11 +10971,11 @@ fn dispatch_drag_end(state: &mut AppState) -> bool {
                 state.tabs.len(),
                 state.active_tab
             );
-            if let Some(index) = crate::drag::resolve_tabbar_drop(
+            if let Some(index) = grouped_tab_drop_index(
                 cursor_x,
                 cursor_y,
                 state.tabbar_rect,
-                state.tabs.len(),
+                &visible_tab_indices(state),
             ) {
                 log::info!("drag.end: reordering tab {} to {}", source_tab, index);
                 mutate_tab_reorder(state, &source_tab, index);
@@ -10915,6 +11357,7 @@ pub(crate) mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().to_string(),
             custom_theme: crate::theme::default_custom_theme(),
             last_terminal_theme_painted: String::new(),
@@ -10929,9 +11372,11 @@ pub(crate) mod tests {
             tab_width_px: DEFAULT_TAB_WIDTH_PX,
             toggles: BTreeMap::new(),
             palette_open: false,
+            process_details_open: false,
             diff_review: None,
             palette_query: String::new(),
             palette_active: 0,
+            explorer: crate::explorer::Explorer::default(),
             sidebar_collapsed: false,
             sidebar_width: 252.0,
             window_maximized: false,
@@ -11007,15 +11452,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_six() {
+    fn settings_section_all_includes_agent_skills() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
         assert_eq!(all[3], SettingsSection::Sessions);
         assert_eq!(all[4], SettingsSection::Notifications);
-        assert_eq!(all[5], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::AgentSkills);
+        assert_eq!(all[6], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -11513,6 +11959,26 @@ pub(crate) mod tests {
     fn dispatch_shell_clear_workspace_with_malformed_index_returns_false() {
         let mut state = test_state();
         assert!(!dispatch(&mut state, "shell.clear_workspace:abc"));
+    }
+
+    #[test]
+    fn escape_closes_confirmation_above_process_details_first() {
+        let mut state = seed_state();
+        dispatch(&mut state, "processes.open");
+        state.confirm_dialog = Some(ConfirmDialog::KillAll { count: 1 });
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(state.confirm_dialog.is_none());
+        assert!(state.process_details_open);
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!state.process_details_open);
+    }
+
+    #[test]
+    fn process_details_open_and_escape_close() {
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "processes.open"));
+        assert!(dispatch(&mut state, "modal.close"));
+        assert!(!dispatch(&mut state, "processes.close"));
     }
 
     #[test]
@@ -13180,6 +13646,96 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tab_groups_drop_maps_visible_slots_to_workspace_order() {
+        let bar = crate::drag::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 40.0,
+        };
+        let visible = [1, 3];
+        assert_eq!(grouped_tab_drop_index(0.0, 20.0, bar, &visible), Some(1));
+        assert_eq!(grouped_tab_drop_index(200.0, 20.0, bar, &visible), Some(3));
+        assert_eq!(grouped_tab_drop_index(900.0, 20.0, bar, &visible), Some(4));
+        assert_eq!(grouped_tab_drop_index(200.0, 80.0, bar, &visible), None);
+    }
+
+    #[test]
+    fn tab_groups_update_when_agent_returns_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        classify_pane_title(&mut state, id, "Claude Code");
+        assert_eq!(visible_tab_indices(&state), vec![1]);
+        classify_pane_title(&mut state, id, "PowerShell");
+        assert_eq!(visible_tab_indices(&state), vec![0, 1]);
+    }
+
+    #[test]
+    fn tab_groups_single_agent_does_not_cycle_to_shell() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        state.pane_agents.insert(
+            id,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(!dispatch(&mut state, "tab.next"));
+        assert!(!dispatch(&mut state, "tab.prev"));
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn tab_groups_keep_agent_focus_when_entering_mixed_split() {
+        let mut state = test_state();
+        mutate_split_right(&mut state, PaneId(1));
+        let agent = state.panes[0][1].id;
+        state.pane_agents.insert(
+            agent.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        state.active_pane = PaneId(1);
+        mutate_add_tab(&mut state);
+        let other = state.active_pane;
+        state.pane_agents.insert(
+            other.0,
+            crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+        );
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_pane, agent);
+        assert!(dispatch(&mut state, "tab.next"));
+        assert_eq!(state.active_pane, other);
+    }
+
+    #[test]
+    fn tab_groups_cycle_only_matching_panes() {
+        let mut state = test_state();
+        for _ in 0..3 {
+            mutate_add_tab(&mut state);
+        }
+        for index in [1, 3] {
+            let id = state.tabs[index].active_pane.0;
+            state.pane_agents.insert(
+                id,
+                crate::agents::AgentTag::new("claude", crate::agents::AgentTagSource::Title),
+            );
+        }
+        mutate_switch_tab(&mut state, 0);
+        for (command, expected) in [
+            ("tab.next", 2),
+            ("tab.next", 0),
+            ("tab.prev", 2),
+            ("tab.switch:1", 1),
+            ("tab.prev", 3),
+            ("tab.next", 1),
+        ] {
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.active_tab, expected);
+        }
+    }
+
+    #[test]
     fn dispatch_tab_next_wraps() {
         let mut state = test_state();
         mutate_add_tab(&mut state);
@@ -13273,6 +13829,138 @@ pub(crate) mod tests {
             state.sidebar_width, MAX_SIDEBAR_WIDTH,
             "rejected input leaves width alone"
         );
+    }
+
+    #[test]
+    fn explorer_automatic_refresh_tracks_create_rename_delete_and_pauses_when_hidden() {
+        let root = std::env::temp_dir().join(format!("tm-explorer-poll-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let file = root.join("folder").join("before.txt");
+        std::fs::write(&file, "before").unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(seed_state()));
+        {
+            let mut state = shared.lock_recover();
+            state.workspaces[0].path = Some(root.clone());
+            dispatch(&mut state, "explorer.show");
+            let generation = state.explorer.generation;
+            state.explorer.accept(
+                generation,
+                root.clone(),
+                crate::explorer::read_directory(&root),
+            );
+            state.explorer.expanded.insert(root.join("folder"));
+            state.explorer.accept(
+                generation,
+                root.join("folder"),
+                crate::explorer::read_directory(&root.join("folder")),
+            );
+            state.explorer.selected = Some(file.clone());
+            dispatch_editor_open_path(&mut state, &file.to_string_lossy());
+        }
+        assert!(
+            !refresh_explorer_once(&shared),
+            "quiet folders must not rebuild"
+        );
+        std::fs::write(root.join("new.txt"), "new").unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(shared.lock_recover().explorer.selected, Some(file.clone()));
+        assert!(shared
+            .lock_recover()
+            .explorer
+            .expanded
+            .contains(&root.join("folder")));
+        std::fs::write(&file, "changed externally").unwrap();
+        assert!(
+            !refresh_explorer_once(&shared),
+            "content-only changes do not change the tree"
+        );
+        assert_eq!(
+            shared
+                .lock_recover()
+                .editors
+                .values()
+                .next()
+                .unwrap()
+                .buffer
+                .line(0),
+            Some("before")
+        );
+        std::fs::rename(&file, root.join("folder").join("after.txt")).unwrap();
+        assert!(refresh_explorer_once(&shared));
+        assert_eq!(
+            shared.lock_recover().explorer.selected,
+            Some(root.join("folder"))
+        );
+        assert_eq!(
+            shared.lock_recover().editors.len(),
+            1,
+            "tree refresh must keep editor buffers open"
+        );
+        shared.lock_recover().sidebar_collapsed = true;
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(!refresh_explorer_once(&shared));
+        shared.lock_recover().sidebar_collapsed = false;
+        assert!(
+            refresh_explorer_once(&shared),
+            "reopening catches up with hidden changes"
+        );
+        assert!(!refresh_explorer_once(&shared));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn explorer_copy_uses_context_path_instead_of_current_selection() {
+        let _lock = clipboard_access_guard();
+        let mut state = seed_state();
+        let root = std::env::temp_dir().join("copy-project");
+        let path = root.join("folder name").join("example.rs");
+        state.explorer.selected = Some(root.join("different.rs"));
+        for (command, expected) in [
+            (
+                "explorer.copy_relative",
+                "folder name/example.rs".to_string(),
+            ),
+            (
+                "explorer.copy_absolute",
+                path.to_string_lossy().into_owned(),
+            ),
+        ] {
+            state.ctx_menu = Some(CtxMenu {
+                x: 0.0,
+                y: 0.0,
+                target: CtxMenuTarget::Explorer {
+                    path: path.clone(),
+                    root: root.clone(),
+                },
+            });
+            assert!(dispatch(&mut state, command));
+            assert_eq!(state.clipboard.read_text().unwrap(), expected);
+            assert!(state.ctx_menu.is_none());
+        }
+        assert!(
+            !dispatch(&mut state, "explorer.copy_relative"),
+            "no menu target means no copy"
+        );
+    }
+
+    #[test]
+    fn explorer_toggle_preserves_workspace_access_and_browses_active_root() {
+        let mut state = seed_state();
+        state.workspaces[0].path = Some(PathBuf::from("project"));
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.explorer.active);
+        assert!(!state.sidebar_collapsed);
+        assert_eq!(
+            state.explorer.root.as_deref(),
+            Some(std::path::Path::new("project"))
+        );
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "explorer.toggle"));
+        assert!(!state.sidebar_collapsed);
+        assert!(dispatch(&mut state, "sidebar.workspaces"));
+        assert!(!state.explorer.active);
+        assert!(!state.sidebar_collapsed);
     }
 
     #[test]

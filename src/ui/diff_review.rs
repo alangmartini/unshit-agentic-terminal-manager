@@ -20,69 +20,79 @@ fn button(shared: &SharedState, text: &str, command: impl Into<String>) -> Eleme
         })
 }
 
-fn input(shared: &SharedState, review: &Review, count: bool) -> ElementDef {
+#[derive(Clone, Copy)]
+enum Field {
+    Count,
+    Base,
+    From,
+    To,
+}
+
+fn input(shared: &SharedState, review: &Review, field: Field) -> ElementDef {
     let change = shared.clone();
     let submit = shared.clone();
-    ElementDef::new(Tag::Input)
+    let (id, title, value, placeholder) = match field {
+        Field::Count => ("diff-count", "Count", &review.count, "Commit count"),
+        Field::Base => (
+            "diff-base",
+            "Base ref",
+            &review.base_ref,
+            "Auto: default branch",
+        ),
+        Field::From => (
+            "diff-from",
+            "From",
+            &review.from_ref,
+            "Auto: default branch",
+        ),
+        Field::To => ("diff-to", "To", &review.to_ref, "Branch, tag or commit"),
+    };
+    let input = ElementDef::new(Tag::Input)
         .with_class("diff-input")
-        .with_id(if count { "diff-count" } else { "diff-base" })
+        .with_id(id)
         .with_tab_index(0)
-        .with_value(if count {
-            &review.count
-        } else {
-            &review.base_ref
-        })
-        .with_placeholder(if count {
-            "Commit count"
-        } else {
-            "Base branch, tag or SHA"
-        })
+        .with_value(value)
+        .with_placeholder(placeholder)
         .on_change(move |text| {
             mutate_with(&change, |st| {
                 if let Some(r) = st.diff_review.as_mut() {
                     let value = text.chars().take(1024).collect();
-                    if count {
-                        r.count = value;
-                    } else {
-                        r.base_ref = value;
+                    match field {
+                        Field::Count => r.count = value,
+                        Field::Base => r.base_ref = value,
+                        Field::From => r.from_ref = value,
+                        Field::To => r.to_ref = value,
                     }
                 }
             });
         })
         .on_submit(move |_| {
             mutate_with(&submit, |st| dispatch(st, "review.refresh"));
-        })
+        });
+    ElementDef::new(Tag::Div)
+        .with_class("diff-field")
+        .with_key(id)
+        .with_child(label("diff-field-label", title))
+        .with_child(input)
 }
 
 pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let Some(review) = &snap.diff_review else {
         return ElementDef::new(Tag::Div).with_class("confirm-dialog-hidden");
     };
-    let mut toolbar = ElementDef::new(Tag::Div).with_class("diff-toolbar");
+    let mut modes = ElementDef::new(Tag::Div).with_class("diff-controls");
     for (mode, title) in [
         ("last", "Last N commits"),
         ("unpushed", "Unpushed"),
         ("base", "Compare base"),
+        ("branches", "Compare branches"),
     ] {
         let mut tab = button(shared, title, format!("review.mode:{mode}"));
         if review.mode == mode {
             tab = tab.with_class("diff-active");
         }
-        toolbar = toolbar.with_child(tab);
+        modes = modes.with_child(tab);
     }
-    if review.mode != "unpushed" {
-        toolbar = toolbar
-            .with_child(label(
-                "diff-field-label",
-                if review.mode == "last" {
-                    "Count"
-                } else {
-                    "Base ref"
-                },
-            ))
-            .with_child(input(shared, review, review.mode == "last"));
-    }
-    toolbar = toolbar.with_child(button(shared, "Refresh", "review.refresh"));
     let mut views = ElementDef::new(Tag::Div).with_class("diff-view-switch");
     for (split, title, command) in [
         (false, "Unified", "review.view:unified"),
@@ -94,26 +104,65 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         }
         views = views.with_child(view);
     }
-    toolbar = toolbar.with_child(views);
+    modes = modes.with_child(views);
+    let mut fields = ElementDef::new(Tag::Div).with_class("diff-controls");
+    match review.mode {
+        "base" => fields = fields.with_child(input(shared, review, Field::Base)),
+        "branches" => {
+            fields = fields
+                .with_child(input(shared, review, Field::From))
+                .with_child(input(shared, review, Field::To));
+        }
+        "unpushed" | "patch" => {}
+        _ => fields = fields.with_child(input(shared, review, Field::Count)),
+    }
+    fields = fields
+        .with_child(button(shared, "Open patch…", "review.patch_open").with_id("diff-open-patch"))
+        .with_child(button(shared, "Refresh", "review.refresh"));
+    let mut toolbar = ElementDef::new(Tag::Div)
+        .with_class("diff-toolbar")
+        .with_child(modes)
+        .with_child(fields);
+    let hint = match review.mode {
+        "base" => Some("Current HEAD since the common ancestor. Leave Base ref empty to use the default branch."),
+        "branches" => Some("Direct comparison from the first ref to the second. Leave From empty for the default branch; HEAD is your current commit."),
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        toolbar = toolbar.with_child(label("diff-range-hint", hint));
+    }
     let header = ElementDef::new(Tag::Div)
         .with_class("diff-header")
         .with_child(label("diff-title", "Changes"))
-        .with_child(label("diff-subtitle", review.root.display().to_string()))
+        .with_child(label(
+            "diff-subtitle",
+            if review.mode == "patch" {
+                review.patch_path.as_ref().unwrap_or(&review.root)
+            } else {
+                &review.root
+            }
+            .display()
+            .to_string(),
+        ))
         .with_child(button(shared, "Close · Esc", "review.close").with_autofocus(true));
     let mut content = ElementDef::new(Tag::Div).with_class("diff-content");
     if let Some(report) = &review.report {
         let added: usize = report.files.iter().filter_map(|f| f.added).sum();
         let removed: usize = report.files.iter().filter_map(|f| f.removed).sum();
+        let range = if report.patches.is_some() {
+            "Patch file".to_string()
+        } else {
+            format!("{} → {}", report.base, report.head)
+        };
         content = content.with_child(label(
             "diff-summary",
             format!(
-                "{} files   +{}  -{}   ·   {} → {}\n{}",
+                "{} files   +{}  -{}\n{}\n{}",
                 report.files.len(),
                 added,
                 removed,
-                &report.base[..8],
-                &report.head[..8],
-                report.label
+                report.label,
+                range,
             ),
         ));
         if report.files.is_empty() {
@@ -136,9 +185,13 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         content = content.with_child(label(
             "diff-empty",
             if review.loading {
-                "Reading Git history…"
+                if review.mode == "patch" {
+                    "Reading patch file…"
+                } else {
+                    "Reading Git history…"
+                }
             } else {
-                "Choose a range and refresh to review committed changes."
+                "Choose a Git range, open a patch file, or drop a .patch here."
             },
         ));
     }
@@ -154,7 +207,11 @@ pub fn build(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(content)
         .with_child(label(
             "diff-footer",
-            "LOCAL GIT REVIEW   ·   Read only   ·   Refresh uses local refs; no automatic fetch",
+            if review.mode == "patch" {
+                "PATCH REVIEW   ·   Read only   ·   Drop a .patch or .diff file to open it"
+            } else {
+                "LOCAL GIT REVIEW   ·   Read only   ·   Refresh uses local refs; no automatic fetch"
+            },
         ))
 }
 
@@ -398,9 +455,10 @@ mod tests {
         let mut state = seed_state();
         let mut review = Review::new("C:/projects/unshit".into());
         review.report = Some(Arc::new(Report {
+            patches: None,
             root: review.root.clone(),
-            base: "a123456789".into(),
-            head: "b123456789".into(),
+            base: "a123456789012345678901234567890123456789".into(),
+            head: "b123456789012345678901234567890123456789".into(),
             label: "Last 1 commits · first-parent history".into(),
             files: vec![File {
                 path: "src/main.rs".into(),
@@ -428,6 +486,71 @@ mod tests {
             &Default::default(),
             None,
         )
+    }
+
+    fn import_fixture(shared: &SharedState, path: &std::path::Path) {
+        let report = crate::diff_review::patch_file::load(path).unwrap();
+        let mut state = shared.lock_recover();
+        let review = state.diff_review.as_mut().unwrap();
+        review.mode = "patch";
+        review.patch_path = Some(path.to_path_buf());
+        review.lines = Arc::new(report.patches.as_ref().unwrap()[0].clone());
+        review.split_rows = Arc::new(crate::diff_review::split::align(&review.lines));
+        review.hunks = Arc::new(crate::diff_review::collect_hunks(
+            &review.lines,
+            &review.split_rows,
+        ));
+        review.report = Some(Arc::new(report));
+        review.set_file_filter("");
+    }
+
+    #[test]
+    fn imported_patch_renders_and_keeps_review_controls() {
+        let path = std::env::temp_dir().join(format!("review-ui-{}.patch", std::process::id()));
+        std::fs::write(
+            &path,
+            "diff --git a/example.rs b/example.rs\n@@ -12 +12 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let shared = fixture();
+        import_fixture(&shared, &path);
+        std::fs::remove_file(&path).unwrap();
+        for width in [800.0, 1280.0] {
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                width,
+                720.0,
+            );
+            harness.step();
+            assert!(harness.query("#diff-open-patch").is_some());
+            assert!(harness.query("#diff-count").is_none());
+            assert!(harness.query(".diff-added").is_some());
+            assert!(harness.query(".diff-removed").is_some());
+            let summary = harness.query(".diff-summary").unwrap();
+            assert!(
+                matches!(summary.content, ElementContent::Text(ref text) if text.contains("1 files   +1  -1") && text.contains("Patch file"))
+            );
+            dispatch(&mut shared.lock_recover(), "review.hunk_next");
+            dispatch(&mut shared.lock_recover(), "review.view:split");
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            assert_eq!(
+                shared
+                    .lock_recover()
+                    .diff_review
+                    .as_ref()
+                    .unwrap()
+                    .active_hunk,
+                Some(0)
+            );
+            assert!(harness.query(".diff-added").is_some());
+            assert_eq!(
+                harness.query(".diff-split-side-label").unwrap().content,
+                ElementContent::Text("Before".into())
+            );
+            dispatch(&mut shared.lock_recover(), "review.view:unified");
+        }
     }
 
     #[test]
@@ -475,6 +598,19 @@ mod tests {
             );
             harness.step();
             assert!(harness.query(".terminal-grid").is_none());
+            let summary = harness.query(".diff-summary").unwrap();
+            let ElementContent::Text(text) = summary.content else {
+                panic!("Missing range summary")
+            };
+            let report = shared
+                .lock_recover()
+                .diff_review
+                .as_ref()
+                .unwrap()
+                .report
+                .clone()
+                .unwrap();
+            assert!(text.contains(&report.base) && text.contains(&report.head));
             for selector in [
                 ".diff-overlay",
                 ".diff-files",
@@ -501,6 +637,55 @@ mod tests {
             );
             harness.locator_by_text("Close · Esc").click();
             assert!(shared.lock_recover().diff_review.is_none());
+        }
+    }
+
+    #[test]
+    fn compare_controls_stay_visible_and_keep_independent_ref_inputs() {
+        for width in [800.0, 1280.0] {
+            let shared = fixture();
+            let mut harness = TestHarness::new(
+                include_str!("../../assets/styles.css"),
+                || tree(&shared),
+                width,
+                720.0,
+            );
+            harness.step();
+            harness.locator_by_text("Compare branches").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            for selector in ["#diff-from", "#diff-to"] {
+                let field = harness.query(selector).expect(selector).layout_rect;
+                assert!(field.width >= 160.0 && field.height >= 28.0, "{field:?}");
+                assert!(
+                    field.x >= 0.0 && field.x + field.width <= width,
+                    "{field:?}"
+                );
+            }
+            harness.locator("#diff-from").fill("release/old");
+            harness.locator("#diff-to").fill("origin/release/new");
+            let request = shared.lock_recover().diff_review.as_ref().unwrap().request;
+            harness.locator("#diff-to").press("Enter");
+            assert_ne!(
+                shared.lock_recover().diff_review.as_ref().unwrap().request,
+                request
+            );
+            // Changing modes must remount the appropriate live input buffers.
+            harness.locator_by_text("Compare base").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            harness.locator("#diff-base").fill("trunk");
+            harness.locator_by_text("Compare branches").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            harness.locator("#diff-from").expect_value("release/old");
+            harness
+                .locator("#diff-to")
+                .expect_value("origin/release/new");
+            harness.locator_by_text("Compare base").click();
+            harness.rebuild(|| tree(&shared));
+            harness.step();
+            harness.locator("#diff-base").expect_value("trunk");
         }
     }
 
@@ -775,6 +960,17 @@ mod tests {
             return;
         };
         let shared = fixture();
+        if let Some(patch) = std::env::var_os("TM_DIFF_VISUAL_PATCH") {
+            import_fixture(&shared, std::path::Path::new(&patch));
+        } else if let Ok(mode) = std::env::var("TM_DIFF_VISUAL_RANGE") {
+            let mut state = shared.lock_recover();
+            let review = state.diff_review.as_mut().unwrap();
+            review.mode = match mode.as_str() {
+                "base" => "base",
+                "branches" => "branches",
+                _ => "last",
+            };
+        }
         if std::env::var("TM_DIFF_VISUAL_MODE").as_deref() == Ok("split") {
             shared
                 .lock_recover()

@@ -376,6 +376,18 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         enabled: false,
     },
     PaletteAction {
+        id: "toggle_explorer",
+        label: "Toggle file explorer",
+        description: "Browse the active workspace and open files in the editor.",
+        group: PaletteGroup::Layout,
+        icon: PaletteIcon::Sidebar,
+        keybind: Some(KeybindAction::ToggleExplorer),
+        shortcut_label: None,
+        dispatch: "explorer.toggle",
+        keywords: &["files", "explorer", "folders", "browse"],
+        enabled: true,
+    },
+    PaletteAction {
         id: "toggle_sidebar",
         label: "Toggle sidebar",
         description: "Show or hide the workspace sidebar.",
@@ -1527,6 +1539,7 @@ mod tests {
                 "arrange_grid_2x2",
                 "balance_panes",
                 "toggle_pane_fullscreen",
+                "toggle_explorer",
                 "toggle_sidebar",
                 "kill_session",
                 "restart_session",
@@ -1707,6 +1720,7 @@ mod tests {
                         | "tabs.worktree_mode.toggle"
                         | "pane.close"
                         | "sidebar.toggle"
+                        | "explorer.toggle"
                         | "modal.open"
                         | "quick_prompt.open"
                         | "agent.new"
@@ -1784,6 +1798,7 @@ mod tests {
                         "arrange_grid_2x2",
                         "balance_panes",
                         "toggle_pane_fullscreen",
+                        "toggle_explorer",
                         "toggle_sidebar",
                     ],
                 ),
