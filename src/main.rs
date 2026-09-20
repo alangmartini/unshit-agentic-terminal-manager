@@ -1448,7 +1448,7 @@ fn main() {
 
     // Self-update: the check and download threads need the same way back
     // into app state and the render loop; the delayed startup check runs
-    // on its own thread once the sink exists.
+    // on its own thread once hooks are registered.
     {
         let hooks_shared = shared.clone();
         let hooks_sink = window_event_sink.clone();
@@ -1461,7 +1461,7 @@ fn main() {
             }),
         });
     }
-    crate::updater::start_startup_check(shared.clone(), window_event_sink.clone());
+    crate::updater::start_startup_check();
 
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
