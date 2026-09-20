@@ -75,7 +75,7 @@ the user names another place.
    show one lane per used process with numbered badges on the event edges,
    and clicking a box must drill into its directly connected steps while staying in the current view. Keep the overview and storyline breadcrumbs visible, with a way to restore the whole graph; reset scrolling when focus changes. Graph boxes, event badges, stack rows and pane items should follow the same progressive navigation model. Source appears only after an explicit right-click → Source action (also available with Shift+F10), never as a side effect of drilling down. Verify back navigation, leaf nodes and source dismissal preserve context. The page opens
    straight into a view from the URL hash, so a screenshot needs no clicks:
-   `#view=stack`, `#view=panes`, `#view=graph`, plus `&level=events|code|source`
+   `#view=stack`, `#view=panes`, `#view=graph`, plus `&level=events|code`
    and `&depth=1|2|3|all`. Inspect overview and a decision at both wide and narrow desktop widths: all main steps should be visible in the overview, cards must wrap without truncation, connections must avoid card interiors, and branch choices must be readable together. Keep the whole graph readable by default and offer explicit zoom controls. Without a browser, at least rerun with `--check`
    and confirm zero warnings.
 

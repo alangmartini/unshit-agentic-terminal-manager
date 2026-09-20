@@ -32,7 +32,6 @@ button { font: inherit; color: inherit; }
 
 .flow-header { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
 .flow-title { font-size: 13px; color: var(--fg-primary); }
-.flow-summary { font-size: 11px; color: var(--fg-secondary); }
 .flow-meta { font-size: 10px; color: var(--fg-tertiary); }
 .flow-range-chip { align-self: flex-start; padding: 0 6px; font-size: 10px; color: var(--fg-tertiary); background: transparent; border: 1px solid var(--border-soft); border-radius: var(--r-sm); }
 
@@ -44,7 +43,6 @@ button { font: inherit; color: inherit; }
 .flow-tool { border-color: var(--border-soft); }
 .flow-tab:hover, .flow-tool:hover { color: var(--fg-primary); background: var(--bg-hover); }
 .flow-tab.active { color: var(--fg-primary); background: var(--bg-elevated); border-color: var(--border-soft); }
-.flow-tab.disabled, .flow-tab.disabled:hover { color: var(--fg-ghost); background: transparent; cursor: default; }
 .flow-keys { margin-left: auto; font-size: 10px; color: var(--fg-muted); }
 
 /* Call stack. */
@@ -74,12 +72,9 @@ button { font: inherit; color: inherit; }
    location keep their natural width and the sentence ellipsizes instead. */
 .flow-desc { flex: 1 1 0%; min-width: 48px; color: var(--fg-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-loc { flex: 0 1 auto; min-width: 40px; max-width: 220px; color: var(--fg-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.flow-src { padding: 0 6px; font-size: 10px; color: var(--fg-tertiary); background: transparent; border: 1px solid var(--border-soft); border-radius: var(--r-sm); cursor: pointer; flex-shrink: 0; }
-.flow-src:hover, .flow-src.active { color: var(--fg-primary); background: var(--bg-hover); }
 .flow-placeholder { display: block; padding: 12px 14px; font-size: 11px; color: var(--fg-tertiary); }
 
-/* Source excerpt under a row or inside a column. */
-.flow-snippet-row { display: flex; align-items: flex-start; padding: 2px 14px 6px 12px; }
+/* Source excerpt inside the source dialog. */
 .flow-snippet { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 6px 0; border: 1px solid var(--border-soft); border-radius: var(--r-sm); background: var(--bg-subtle); overflow-x: auto; overflow-y: hidden; }
 .flow-snippet-path { padding: 0 10px 4px 10px; font-size: 10px; color: var(--fg-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Skill text has long lines; the block scrolls sideways instead of clipping. */
@@ -158,9 +153,8 @@ button { font: inherit; color: inherit; }
 .flow-graph-node-desc { font-size: 10px; color: var(--fg-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .flow-graph-badge { position: absolute; display: flex; align-items: center; justify-content: center; padding: 0; font-size: 10px; color: var(--bg-base); background: var(--violet); border: 1px solid var(--violet); border-radius: 999px; cursor: pointer; }
 .flow-graph-badge:hover { background: var(--amber-300); border-color: var(--amber-300); }
-.flow-graph-edge-label { position: absolute; max-width: 200px; height: 16px; line-height: 16px; padding: 0 4px; font-size: 10px; color: var(--fg-secondary); background: var(--bg-base); border-radius: var(--r-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.flow-graph-edge-label { position: absolute; max-width: 150px; height: 16px; line-height: 16px; padding: 0 4px; font-size: 10px; color: var(--fg-secondary); background: var(--bg-base); border-radius: var(--r-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 .flow-error { padding: 24px; color: var(--rust); font-size: 12px; white-space: pre-wrap; }
-.flow-graph-edge-label { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-journey { padding: 8px 14px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
 .flow-overview, .flow-crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .flow-overview .current, .flow-graph-node.focus { border-color: var(--amber-300); background: var(--bg-selected); }
@@ -168,7 +162,6 @@ button { font: inherit; color: inherit; }
 .flow-context { position: fixed; z-index: 100; padding: 8px; background: var(--bg-elevated); border: 1px solid var(--amber-300); }
 .flow-source-dialog { width: min(900px, 90vw); max-height: 80vh; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-focus); }
 .flow-source-dialog::backdrop { background: #0009; }
-.flow-header .flow-summary { display: none; }
 button:focus-visible, [role=button]:focus-visible { outline: 2px solid var(--amber-300); outline-offset: 2px; }
 
 /* Readable graph cards and predictable navigation at every depth. */
@@ -228,8 +221,8 @@ body { font-size: 13px; }
   'use strict';
   var SCHEMA_VERSION = 1;
   var PROCESS_PALETTE = 6;
-  var VIEW_TABS = [['stack graph', null], ['tree', null], ['call stack', 'stack'], ['panes', 'panes'], ['graph', 'graph'], ['sequence', null]];
-  var LEVELS = ['events', 'code', 'source'];
+  var VIEW_TABS = [['call stack', 'stack'], ['panes', 'panes'], ['graph', 'graph']];
+  var LEVELS = ['events', 'code'];
   var DEPTHS = ['1', '2', '3', 'all'];
   var CARRIERS = [
     ['ui', 'UI', '<path d="M4 2L4 12L7 9.5L9 13.5L11 12.5L9 8.5L12.5 8Z"/>'],
@@ -242,9 +235,8 @@ body { font-size: 13px; }
     ['in_memory', 'in-memory', '<rect x="4.5" y="4.5" width="7" height="7" rx="1"/><path d="M2 6.5H4.5M2 9.5H4.5M11.5 6.5H14M11.5 9.5H14"/><path d="M6.5 2V4.5M9.5 2V4.5M6.5 11.5V14M9.5 11.5V14"/>']
   ];
   var CARRIER_LABEL = {}; CARRIERS.forEach(function (c) { CARRIER_LABEL[c[0]] = c[1]; });
-  var EDGE_LABEL = { calls: 'calls', handled_by: 'handled by', resolves: 'resolves' };
   var DIFF_MARK = { added: '+', removed: '-', modified: '~' };
-  var LANE_WIDTH = 356, LANE_GAP = 56, LANE_HEADER = 48, NODE_WIDTH = 316, NODE_HEIGHT = 56, NODE_STACK_GAP = 10, ROW_GAP = 44, PADDING = 16, BADGE = 18, LANE_GAP_LOOP = 236;
+  var LANE_WIDTH = 356, LANE_GAP = 56, LANE_HEADER = 48, NODE_WIDTH = 316, PADDING = 16, BADGE = 18;
   var MAX_TREE_DEPTH = 64, MAX_TREE_ROWS = 10000;
 
   // ---- DOM helpers -------------------------------------------------------
@@ -329,14 +321,14 @@ body { font-size: 13px; }
   }
   var rows = deriveTree();
 
-  var state = { view: 'graph', level: 'code', collapsed: {}, srcOpen: {}, selectedRow: null, path: [], columnCursor: null, graphCrumbs: [], graphDepth: '2', resetScroll: false, zoom: 'fit' };
+  var state = { view: 'graph', level: 'code', collapsed: {}, selectedRow: null, path: [], columnCursor: null, graphCrumbs: [], graphDepth: '2', resetScroll: false, zoom: 'fit' };
   // `#view=graph&level=events&depth=2` opens the page in that state, so a
   // screenshot script can show each view without clicking.
   (function applyHash() {
     var params = {};
     location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) params[p[0]] = decodeURIComponent(p[1] || ''); });
     if (['stack', 'panes', 'graph'].indexOf(params.view) >= 0) state.view = params.view;
-    if (params.level !== 'source' && LEVELS.indexOf(params.level) >= 0) setLevel(params.level);
+    if (LEVELS.indexOf(params.level) >= 0) setLevel(params.level);
     if (DEPTHS.indexOf(params.depth) >= 0) state.graphDepth = params.depth;
   })();
 
@@ -399,15 +391,9 @@ body { font-size: 13px; }
     while (cur != null) { if (visible(cur)) { state.selectedRow = cur; return; } cur = rows[cur].parent; }
     state.selectedRow = d.length ? d[0].row : null;
   }
-  function toggleCollapsed(r) { if (rows[r].childCount === 0) return false; if (state.collapsed[r]) delete state.collapsed[r]; else state.collapsed[r] = true; clampSelection(); return true; }
   function expandAll() { state.collapsed = {}; }
   function collapseAll() { rows.forEach(function (row, i) { if (row.childCount > 0) state.collapsed[i] = true; }); clampSelection(); }
-  function toggleSrc(id) { var n = node(id); if (!n || !n.location) return; if (state.srcOpen[id]) delete state.srcOpen[id]; else state.srcOpen[id] = true; }
-  function setLevel(level) {
-    state.level = level; state.srcOpen = {};
-    if (level === 'source') flow.nodes.forEach(function (n) { if (n.location) state.srcOpen[n.id] = true; });
-    clampSelection();
-  }
+  function setLevel(level) { state.level = level; clampSelection(); }
 
   // ---- Panes --------------------------------------------------------------
   function columnCount() { return state.path.length + 1; }
@@ -436,19 +422,8 @@ body { font-size: 13px; }
   function columnEnter() { var items = focusedItems(), item = items[state.columnCursor == null ? 0 : state.columnCursor]; if (!item) return false; return selectColumn(state.path.length, item.nodeId); }
   function columnBack() { return graphCrumb(Math.max(0, state.graphCrumbs.length - 1)); }
   function columnEdge(end) { var items = focusedItems(); if (!items.length) return false; state.columnCursor = end ? items.length - 1 : 0; return true; }
-  function focusNode(id) {
-    var r = -1; for (var i = 0; i < rows.length; i++) if (rows[i].nodeId === id) { r = i; break; }
-    if (r < 0) return false;
-    var chain = []; var cur = r;
-    while (cur != null) { chain.push(rows[cur].nodeId); cur = rows[cur].parent; }
-    chain.reverse(); state.path = chain; state.columnCursor = null; state.view = 'panes'; return true;
-  }
 
   // ---- Graph layout -------------------------------------------------------
-  function cubic(p0, p1, p2, p3, t) {
-    var u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
-    return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
-  }
   function graphRoots() { return state.graphCrumbs.length ? [state.graphCrumbs[state.graphCrumbs.length - 1]] : flow.entries.slice(); }
   function graphLayout(roots, depthName) {
     var limit = depthName === 'all' ? null : parseInt(depthName, 10);
@@ -592,7 +567,6 @@ body { font-size: 13px; }
   }
   function buildHeader() {
     var head = add(h('div', 'flow-header'), h('span', 'flow-title', flow.title));
-    if (flow.summary && flow.summary.trim()) add(head, h('span', 'flow-summary', flow.summary));
     var parts = [flow.nodes.length + ' nodes', flow.edges.length + ' edges', flow.mode || 'explain'];
     if (flow.git_ref) parts.push(flow.git_ref);
     add(head, h('span', 'flow-meta', parts.join(' · ')));
@@ -602,11 +576,8 @@ body { font-size: 13px; }
   function tab(name, active, fn) { var b = h('button', 'flow-tab' + (active ? ' active' : ''), name); return on(b, fn); }
   function buildToolbar() {
     var views = add(h('div', 'flow-toolbar-row'), h('span', 'flow-toolbar-label', 'view:'));
-    VIEW_TABS.filter(function (t) { return t[1]; }).forEach(function (t) { add(views, t[1] ? tab(t[0], state.view === t[1], function () { state.view = t[1]; }) : h('button', 'flow-tab disabled', t[0])); });
+    VIEW_TABS.forEach(function (t) { add(views, tab(t[0], state.view === t[1], function () { state.view = t[1]; })); });
     add(views, h('span', 'flow-keys', 'Enter: follow · Esc: back · Shift+F10: menu'));
-    var levels = add(h('div', 'flow-toolbar-row'), h('span', 'flow-toolbar-label', 'level:'));
-    LEVELS.filter(function (l) { return l !== 'source'; }).forEach(function (l) { add(levels, tab(l, state.level === l, function () { setLevel(l); })); });
-
     return add(h('div', 'flow-toolbar'), views);
   }
   function badge(text) { return h('span', 'flow-badge', text); }
@@ -614,11 +585,7 @@ body { font-size: 13px; }
     var tree = h('div', 'flow-tree');
     var d = displayRows();
     if (!d.length) add(tree, h('span', 'flow-placeholder', 'nothing to show at this level'));
-    d.forEach(function (disp) {
-      add(tree, buildRow(disp));
-      var n = node(rows[disp.row].nodeId);
-      if (n && state.srcOpen[n.id]) { var sr = h('div', 'flow-snippet-row'); for (var i = 0; i <= disp.depth; i++) add(sr, h('span', 'flow-indent')); add(tree, add(sr, snippetBlock(n))); }
-    });
+    d.forEach(function (disp) { add(tree, buildRow(disp)); });
     return tree;
   }
   function buildRow(disp) {
@@ -870,7 +837,6 @@ body { font-size: 13px; }
       else if (key === 'Home') changed = columnEdge(false); else if (key === 'End') changed = columnEdge(true);
       else if (key === 'ArrowRight' || key === 'Enter' || key === ' ') changed = columnEnter();
       else if (key === 'ArrowLeft') changed = columnBack();
-      else if (key === 'Escape') { changed = state.columnCursor != null; state.columnCursor = null; }
       else return;
     } else {
       if (key === 'ArrowDown') changed = moveSelection(1); else if (key === 'ArrowUp') changed = moveSelection(-1);
@@ -878,8 +844,6 @@ body { font-size: 13px; }
       else if (key === 'Home') changed = selectEdge(false); else if (key === 'End') changed = selectEdge(true);
       else if (key === 'ArrowRight') changed = selectInto(); else if (key === 'ArrowLeft') changed = selectOut();
       else if (key === 'Enter' || key === ' ') { if (state.selectedRow != null) changed = graphZoom(rows[state.selectedRow].nodeId); }
-      else if (key === 'Escape') { changed = state.selectedRow != null; state.selectedRow = null; }
-
       else if (key === 'e' || key === 'E') { expandAll(); changed = true; }
       else if (key === 'c' || key === 'C') { collapseAll(); changed = true; }
       else return;
