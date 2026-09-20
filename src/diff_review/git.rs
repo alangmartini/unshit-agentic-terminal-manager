@@ -163,22 +163,23 @@ fn resolve_input(dir: &Path, name: &str, field: &str) -> Result<String, String> 
     })
 }
 
-/// Only consult local refs, on the review worker. Never fetch or guess HEAD.
-fn base_ref(dir: &Path, name: &str) -> Result<String, String> {
-    if !name.trim().is_empty() {
-        return Ok(name.trim().to_owned());
+/// Resolve `name`, or when empty a default from local refs only. Never fetch or guess HEAD.
+fn resolve_base(dir: &Path, name: &str, field: &str) -> Result<(String, String), String> {
+    let name = name.trim();
+    if !name.is_empty() {
+        return resolve_input(dir, name, field).map(|commit| (name.to_owned(), commit));
     }
     if let Ok(target) = text(
         dir,
         &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
     ) {
-        if resolve(dir, &target).is_ok() {
-            return Ok(target);
+        if let Ok(commit) = resolve(dir, &target) {
+            return Ok((target, commit));
         }
     }
     for branch in ["refs/heads/main", "refs/heads/master"] {
-        if resolve(dir, branch).is_ok() {
-            return Ok(branch.into());
+        if let Ok(commit) = resolve(dir, branch) {
+            return Ok((branch.into(), commit));
         }
     }
     Err("Cannot determine the default branch from local refs. Enter a base ref such as your default branch or origin/trunk.".into())
@@ -242,14 +243,12 @@ pub fn load(dir: &Path, range: &Range) -> Result<Report, String> {
             )
         }
         Range::Base(name) => {
-            let name = base_ref(&root, name)?;
-            let target = resolve_input(&root, &name, "base ref")?;
+            let (name, target) = resolve_base(&root, name, "base ref")?;
             let base = text(&root, &["merge-base", &target, &head])?;
             (base, format!("Changes since common ancestor with {name}"))
         }
         Range::Branches { from, to } => {
-            let from = base_ref(&root, from)?;
-            let base = resolve_input(&root, &from, "From ref")?;
+            let (from, base) = resolve_base(&root, from, "From ref")?;
             (base, format!("Branch tips: {from} → {}", to.trim()))
         }
     };
