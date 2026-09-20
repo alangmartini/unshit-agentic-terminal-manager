@@ -1648,6 +1648,7 @@ mod tests {
                     mem_bytes: 163 << 20,
                     process_count: 4,
                     root_exe: None,
+                    processes: Default::default(),
                 },
             );
         }
@@ -1860,6 +1861,7 @@ mod tests {
                 mem_bytes: 164 << 20,
                 process_count: 5,
                 root_exe: None,
+                processes: Default::default(),
             }),
         };
         let el = build_terminal_entry(0, &entry, false, false, &make_shared());
@@ -1874,6 +1876,7 @@ mod tests {
             mem_bytes: 1 << 30,
             process_count: 1,
             root_exe: None,
+            processes: Default::default(),
         };
         assert_eq!(usage_chip_text(&baseline_pending), "--% \u{00B7} 1.0G");
     }

@@ -344,7 +344,10 @@ fn build_tree(
         root = root
             .with_class("settings")
             .with_child(build_settings_page(snap, shared))
-            .with_child(with_custom_surface_style(build_statusbar(snap), snap));
+            .with_child(with_custom_surface_style(
+                build_statusbar(snap, shared),
+                snap,
+            ));
     } else if snap.diff_review.is_none() {
         root = root.with_child(
             ElementDef::new(Tag::Div)
@@ -357,7 +360,10 @@ fn build_tree(
                         .with_class("role-main")
                         .with_child(build_tabbar(snap, shared))
                         .with_child(build_terminal_grid(snap, shared, grids))
-                        .with_child(with_custom_surface_style(build_statusbar(snap), snap)),
+                        .with_child(with_custom_surface_style(
+                            build_statusbar(snap, shared),
+                            snap,
+                        )),
                 ),
         );
     }
@@ -375,6 +381,7 @@ fn build_tree(
         root: root
             .with_child(crate::ui::diff_review::build(snap, shared))
             .with_child(build_ctx_menu_overlay(snap, shared))
+            .with_child(crate::ui::process_details::build(snap, shared))
             .with_child(crate::ui::confirm_dialog::build_confirm_dialog_overlay(
                 snap, shared,
             ))
