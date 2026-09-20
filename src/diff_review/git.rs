@@ -12,6 +12,7 @@ pub enum Range {
     Last(usize),
     Unpushed,
     Base(String),
+    Branches { from: String, to: String },
 }
 
 #[derive(Clone, Debug)]
@@ -150,10 +151,48 @@ fn resolve(dir: &Path, name: &str) -> Result<String, String> {
     )
 }
 
+fn resolve_input(dir: &Path, name: &str, field: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 1024 {
+        return Err(format!(
+            "Enter a branch, tag, or commit (up to 1024 bytes) as the {field}."
+        ));
+    }
+    resolve(dir, name).map_err(|error| {
+        format!("Cannot resolve {field} '{name}' to a commit. Enter a locally available branch, tag, or commit; remote branches need their remote prefix (for example, origin/trunk).\n{error}")
+    })
+}
+
+/// Resolve `name`, or when empty a default from local refs only. Never fetch or guess HEAD.
+fn resolve_base(dir: &Path, name: &str, field: &str) -> Result<(String, String), String> {
+    let name = name.trim();
+    if !name.is_empty() {
+        return resolve_input(dir, name, field).map(|commit| (name.to_owned(), commit));
+    }
+    if let Ok(target) = text(
+        dir,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
+        if let Ok(commit) = resolve(dir, &target) {
+            return Ok((target, commit));
+        }
+    }
+    for branch in ["refs/heads/main", "refs/heads/master"] {
+        if let Ok(commit) = resolve(dir, branch) {
+            return Ok((branch.into(), commit));
+        }
+    }
+    Err("Cannot determine the default branch from local refs. Enter a base ref such as your default branch or origin/trunk.".into())
+}
+
 pub fn load(dir: &Path, range: &Range) -> Result<Report, String> {
     let root = PathBuf::from(text(dir, &["rev-parse", "--show-toplevel"])?);
-    let head =
-        resolve(&root, "HEAD").map_err(|_| "This repository has no commits yet.".to_string())?;
+    let head = match range {
+        Range::Branches { to, .. } => resolve_input(&root, to, "To ref")?,
+        _ => {
+            resolve(&root, "HEAD").map_err(|_| "This repository has no commits yet.".to_string())?
+        }
+    };
     let (base, label) = match range {
         Range::Last(n) => {
             if !(1..=10_000).contains(n) {
@@ -204,15 +243,13 @@ pub fn load(dir: &Path, range: &Range) -> Result<Report, String> {
             )
         }
         Range::Base(name) => {
-            if name.trim().is_empty() || name.len() > 1024 {
-                return Err("Enter a branch, tag, or commit as the base ref.".into());
-            }
-            let target = resolve(&root, name.trim())?;
+            let (name, target) = resolve_base(&root, name, "base ref")?;
             let base = text(&root, &["merge-base", &target, &head])?;
-            (
-                base,
-                format!("Changes since common ancestor with {}", name.trim()),
-            )
+            (base, format!("Changes since common ancestor with {name}"))
+        }
+        Range::Branches { from, to } => {
+            let (from, base) = resolve_base(&root, from, "From ref")?;
+            (base, format!("Branch tips: {from} → {}", to.trim()))
         }
     };
     let bytes = run(
@@ -420,6 +457,50 @@ mod tests {
     }
 
     #[test]
+    fn automatic_base_uses_remote_default_instead_of_assuming_main() {
+        let repo = Repo::new();
+        repo.commit("root\n");
+        repo.git(&["branch", "-m", "trunk"]);
+        repo.git(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        repo.git(&["checkout", "-qb", "feature"]);
+        repo.commit("root\nfeature\n");
+        let report = load(&repo.0, &Range::Base(String::new())).unwrap();
+        assert_eq!(report.base, resolve(&repo.0, "origin/trunk").unwrap());
+        assert!(report.label.contains("origin/trunk"));
+        assert_eq!(report.files[0].added, Some(1));
+    }
+
+    #[test]
+    fn automatic_base_falls_back_to_local_branches_and_explains_missing_default() {
+        let repo = Repo::new();
+        repo.commit("root\n");
+        for branch in ["main", "master"] {
+            repo.git(&["branch", "-m", branch]);
+            let report = load(&repo.0, &Range::Base(String::new())).unwrap();
+            assert!(report.files.is_empty());
+            assert!(report.label.contains(branch));
+        }
+        repo.git(&["branch", "-m", "custom"]);
+        assert!(load(&repo.0, &Range::Base(String::new()))
+            .unwrap_err()
+            .contains("Enter a base ref"));
+    }
+
+    #[test]
+    fn invalid_base_names_the_ref_and_how_to_correct_it() {
+        let repo = Repo::new();
+        repo.commit("root\n");
+        let error = load(&repo.0, &Range::Base("missing-branch".into())).unwrap_err();
+        assert!(error.contains("missing-branch"), "{error}");
+        assert!(error.contains("locally available"), "{error}");
+    }
+
+    #[test]
     fn base_comparison_excludes_changes_only_on_base_branch() {
         let repo = Repo::new();
         repo.commit("root\n");
@@ -440,6 +521,105 @@ mod tests {
         assert!(load(&repo.0, &Range::Base("main".into()))
             .unwrap_err()
             .contains("no common ancestor"));
+    }
+
+    #[test]
+    fn branch_comparison_uses_both_tips_without_checkout_or_dirty_files() {
+        let repo = Repo::new();
+        repo.commit("root\n");
+        repo.git(&["checkout", "-qb", "feature"]);
+        repo.commit("root\nfeature\n");
+        repo.git(&["update-ref", "refs/remotes/origin/feature", "HEAD"]);
+        repo.git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.0.join("base-only.txt"), "base\n").unwrap();
+        repo.commit("root\n");
+        std::fs::write(repo.0.join("a.txt"), "staged\n").unwrap();
+        repo.git(&["add", "a.txt"]);
+        std::fs::write(repo.0.join("a.txt"), "dirty\n").unwrap();
+        let before = run(&repo.0, &["status", "--porcelain=v1", "-z"]).unwrap();
+        let range = Range::Branches {
+            from: " main ".into(),
+            to: "origin/feature".into(),
+        };
+        let report = load(&repo.0, &range).unwrap();
+        assert_eq!(report.base, resolve(&repo.0, "main").unwrap());
+        assert_eq!(report.head, resolve(&repo.0, "feature").unwrap());
+        assert!(report.label.contains("main → origin/feature"));
+        assert_eq!(report.files.len(), 2);
+        let removed = report
+            .files
+            .iter()
+            .find(|f| f.path == "base-only.txt")
+            .unwrap();
+        assert_eq!(removed.removed, Some(1));
+        let file = report.files.iter().find(|f| f.path == "a.txt").unwrap();
+        let lines = patch(&report, file).unwrap();
+        assert!(lines.iter().any(|l| l.text == "+feature"));
+        assert!(!lines
+            .iter()
+            .any(|l| l.text.contains("dirty") || l.text.contains("staged")));
+        let reverse = load(
+            &repo.0,
+            &Range::Branches {
+                from: "feature".into(),
+                to: "main".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(reverse.base, report.head);
+        assert_eq!(reverse.head, report.base);
+        assert_eq!(
+            run(&repo.0, &["status", "--porcelain=v1", "-z"]).unwrap(),
+            before
+        );
+        assert_eq!(
+            text(&repo.0, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
+    fn branch_comparison_handles_defaults_unrelated_history_and_invalid_refs() {
+        let repo = Repo::new();
+        repo.commit("root\n");
+        let report = load(
+            &repo.0,
+            &Range::Branches {
+                from: String::new(),
+                to: "HEAD".into(),
+            },
+        )
+        .unwrap();
+        assert!(report.files.is_empty());
+        repo.git(&["checkout", "-q", "--orphan", "unrelated"]);
+        repo.commit("separate history\n");
+        let report = load(
+            &repo.0,
+            &Range::Branches {
+                from: "main".into(),
+                to: "unrelated".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.files.len(), 1);
+        for (from, to, field) in [
+            ("missing", "HEAD", "From ref"),
+            ("main", "missing", "To ref"),
+            ("main", "", "To ref"),
+            ("main", "--output=oops", "To ref"),
+            ("main", "main..unrelated", "To ref"),
+        ] {
+            let error = load(
+                &repo.0,
+                &Range::Branches {
+                    from: from.into(),
+                    to: to.into(),
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+        assert!(!repo.0.join("oops").exists());
     }
 
     #[test]

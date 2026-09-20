@@ -8123,13 +8123,17 @@ body.dragging-pane {
 .diff-header { display: flex; flex-direction: row; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--border-default); flex-shrink: 0; }
 .diff-title { font-size: 18px; font-weight: 600; }
 .diff-subtitle { flex: 1; min-width: 0; font-size: 12px; color: var(--fg-secondary); overflow: hidden; }
-.diff-toolbar { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 16px; background: var(--bg-subtle); flex-shrink: 0; }
-.diff-button { padding: 6px 10px; border: 1px solid var(--border-default); border-radius: 4px; background: var(--bg-elevated); color: var(--fg-primary); font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.diff-toolbar { display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; background: var(--bg-subtle); flex-shrink: 0; }
+.diff-controls { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px; }
+.diff-field { display: flex; flex-direction: row; align-items: center; gap: 8px; flex-shrink: 0; }
+.diff-range-hint { font-size: 12px; color: var(--fg-secondary); }
+.diff-button { padding: 6px 10px; border: 1px solid var(--border-default); border-radius: 4px; background: var(--bg-elevated); color: var(--fg-primary); font-size: 12px; cursor: pointer; flex-shrink: 0; white-space: nowrap; }
 .diff-button:hover { background: var(--bg-hover); }
 .diff-button:focus { border-color: var(--border-focus); }
 .diff-active { background: var(--bg-selected); border-color: var(--border-focus); color: var(--amber-100); }
 .diff-field-label { font-size: 12px; color: var(--fg-secondary); }
-.diff-input { width: 180px; height: 30px; padding: 4px 8px; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-default); border-radius: 4px; font-size: 12px; }
+.diff-input { width: 220px; height: 30px; padding: 4px 8px; background: var(--bg-base); color: var(--fg-primary); border: 1px solid var(--border-default); border-radius: 4px; font-size: 12px; }
+#diff-count { width: 80px; }
 .diff-input:focus { border-color: var(--border-focus); }
 .diff-content { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .diff-summary { padding: 10px 16px; font-size: 12px; color: var(--fg-secondary); white-space: pre-wrap; flex-shrink: 0; border-bottom: 1px solid var(--border-default); }

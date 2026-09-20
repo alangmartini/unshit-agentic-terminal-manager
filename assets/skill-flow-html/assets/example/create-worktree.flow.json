@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "title": "/create-worktree",
+  "summary": "The user asks for a new worktree, optionally naming it. The agent inspects the repository, derives a slug, branch and sibling destination, creates the worktree with one git command, verifies it, adopts it as the working directory for every later tool call, and reports the path and branch.",
+  "repo_root": "create-worktree",
+  "git_ref": "create-worktree@user-scope",
+  "mode": "explain",
+  "diff_range": null,
+  "error": null,
+  "next_flow": "Implementation completion: once the task's code is done in this worktree, commit, push and open a pull request against the repository's default branch (SKILL.md lines 21-28).",
+  "processes": [
+    { "id": "human", "label": "Human" },
+    { "id": "agent", "label": "Agent" },
+    { "id": "shell", "label": "Shell" },
+    { "id": "fs", "label": "Filesystem" }
+  ],
+  "nodes": [
+    {
+      "id": "ui.invoke",
+      "name": "/create-worktree [name]",
+      "kind": "event",
+      "process": "human",
+      "carrier": "ui",
+      "description": "The user asks for a new isolated worktree, optionally naming it.",
+      "payload": "optional name"
+    },
+    {
+      "id": "SKILL.md::create-worktree",
+      "name": "Create worktree",
+      "kind": "function",
+      "process": "agent",
+      "description": "Creates the worktree immediately, without routine follow-up questions, and moves all later work into it.",
+      "tags": ["no follow-up questions"],
+      "location": { "file": "SKILL.md", "line": 6, "end_line": 8 }
+    },
+    {
+      "id": "SKILL.md::step-1-identify-repo",
+      "name": "1. Identify the repository",
+      "kind": "function",
+      "process": "agent",
+      "description": "Finds the repository root, the current HEAD and the existing worktrees, and remembers the original directory for a later return.",
+      "tags": ["original directory"],
+      "location": { "file": "SKILL.md", "line": 10 }
+    },
+    {
+      "id": "tool.bash.git-inspect",
+      "name": "git rev-parse / git worktree list",
+      "kind": "event",
+      "carrier": "process",
+      "description": "Asks git where the checkout is and which worktrees already exist.",
+      "payload": "cwd"
+    },
+    {
+      "id": "shell::git-inspect",
+      "name": "git rev-parse --show-toplevel; git worktree list",
+      "kind": "function",
+      "process": "shell",
+      "description": "Prints the source root, HEAD and every existing worktree so the slug step can avoid collisions."
+    },
+    {
+      "id": "tool.fs.read-source-instructions",
+      "name": "Read repository instructions",
+      "kind": "event",
+      "process": "fs",
+      "carrier": "fs",
+      "description": "Reads the AGENTS.md or CLAUDE.md that applies at the source root."
+    },
+    {
+      "id": "SKILL.md::step-2-slug",
+      "name": "2. Derive slug, branch and destination",
+      "kind": "function",
+      "process": "agent",
+      "description": "Turns the name into a directory slug, derives the codex/<slug> branch and a sibling worktrees directory, and resolves the destination to an absolute path.",
+      "tags": ["slug", "branch", "destination"],
+      "location": { "file": "SKILL.md", "line": 11 }
+    },
+    {
+      "id": "decision.name-supplied",
+      "name": "name supplied?",
+      "kind": "event",
+      "carrier": "in_memory",
+      "description": "The invocation carried a name, or it did not."
+    },
+    {
+      "id": "SKILL.md::step-2-normalize-name",
+      "name": "Normalize the supplied name",
+      "kind": "function",
+      "process": "agent",
+      "description": "Replaces spaces and unsafe path characters with hyphens and never treats the name as a path or shell code.",
+      "tags": ["never a path"],
+      "location": { "file": "SKILL.md", "line": 11 }
+    },
+    {
+      "id": "SKILL.md::step-2-random-slug",
+      "name": "Generate a random slug",
+      "kind": "function",
+      "process": "agent",
+      "description": "Makes a short random slug when no name was given.",
+      "location": { "file": "SKILL.md", "line": 11 }
+    },
+    {
+      "id": "tool.bash.check-ref-format",
+      "name": "git check-ref-format --branch",
+      "kind": "event",
+      "carrier": "process",
+      "description": "Asks git whether the derived branch name is acceptable.",
+      "payload": "codex/<slug>"
+    },
+    {
+      "id": "shell::check-ref-format",
+      "name": "git check-ref-format --branch",
+      "kind": "function",
+      "process": "shell",
+      "description": "Fails when git would refuse the branch name."
+    },
+    {
+      "id": "decision.exists",
+      "name": "branch or destination exists?",
+      "kind": "event",
+      "carrier": "in_memory",
+      "description": "Either the branch or the destination directory is already taken."
+    },
+    {
+      "id": "SKILL.md::step-2-suffix",
+      "name": "Append a random suffix",
+      "kind": "function",
+      "process": "agent",
+      "description": "Appends a short random suffix instead of overwriting or reusing an existing worktree.",
+      "tags": ["never overwrite"],
+      "location": { "file": "SKILL.md", "line": 11 }
+    },
+    {
+      "id": "SKILL.md::step-3-worktree-add",
+      "name": "3. Create the worktree",
+      "kind": "function",
+      "process": "agent",
+      "description": "Runs worktree add from the source root with each argument quoted for the active shell and checks the exit status before continuing.",
+      "tags": ["quoting", "exit status", "no stash/reset/fetch"],
+      "location": { "file": "SKILL.md", "line": 12 }
+    },
+    {
+      "id": "tool.bash.worktree-add",
+      "name": "git worktree add -b",
+      "kind": "event",
+      "carrier": "process",
+      "description": "Creates the branch and the worktree in one command.",
+      "payload": "-C <source-root> -b <branch> <absolute-destination> HEAD"
+    },
+    {
+      "id": "shell::worktree-add",
+      "name": "git worktree add",
+      "kind": "function",
+      "process": "shell",
+      "description": "Branches from the committed HEAD into the sibling directory and leaves uncommitted source files where they are."
+    },
+    {
+      "id": "decision.source-dirty",
+      "name": "source checkout dirty?",
+      "kind": "event",
+      "carrier": "in_memory",
+      "description": "Uncommitted or untracked files exist in the source checkout."
+    },
+    {
+      "id": "SKILL.md::step-3-mention-dirty",
+      "name": "Mention the dirty source",
+      "kind": "function",
+      "process": "agent",
+      "description": "Says once that uncommitted changes stayed behind in the source checkout.",
+      "location": { "file": "SKILL.md", "line": 12 }
+    },
+    {
+      "id": "SKILL.md::step-4-verify",
+      "name": "4. Verify and adopt the destination",
+      "kind": "function",
+      "process": "agent",
+      "description": "Confirms the new checkout with git, reads its instructions, and makes the absolute destination the explicit workdir for every later tool call.",
+      "tags": ["workdir"],
+      "location": { "file": "SKILL.md", "line": 13 }
+    },
+    {
+      "id": "tool.bash.verify",
+      "name": "git -C <destination> rev-parse / branch --show-current",
+      "kind": "event",
+      "carrier": "process",
+      "description": "Checks that the destination is a real checkout on the new branch.",
+      "payload": "absolute destination"
+    },
+    {
+      "id": "shell::verify",
+      "name": "git rev-parse --show-toplevel; git branch --show-current",
+      "kind": "function",
+      "process": "shell",
+      "description": "Prints the toplevel and the current branch of the new worktree."
+    },
+    {
+      "id": "tool.fs.read-destination-instructions",
+      "name": "Read the worktree's instructions",
+      "kind": "event",
+      "process": "fs",
+      "carrier": "fs",
+      "description": "Reads the AGENTS.md or CLAUDE.md that applies inside the new worktree."
+    },
+    {
+      "id": "state.workdir",
+      "name": "workdir = <absolute destination>",
+      "kind": "state",
+      "process": "agent",
+      "description": "Every subsequent shell call, edit, search and git operation is rooted here, because a shell cd would not persist across tool calls.",
+      "tags": ["workdir"],
+      "location": { "file": "SKILL.md", "line": 13 }
+    },
+    {
+      "id": "SKILL.md::step-5-report",
+      "name": "5. Report",
+      "kind": "function",
+      "process": "agent",
+      "description": "Reports the path, the branch, and that subsequent commands run in the worktree.",
+      "location": { "file": "SKILL.md", "line": 14, "end_line": 17 }
+    },
+    {
+      "id": "ui.report",
+      "name": "Path / Branch / I'll run subsequent commands in this worktree.",
+      "kind": "event",
+      "process": "human",
+      "carrier": "ui",
+      "description": "Three lines the user reads.",
+      "payload": "Path: <absolute path> · Branch: <branch>"
+    }
+  ],
+  "edges": [
+    { "from": "ui.invoke", "to": "SKILL.md::create-worktree", "kind": "handled_by" },
+    { "from": "SKILL.md::create-worktree", "to": "SKILL.md::step-1-identify-repo", "kind": "calls" },
+    { "from": "SKILL.md::step-1-identify-repo", "to": "tool.bash.git-inspect", "kind": "calls" },
+    { "from": "tool.bash.git-inspect", "to": "shell::git-inspect", "kind": "handled_by" },
+    { "from": "SKILL.md::step-1-identify-repo", "to": "tool.fs.read-source-instructions", "kind": "calls" },
+    { "from": "SKILL.md::create-worktree", "to": "SKILL.md::step-2-slug", "kind": "calls" },
+    { "from": "SKILL.md::step-2-slug", "to": "decision.name-supplied", "kind": "calls" },
+    { "from": "decision.name-supplied", "to": "SKILL.md::step-2-normalize-name", "kind": "handled_by" },
+    { "from": "decision.name-supplied", "to": "SKILL.md::step-2-random-slug", "kind": "handled_by" },
+    { "from": "SKILL.md::step-2-slug", "to": "tool.bash.check-ref-format", "kind": "calls" },
+    { "from": "tool.bash.check-ref-format", "to": "shell::check-ref-format", "kind": "handled_by" },
+    { "from": "SKILL.md::step-2-slug", "to": "decision.exists", "kind": "calls" },
+    { "from": "decision.exists", "to": "SKILL.md::step-2-suffix", "kind": "handled_by" },
+    { "from": "SKILL.md::create-worktree", "to": "SKILL.md::step-3-worktree-add", "kind": "calls" },
+    { "from": "SKILL.md::step-3-worktree-add", "to": "tool.bash.worktree-add", "kind": "calls" },
+    { "from": "tool.bash.worktree-add", "to": "shell::worktree-add", "kind": "handled_by" },
+    { "from": "SKILL.md::step-3-worktree-add", "to": "decision.source-dirty", "kind": "calls" },
+    { "from": "decision.source-dirty", "to": "SKILL.md::step-3-mention-dirty", "kind": "handled_by" },
+    { "from": "SKILL.md::create-worktree", "to": "SKILL.md::step-4-verify", "kind": "calls" },
+    { "from": "SKILL.md::step-4-verify", "to": "tool.bash.verify", "kind": "calls" },
+    { "from": "tool.bash.verify", "to": "shell::verify", "kind": "handled_by" },
+    { "from": "SKILL.md::step-4-verify", "to": "tool.fs.read-destination-instructions", "kind": "calls" },
+    { "from": "SKILL.md::step-4-verify", "to": "state.workdir", "kind": "calls" },
+    { "from": "SKILL.md::create-worktree", "to": "SKILL.md::step-5-report", "kind": "calls" },
+    { "from": "SKILL.md::step-5-report", "to": "ui.report", "kind": "resolves" }
+  ],
+  "entries": ["ui.invoke"]
+}
