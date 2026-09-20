@@ -25,14 +25,14 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem, Shaping};
 
 /// Select the least expensive shaping mode that preserves UI text behavior.
 ///
-/// ASCII is fully covered by every supported UI font, so it does not need
-/// system fallback or complex-script shaping. Keeping it on Cosmic Text's
-/// basic path avoids the substantially more expensive fallback machinery for
-/// the common case (labels, values, and buttons). Any non-ASCII text keeps
-/// the advanced path so localized and symbol-bearing UI remains correct.
+/// Cosmic Text 0.12's basic path reports cluster offsets relative to each
+/// shaping run. Only a single ASCII alphanumeric word can safely use that
+/// path: spaces and punctuation can split runs and reset selection offsets.
+/// Multi-word, symbol-bearing and localized text use advanced shaping so
+/// hit testing and selection retain byte offsets into the complete line.
 #[inline]
 pub fn ui_text_shaping(text: &str) -> Shaping {
-    if text.is_ascii() {
+    if text.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         Shaping::Basic
     } else {
         Shaping::Advanced
@@ -179,8 +179,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ui_text_shaping_uses_basic_only_for_ascii() {
-        assert_eq!(ui_text_shaping("Config font size"), Shaping::Basic);
+    fn ui_text_shaping_uses_basic_only_for_single_ascii_words() {
+        assert_eq!(ui_text_shaping("Config123"), Shaping::Basic);
+        assert_eq!(ui_text_shaping("Config font size"), Shaping::Advanced);
+        assert_eq!(ui_text_shaping("one-two"), Shaping::Advanced);
         assert_eq!(ui_text_shaping("custom · your palette"), Shaping::Advanced);
     }
 

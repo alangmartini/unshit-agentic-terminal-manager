@@ -97,3 +97,15 @@ fn glyph_ranges_with_letter_spacing() {
     let gap_with = ranges_with_spacing[1].x - ranges_with_spacing[0].x;
     assert!(gap_with > gap_no, "Letter spacing should increase gap between glyphs");
 }
+
+#[test]
+fn glyph_offsets_after_spaces_and_punctuation_refer_to_the_complete_line() {
+    let mut font_system = FontSystem::new();
+    for text in ["AAAA BBBB", "one-two", "first, second"] {
+        let ranges = layout::text_glyph_ranges(text, 16.0, 1.2, 0.0, Some(400.0), &mut font_system);
+        assert_eq!(ranges.last().unwrap().byte_end, text.len());
+        for pair in ranges.windows(2) {
+            assert!(pair[0].byte_end <= pair[1].byte_start, "offsets reset in {text:?}");
+        }
+    }
+}
