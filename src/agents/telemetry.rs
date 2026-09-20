@@ -20,7 +20,8 @@ pub use crate::telemetry_sink::now_unix_ms;
 pub struct AgentEventRecord<'a> {
     pub timestamp_unix_ms: u64,
     /// Dotted event name: `agent.classified`, `agent.untagged`,
-    /// `agent.launch`, `agent.launch_failed`, `agent.cli`.
+    /// `agent.launch`, `agent.launch_failed`, `agent.cli`,
+    /// `agent.rules_loaded`, `agent.rules_rejected`.
     pub event: &'static str,
     pub level: &'static str,
     /// `AppState::restore_correlation_id`: one id per UI run.
@@ -44,6 +45,15 @@ pub struct AgentEventRecord<'a> {
     pub outcome: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<&'static str>,
+    /// Custom detection rules in force after an `agent.rules_loaded` /
+    /// `agent.rules_rejected` reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_count: Option<usize>,
+    /// Fixed-template diagnostic such as the rules-file rejection reason
+    /// (`rule 2: ...`, `invalid configuration at line 3, column 7`). Never
+    /// configuration contents, paths or titles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl<'a> AgentEventRecord<'a> {
@@ -60,6 +70,8 @@ impl<'a> AgentEventRecord<'a> {
             reason: None,
             outcome: None,
             error_kind: None,
+            rule_count: None,
+            detail: None,
         }
     }
 }

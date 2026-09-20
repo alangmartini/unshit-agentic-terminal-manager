@@ -132,7 +132,7 @@ User data is stored under your platform config and data directories:
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
-| Agent tab classification, launch and kill events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
+| Agent tab classification, launch, kill and detection-rule reload events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
 | Terminal mode changes (alternate screen, mouse reporting) and selection auto-scroll events | `%APPDATA%\com.godly.terminal\terminal-events.jsonl` |
 | Editor pane opens, saves, pastes, find and quick open events | `%APPDATA%\com.godly.terminal\editor-events.jsonl` |
 | Diff pane requests, navigation and file opens | `%APPDATA%\com.godly.terminal\diff-events.jsonl` |

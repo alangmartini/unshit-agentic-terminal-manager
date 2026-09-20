@@ -186,7 +186,14 @@ impl RulesFile {
         Ok(changed)
     }
 
+    /// Reload once per monitor tick. Transitions land in
+    /// `agent-events.jsonl` as `agent.rules_loaded` (the rule set changed, or
+    /// a rejected file became valid again) and `agent.rules_rejected` (the
+    /// file could not be read or parsed; the previous rules stay in force).
+    /// Nothing is emitted while the file is unchanged or stays broken, so a
+    /// steady state costs no writes.
     pub fn refresh(&mut self) {
+        use super::telemetry::{record, AgentEventRecord};
         match self.reload() {
             Ok(changed) => {
                 if changed || self.last_error.is_some() {
@@ -194,12 +201,28 @@ impl RulesFile {
                         "agent detection rules loaded: {} rules",
                         self.rules.rules.len()
                     );
+                    let correlation_id = format!("process-{}", std::process::id());
+                    let mut event =
+                        AgentEventRecord::new("agent.rules_loaded", "info", &correlation_id);
+                    event.rule_count = Some(self.rules.rules.len());
+                    event.reason = Some(if self.last_error.is_some() {
+                        "recovered"
+                    } else {
+                        "changed"
+                    });
+                    record(&event);
                 }
                 self.last_error = None;
             }
             Err(error) => {
                 if self.last_error.as_ref() != Some(&error) {
                     log::warn!("agent-detection.json: {error}; keeping last valid rules");
+                    let correlation_id = format!("process-{}", std::process::id());
+                    let mut event =
+                        AgentEventRecord::new("agent.rules_rejected", "warn", &correlation_id);
+                    event.rule_count = Some(self.rules.rules.len());
+                    event.detail = Some(error.clone());
+                    record(&event);
                 }
                 self.last_error = Some(error);
             }
