@@ -24,6 +24,11 @@ Unshit Terminal Manager is a native macOS and Windows terminal multiplexer built
 
 ![Split panes](preview-split.png)
 
+## Development
+
+Windows and macOS share `main`. See [Development and releases](docs/DEVELOPMENT.md)
+for branch conventions, checkout migration and platform verification.
+
 ## Architecture
 
 Unshit Terminal Manager ships as **two executables**:

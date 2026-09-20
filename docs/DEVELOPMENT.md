@@ -1,0 +1,53 @@
+# Development and releases
+
+## One shared application
+
+`main` is the integration branch for both Windows and macOS. Start short-lived
+feature and fix branches from `main`, and target pull requests at `main`.
+Platform support is part of the same application, not a separate product branch.
+
+Keep shared terminal, daemon protocol, state and UI behavior in shared code.
+Use platform modules and Rust `cfg` gates for native APIs, transports, shortcuts
+and packaging. General UI toolkit fixes belong in `crates/unshit-framework/`.
+The framework's upstream branch remains independent of this repository's branch
+names; the subtree commands in `AGENTS.md` still apply.
+
+Before merging, pass the PR Quality Gate's Windows Rust Checks and macOS Checks.
+The macOS job also builds the application bundle. For local changes, follow the
+verification requirements in `AGENTS.md`; CI complements local UI checks.
+
+## Migrating existing checkouts
+
+After fetching the repository, switch to the shared branch:
+
+```bash
+git fetch origin
+git switch main
+git pull --ff-only origin main
+git remote set-head origin -a
+```
+
+If `main` does not exist locally, use `git switch --track origin/main` instead.
+Commit any pending changes before switching branches. Existing work branches can
+merge `origin/main` and continue as normal; they do not need to be recreated.
+Existing pull requests should target `main`.
+
+`feat/rust-terminal-manager`, `feat/macos-terminal-manager` and `master` are
+historical references after this transition. Do not use them for new feature
+work or maintain a separate stream of platform fixes there. They are retained
+so existing checkouts and links remain recoverable.
+
+## Releases
+
+A release tag identifies one source revision, with separate Windows and macOS
+artifacts built from that revision. Use the same application version on both
+platforms. The existing `v0.5.0` tag remains the original release; integrating
+macOS support does not move or overwrite it.
+
+Build a macOS bundle with `scripts/package-macos.sh`. Use the Windows build and installer instructions in `README.md` for Windows
+artifacts. Development CI artifacts are not a signed or notarized
+public macOS release. Publish a new release only after its platform checks and
+packaging checks pass.
+
+Use a maintenance branch only when an older released version actually needs
+support while `main` moves forward; platform alone is not a reason for one.
