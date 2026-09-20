@@ -45,7 +45,15 @@ function Exit-TmIsolation {
         [string]$PtydExe
     )
 
-    if ($PtydExe -and (Test-Path -LiteralPath $PtydExe)) {
+    # Skip the shutdown when the pipe is already gone (the app itself may have
+    # stopped the daemon, e.g. the self-update hand-off) so a clean run does not
+    # end with a "could not connect" error record. Enumerating the pipe
+    # namespace never connects to a pipe, unlike Test-Path on the pipe path.
+    $pipeAlive = $true
+    try {
+        $pipeAlive = [bool]([System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -ieq $Isolation.PipePath })
+    } catch {}
+    if ($pipeAlive -and $PtydExe -and (Test-Path -LiteralPath $PtydExe)) {
         try {
             # --force: the daemon refuses a plain shutdown while sessions
             # are alive, and shot scripts stop the UI without closing them.

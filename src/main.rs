@@ -40,6 +40,7 @@ pub mod telemetry_sink;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub mod updater;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -795,6 +796,14 @@ fn main() {
             crate::state::ToggleKey::AutoResumeAgents,
             persisted.auto_resume_agents,
         );
+        // Self-update: the startup check defaults on (an upgrader without
+        // the key starts getting offers), and the last version the offer
+        // was shown for keeps the prompt to once per version.
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::CheckUpdatesOnStartup,
+            persisted.check_updates_on_startup.unwrap_or(true),
+        );
+        initial_state.update.prompted_version = persisted.update_prompted_version.clone();
         // Override the seed_state inference with whatever the user
         // last persisted. An upgrader without the field gets an
         // empty spec here, which keeps the daemon's `default_shell()`
@@ -803,6 +812,9 @@ fn main() {
     }
     #[cfg(windows)]
     crate::state::refresh_start_at_login(&mut initial_state);
+    // Is this exe the registered install (per-user or per-machine)? Decides
+    // whether an update can be applied in place or only pointed at.
+    crate::updater::init(&mut initial_state);
     // Bench mode needs a deterministic shell so the scroll workload
     // measures comparable output across runs. On Windows the bench
     // exercises `dir`, which only behaves on cmd.exe; route it through
@@ -1486,6 +1498,23 @@ fn main() {
         crate::state::start_explorer_refresh();
     }
 
+    // Self-update: the check and download threads need the same way back
+    // into app state and the render loop; the delayed startup check runs
+    // on its own thread once hooks are registered.
+    {
+        let hooks_shared = shared.clone();
+        let hooks_sink = window_event_sink.clone();
+        crate::updater::register_hooks(crate::updater::UpdateHooks {
+            shared: hooks_shared,
+            request_rebuild: Box::new(move || {
+                if let Some(sink) = hooks_sink.get() {
+                    let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
+                }
+            }),
+        });
+    }
+    crate::updater::start_startup_check();
+
     // Set up PTY output subscriptions.
     app.set_subscriptions(move || bridge::build_subscriptions(&sub_shared));
 
@@ -1520,6 +1549,9 @@ fn main() {
     // produces (a loaded diff pane, a built file index) and can only ever
     // drive the synchronous half of a feature.
     if let Ok(commands) = std::env::var("TM_STARTUP_DISPATCH") {
+        // One-shot: children must not inherit it. The self-update installer
+        // (and the app it relaunches) would otherwise replay `update.install`.
+        std::env::remove_var("TM_STARTUP_DISPATCH");
         for command in commands.split(';').filter(|c| !c.trim().is_empty()) {
             let command = command.trim();
             if let Some(ms) = command.strip_prefix("sleep:") {
