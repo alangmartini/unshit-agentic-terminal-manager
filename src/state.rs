@@ -6027,19 +6027,25 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
-    let hooks = std::sync::Arc::new(hooks);
-    if EDITOR_OPEN_HOOKS.set(hooks.clone()).is_ok() {
-        if let Err(error) = std::thread::Builder::new()
-            .name("explorer-refresh".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if refresh_explorer_once(&hooks.shared) {
-                    (hooks.request_rebuild)();
-                }
-            })
-        {
-            log::warn!("Could not start explorer refresh: {error}");
-        }
+    let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+}
+
+/// Polls visible explorer folders for filesystem changes about once a
+/// second (see `refresh_explorer_once`). No-op if hooks are not registered.
+pub fn start_explorer_refresh() {
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("explorer-refresh".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if refresh_explorer_once(&hooks.shared) {
+                (hooks.request_rebuild)();
+            }
+        })
+    {
+        log::warn!("Could not start explorer refresh: {error}");
     }
 }
 

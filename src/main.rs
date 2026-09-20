@@ -1433,6 +1433,7 @@ fn main() {
                 }
             }),
         });
+        crate::state::start_explorer_refresh();
     }
 
     // Set up PTY output subscriptions.

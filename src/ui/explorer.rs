@@ -1,8 +1,6 @@
 use std::path::Path;
 use unshit::core::element::*;
-use unshit::core::event::{
-    Event, EventType, Key, KeyEventKind, Modifiers, RequestRebuild, RequestScrollIntoView,
-};
+use unshit::core::event::{Event, EventType, Key, KeyEventKind, Modifiers, RequestScrollIntoView};
 use unshit::core::style::parse::StyleDeclaration;
 
 use crate::explorer::{Explorer, Listing};
@@ -62,16 +60,15 @@ pub fn build_explorer(snapshot: &UiSnapshot, shared: &SharedState) -> ElementDef
                     && (key.modifiers.is_empty()
                         || (key.modifiers == Modifiers::SHIFT && matches!(key.key, Key::Char(_))))
                 {
-                    let changed = mutate_with(&keyboard_state, |state| handle_key(state, key.key));
-                    if changed {
-                        if let Some(path) =
-                            mutate_with(&keyboard_state, |state| state.explorer.selected.clone())
-                        {
-                            return Some(Box::new(RequestScrollIntoView(crate::explorer::row_id(
-                                &path,
-                            ))));
-                        }
-                        return Some(Box::new(RequestRebuild));
+                    let revealed = mutate_with(&keyboard_state, |state| {
+                        handle_key(state, key.key)
+                            .then(|| state.explorer.selected.clone())
+                            .flatten()
+                    });
+                    if let Some(path) = revealed {
+                        return Some(Box::new(RequestScrollIntoView(crate::explorer::row_id(
+                            &path,
+                        ))));
                     }
                 }
             }
