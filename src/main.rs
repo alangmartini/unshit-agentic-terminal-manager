@@ -1195,13 +1195,11 @@ fn main() {
                 true
             })),
             on_file_drop: Some(Arc::new(move |paths: &[std::path::PathBuf]| -> bool {
-                // Native drag-and-drop. When the Quick Prompt overlay is
-                // open, attach any dropped image files as chips (the
-                // drag-and-drop counterpart to Ctrl+V). When it is closed,
-                // `attach_dropped_images` is a no-op and we request no
-                // rebuild, leaving terminal drops untouched.
+                // The review overlay accepts one patch; Quick Prompt accepts
+                // images. Both handlers are no-ops while their overlay is closed.
                 let mut guard = file_drop_shared.lock_recover();
-                crate::state::attach_dropped_images(&mut guard, paths)
+                crate::diff_review::accept_drop(&mut guard, paths)
+                    || crate::state::attach_dropped_images(&mut guard, paths)
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;

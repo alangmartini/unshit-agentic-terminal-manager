@@ -30,6 +30,8 @@ pub struct Report {
     pub head: String,
     pub label: String,
     pub files: Vec<File>,
+    /// Imported rows, indexed like files; absent for Git ranges.
+    pub patches: Option<Vec<Vec<Line>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,6 +271,7 @@ pub fn load(dir: &Path, range: &Range) -> Result<Report, String> {
     )?;
     let files = parse_numstat(&bytes)?;
     Ok(Report {
+        patches: None,
         root,
         base,
         head,

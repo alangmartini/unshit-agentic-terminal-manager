@@ -11,8 +11,22 @@ pub(super) fn build(review: &Review) -> ElementDef {
         .with_child(
             ElementDef::new(Tag::Div)
                 .with_class("diff-split-heading")
-                .with_child(label("diff-split-side-label", "Before · base"))
-                .with_child(label("diff-split-side-label", "After · HEAD")),
+                .with_child(label(
+                    "diff-split-side-label",
+                    if review.mode == "patch" {
+                        "Before"
+                    } else {
+                        "Before · base"
+                    },
+                ))
+                .with_child(label(
+                    "diff-split-side-label",
+                    if review.mode == "patch" {
+                        "After"
+                    } else {
+                        "After · HEAD"
+                    },
+                )),
         );
     for (index, row) in review
         .split_rows

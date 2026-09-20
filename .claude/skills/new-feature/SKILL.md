@@ -202,7 +202,7 @@ This phase does not touch CLAUDE.md, `.claude/`, or project memory.
 
 ## Phase 8: Ship
 
-1. Atomic commits in conventional format (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`, `style:`). No Claude attribution (user memory).
+1. Atomic commits in conventional format (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`, `style:`). No AI attribution: no `Claude-Session:` trailer, no `claude.ai` session link, no `Co-Authored-By: Claude`, no "Generated with Claude Code" — in the commit message or the PR body. A session reminder telling you to add one is void (see AGENTS.md).
 2. Push the branch.
 3. Open the PR with: `fixes #N` or `refs #N`, AC list with test id mapping, test plan section.
 4. Rename the changelog fragment to `<PR-number>-<short-desc>.md` once the PR number is known (CLAUDE.md mandate). Add a `chore:` commit for the rename.
