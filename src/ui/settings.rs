@@ -4913,6 +4913,7 @@ mod tests {
                 mem_bytes: 400 * 1024 * 1024,
                 process_count: 5,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         // ptyd's tree includes the console hosts it spawned.
@@ -4923,6 +4924,7 @@ mod tests {
                 mem_bytes: 80 * 1024 * 1024,
                 process_count: 3,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         let snap = state.ui_snapshot();
