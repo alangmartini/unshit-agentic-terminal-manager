@@ -151,6 +151,9 @@ impl TestHarness {
         // Check scrollbar hit first
         if let Some(hit) = scroll::find_scrollbar_at(&self.arena, self.root, x, y) {
             match hit.part {
+                ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                    scroll::scroll_from_arrow(&mut self.arena, &hit);
+                }
                 ScrollbarPart::Thumb => {
                     let grab_offset = match hit.axis {
                         ScrollbarAxis::Vertical => y - hit.geometry.thumb_y,
