@@ -106,13 +106,18 @@ app (daemon included) and brings the workspace layout back with fresh shells.
    `CheckSource::Install`, which chains into the install when one is found.
 2. Unmanaged copy (`install_scope` is `None`) → opens the release page and
    records `update.install_redirected`.
-3. Otherwise the phase becomes `Downloading`, `update.download_started` is
+3. An installer asset without a SHA-256 digest fails closed:
+   `update.install_failed` with `error_kind: digest_missing`, the phase
+   becomes `Failed` and the message points at the release page. GitHub
+   publishes a digest for every asset of this repository's releases, so this
+   only fires for a feed that was hand-built without one.
+4. Otherwise the phase becomes `Downloading`, `update.download_started` is
    recorded and a worker streams the asset to
    `<cache_dir>\updates\<asset>.partial` (`%LOCALAPPDATA%\com.godly.terminal[.<tag>]\updates`),
-   hashing as it goes. Size must match; the digest must match when the feed
-   has one (`digest_verified`, else `size_only`); the file is then renamed to
-   its final name. Progress reaches the UI at most every 256 KB or 100 ms.
-4. `finish_install` (on the UI thread, phase `Installing`): persist the layout
+   hashing as it goes. Size and digest must both match (`digest_verified`);
+   the file is then renamed to its final name. Progress reaches the UI at
+   most every 256 KB or 100 ms.
+5. `finish_install` (on the UI thread, phase `Installing`): persist the layout
    (`update.layout_persisted`; failure aborts with `workspace_write`), launch
    the installer detached with `installer_args`, record
    `update.install_launched` with the child pid and scope, force-stop the daemon
@@ -179,7 +184,7 @@ relevant, `source` (`startup|manual|install`), `latest_version`, `outcome`,
 | `update.startup_check_toggled` | the settings switch, `outcome` = `on`/`off` |
 | `update.release_page_opened` / `update.release_page_failed` | What's new / open release page |
 | `update.install_redirected` | install requested on an unmanaged copy |
-| `update.download_started` / `update.download_completed` / `update.download_failed` | completed carries `outcome` = `digest_verified`/`size_only`, `bytes`, `elapsed_ms` |
+| `update.download_started` / `update.download_completed` / `update.download_failed` | completed carries `outcome` = `digest_verified` (`size_only` is reachable only through the transport's unit tests; installs without a digest are refused before the download), `bytes`, `elapsed_ms` |
 | `update.stale_downloads_removed` | startup sweep of old `.partial`/installer files (the relaunched app deletes the installer it was just updated by); `bytes` = bytes freed, `total_bytes` = number of files |
 | `update.layout_persisted` / `update.install_launched` / `update.install_failed` | the hand-off; launched carries the installer `pid` and `scope` |
 | `update.daemon_shutdown` / `update.exiting` | last two lines before the process exits |

@@ -643,6 +643,21 @@ pub fn begin_install(state: &mut AppState) -> bool {
         );
         return true;
     };
+    // Fail closed: TLS protects the transport, the digest is what ties the
+    // bytes to what the release published. GitHub attaches one to every
+    // asset of this repository's releases, so refusing without it costs
+    // nothing in practice and closes the size-only path for good.
+    if asset.sha256.is_none() {
+        fail_install(
+            state,
+            "digest_missing",
+            format!(
+                "Release {} does not publish a SHA-256 checksum for its installer, so it will not be installed automatically. Open the release page to update manually.",
+                release.version
+            ),
+        );
+        return true;
+    }
     let Some(dir) = updates_dir() else {
         fail_install(
             state,
@@ -978,6 +993,30 @@ mod tests {
         apply_check_result(&mut state, CheckSource::Startup, Ok(release("99.1.0")));
         assert_eq!(state.confirm_dialog, Some(ConfirmDialog::UpdateAvailable));
         assert_eq!(state.update.prompted_version.as_deref(), Some("99.1.0"));
+    }
+
+    #[test]
+    fn install_refuses_a_release_without_a_digest() {
+        let mut state = state_with(Some(InstallScope::CurrentUser));
+        let mut unsigned = newer();
+        unsigned.installer.as_mut().unwrap().sha256 = None;
+        apply_check_result(&mut state, CheckSource::Manual, Ok(unsigned));
+        assert!(dispatch(&mut state, "update.install"));
+        assert_eq!(state.update.phase, UpdatePhase::Failed);
+        assert!(
+            state
+                .update
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("SHA-256 checksum")),
+            "{:?}",
+            state.update.error
+        );
+        assert!(!state.update.busy(), "nothing was downloaded");
+        assert!(
+            state.update.newer_release().is_some(),
+            "the release stays known so the release page can be opened"
+        );
     }
 
     #[test]

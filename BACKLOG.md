@@ -185,13 +185,15 @@ The audit surfaced adjacent hazards that are not yet fixed:
 - [ ] **Release notes in-app.** *What's new* opens the release page in the
   browser; the GitHub feed already carries the Markdown body. Render it in the
   update dialog (a read-only scroller) once a Markdown-to-element pass exists.
-- [ ] **Missing digest policy.** GitHub only publishes `digest` for assets
-  uploaded after mid-2025; it does for this repo's releases (verified against
-  the 0.4.0 installer on 2026-09-07 by the ignored
-  `live_release_installer_downloads_and_verifies` test). The updater still
-  accepts a size-only match when the feed has no digest and records
-  `"outcome":"size_only"`; consider publishing a `SHA256SUMS` asset from the
-  release script and refusing to install without either.
+- [x] **Missing digest policy.** Decided 2026-09-20: fail closed. GitHub
+  publishes `digest` for every asset of this repository's releases (verified
+  against the 0.4.0 installer on 2026-09-07 by the ignored
+  `live_release_installer_downloads_and_verifies` test), so `begin_install`
+  refuses a release whose installer carries no digest (`update.install_failed`
+  with `error_kind: digest_missing`, and Settings › Updates points at the
+  release page). The transport keeps its size-only mode for unit tests only.
+  Revisit only if a release is ever published through a path that drops the
+  digest; a `SHA256SUMS` asset would be the fallback then.
 - [ ] **Delta / background download.** The installer (~30 MB) downloads only
   after the user clicks install. Pre-downloading when the prompt appears
   would make the click instant; needs a disk-usage cap and cleanup policy
@@ -200,6 +202,9 @@ The audit surfaced adjacent hazards that are not yet fixed:
   passes `/ALLUSERS` and the installer will request elevation via UAC; that
   path has no automated coverage because the e2e never runs a real installer.
 - [ ] **Non-GPU installer.** The feed picks `terminal-manager-*-setup.exe`
-  and skips `non-gpu`; a copy installed from the non-GPU package would be
-  updated to the GPU build. Record the flavour in the registry at install
-  time and select the matching asset.
+  and skips `non-gpu`, so a copy installed from the non-GPU package is
+  updated to the standard package. Harmless today: the two `.iss` files
+  package the same two executables and differ only in `OutputBaseFilename`
+  (the non-GPU name exists for software-renderer test runs, and releases
+  attach only the standard installer). If the flavours ever diverge, record
+  the flavour in the registry at install time and select the matching asset.

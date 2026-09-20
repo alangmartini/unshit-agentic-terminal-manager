@@ -1996,7 +1996,7 @@ mod tests {
                 name: "terminal-manager-99.0.0-setup.exe".into(),
                 url: "https://example.invalid/setup.exe".into(),
                 size: 1000,
-                sha256: None,
+                sha256: Some([0x42; 32]),
             }),
         }
     }

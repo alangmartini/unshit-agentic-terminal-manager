@@ -8,8 +8,10 @@
   daemon and hands off to the installer, which waits for the app to exit,
   installs silently and relaunches it. Workspaces and tabs come back with
   fresh shells; the prompt says so and nothing installs without a click.
-  Copies not set up by the installer (source builds) get *open release page*
-  instead. Dev and test profiles never poll GitHub unless
+  A release whose installer carries no published SHA-256 checksum is never
+  installed automatically; Settings shows why and points at the release
+  page. Copies not set up by the installer (source builds) get *open release
+  page* instead. Dev and test profiles never poll GitHub unless
   `TM_UPDATE_FEED_URL` points them at a feed; `TM_UPDATE_STARTUP_DELAY_MS`
   and `TM_UPDATE_INSTALL_SCOPE` cover the other knobs. Every step is
   recorded in the profile's `update-events.jsonl`. The installer side of the
