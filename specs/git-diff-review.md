@@ -23,6 +23,17 @@ falling back to the active workspace directory. Capture it when opening.
   width with horizontal scrolling on narrow windows. Default remains unified.
 - Last N commits (first-parent history), unpushed commits against the locally
   known push target, and a base branch/ref comparison using merge-base.
+- An empty base ref automatically uses the locally recorded `origin/HEAD`,
+  falling back to an existing local `main` or `master`. If none is available,
+  ask for an explicit ref. Never assume that `main` exists or fetch to discover
+  the default. Invalid explicit refs identify the input and explain how to fix it.
+- Compare branches accepts separate From and To refs (local branches, remote
+  tracking refs, tags, or commits). From defaults to the automatic base and To
+  to `HEAD`. Compare the two committed tips directly, including differences
+  unique to either side, without switching branches or requiring shared history.
+  Show both chosen refs and the exact resolved commit IDs. Keep Compare base's
+  common-ancestor behavior separate. These follow Git's documented
+  [two-commit and merge-base comparisons](https://git-scm.com/docs/git-diff).
 - Show the exact resolved range, file list, additions/deletions, and a unified
   patch with old/new line numbers. Load only the selected file's patch.
 - Preserve rename paths, binary notices, empty states and actionable Git errors.
