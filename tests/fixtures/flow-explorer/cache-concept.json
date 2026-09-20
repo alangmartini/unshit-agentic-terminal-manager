@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "title": "How a cache serves a request",
+  "summary": "A conceptual cache-aside lookup: a hit returns stored data; a miss loads the data and fills the cache for the next request. Freshness and eviction are separate flows.",
+  "repo_root": ".",
+  "mode": "explain",
+  "processes": [
+    {
+      "id": "caller",
+      "label": "Caller"
+    },
+    {
+      "id": "cache",
+      "label": "Cache"
+    },
+    {
+      "id": "source",
+      "label": "Data source"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "request",
+      "name": "Request data",
+      "kind": "event",
+      "process": "caller",
+      "description": "A caller asks for a value by its key."
+    },
+    {
+      "id": "lookup",
+      "name": "Look up the key",
+      "kind": "function",
+      "process": "cache",
+      "description": "The cache checks whether it already holds the requested value."
+    },
+    {
+      "id": "hit",
+      "name": "Return cached value",
+      "kind": "state",
+      "process": "caller",
+      "description": "The caller receives the cached value without loading it again."
+    },
+    {
+      "id": "load",
+      "name": "Load the value",
+      "kind": "function",
+      "process": "source",
+      "description": "On a miss, the application fetches the value from its original source."
+    },
+    {
+      "id": "store",
+      "name": "Fill the cache",
+      "kind": "function",
+      "process": "cache",
+      "description": "The application stores the loaded value for future requests."
+    },
+    {
+      "id": "result",
+      "name": "Return loaded value",
+      "kind": "state",
+      "process": "caller",
+      "description": "The caller receives the value loaded from the source."
+    },
+    {
+      "id": "cache.hit",
+      "name": "Cache hit",
+      "kind": "event",
+      "process": "cache",
+      "description": "The key has a cached value, so the caller can use it immediately."
+    },
+    {
+      "id": "cache.miss",
+      "name": "Cache miss",
+      "kind": "event",
+      "process": "cache",
+      "description": "The key has no cached value, so the application must load it."
+    }
+  ],
+  "edges": [
+    {
+      "from": "request",
+      "to": "lookup",
+      "kind": "handled_by"
+    },
+    {
+      "from": "lookup",
+      "to": "cache.hit",
+      "kind": "calls"
+    },
+    {
+      "from": "cache.hit",
+      "to": "hit",
+      "kind": "handled_by"
+    },
+    {
+      "from": "lookup",
+      "to": "cache.miss",
+      "kind": "calls"
+    },
+    {
+      "from": "cache.miss",
+      "to": "load",
+      "kind": "handled_by"
+    },
+    {
+      "from": "load",
+      "to": "store",
+      "kind": "calls"
+    },
+    {
+      "from": "store",
+      "to": "result",
+      "kind": "resolves"
+    }
+  ],
+  "entries": [
+    "request"
+  ],
+  "next_flow": "Expiration, invalidation, and eviction decide when cached data stops being usable."
+}

@@ -101,6 +101,11 @@ fn build_settings_page_rail(state: &UiSnapshot, shared: &SharedState) -> Element
                 .with_child(settings_nav_item(SettingsSection::Shell, active, shared))
                 .with_child(settings_nav_item(SettingsSection::Sessions, active, shared))
                 .with_child(settings_nav_group("automation"))
+                .with_child(settings_nav_item(
+                    SettingsSection::AgentSkills,
+                    active,
+                    shared,
+                ))
                 .with_child(settings_nav_item(SettingsSection::Keybinds, active, shared))
                 .with_child(settings_nav_item(
                     SettingsSection::Notifications,
@@ -138,6 +143,7 @@ fn settings_section_title(section: SettingsSection) -> &'static str {
         SettingsSection::Keybinds => "Keybinds",
         SettingsSection::Sessions => "Sessions",
         SettingsSection::Notifications => "Notifications",
+        SettingsSection::AgentSkills => "Agent skills",
         SettingsSection::DangerZone => "Danger Zone",
     }
 }
@@ -159,9 +165,7 @@ fn settings_nav_item(
     item.on_click(move || {
         mutate_with(&s, |st| {
             st.settings_section = section;
-            if section == SettingsSection::Sessions {
-                crate::state::refresh_sessions(st);
-            }
+            crate::state::refresh_settings_section(st, section);
         });
     })
 }
@@ -173,6 +177,7 @@ fn settings_nav_class(section: SettingsSection) -> &'static str {
         SettingsSection::Sessions => "nav-sessions",
         SettingsSection::Keybinds => "nav-keybinds",
         SettingsSection::Notifications => "nav-notifications",
+        SettingsSection::AgentSkills => "nav-agent-skills",
         SettingsSection::DangerZone => "nav-danger-zone",
     }
 }
@@ -184,6 +189,7 @@ fn settings_nav_icon(section: SettingsSection) -> SvgNode {
         SettingsSection::Keybinds => icon_chevrons(),
         SettingsSection::Sessions => icon_folder(),
         SettingsSection::Notifications => icon_bell(),
+        SettingsSection::AgentSkills => icon_chevrons(),
         SettingsSection::DangerZone => icon_settings_nav_close(),
     }
 }
@@ -221,6 +227,7 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
             "Login startup, agent recovery, daemon sessions, and workspace attachment."
         }
         SettingsSection::Notifications => "Desktop notifications and focused panes.",
+        SettingsSection::AgentSkills => "Create interactive flows from concepts, explanations, and code in your agent conversations.",
         SettingsSection::DangerZone => "Destructive session and close behavior.",
     }
 }
@@ -238,6 +245,7 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
         SettingsSection::Keybinds => body.with_child(build_keybinds_section(state, shared)),
         SettingsSection::Sessions => body.with_child(build_sessions_section(state, shared)),
         SettingsSection::Notifications => body.with_child(build_notifications_section(shared)),
+        SettingsSection::AgentSkills => body.with_child(build_agent_skills_section(state, shared)),
         SettingsSection::DangerZone => body.with_child(build_danger_zone_section(state, shared)),
     };
     body
@@ -1034,6 +1042,75 @@ fn preview_span(palette: &AppearancePreviewPalette, class: &str, text: &str) -> 
     span
 }
 
+fn skill_action(shared: &SharedState, agent_id: &str, action: &str, label: &str) -> ElementDef {
+    let shared = shared.clone();
+    let command = format!("flow.skill.{action}:{agent_id}");
+    ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_id(format!("flow-skill-{action}-{agent_id}"))
+        .with_tab_index(0)
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("btn-label")
+                .with_text(label),
+        )
+        .on_click(move || {
+            mutate_with(&shared, |state| dispatch(state, &command));
+        })
+}
+
+fn build_agent_skills_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    use crate::flow_explorer::skills::InstallStatus;
+    let mut card = set_card("Flow Explorer", Some("personal skill · all projects"))
+        .with_child(ElementDef::new(Tag::Div)
+            .with_class("flow-skill-help")
+            .with_text("Ask your agent: “Use flow-explorer to visualize what you just explained.” The skill creates a diagram and opens it in Unshit. Start a new agent session if it does not appear."));
+    for installation in &state.flow_skill_installations {
+        let mut controls = ElementDef::new(Tag::Div).with_class("flow-skill-actions");
+        match installation.status {
+            InstallStatus::Missing => {
+                controls = controls.with_child(skill_action(
+                    shared,
+                    installation.agent.id(),
+                    "install",
+                    "Install",
+                ));
+            }
+            InstallStatus::Installed | InstallStatus::UpdateAvailable => {
+                if installation.status == InstallStatus::UpdateAvailable {
+                    controls = controls.with_child(skill_action(
+                        shared,
+                        installation.agent.id(),
+                        "install",
+                        "Update",
+                    ));
+                }
+                controls = controls.with_child(skill_action(
+                    shared,
+                    installation.agent.id(),
+                    "remove",
+                    "Remove copy",
+                ));
+            }
+            _ => {}
+        }
+        let details = format!(
+            "{}\n{}",
+            installation.status.label(),
+            installation.path.display()
+        );
+        card = card.with_child(settings_page_field(
+            installation.agent.label(),
+            Some(&details),
+            controls,
+            state.config_font_size_pt,
+        ));
+    }
+    card.with_child(ElementDef::new(Tag::Div)
+        .with_class("flow-skill-help")
+        .with_text("Installs on this computer. Custom skills are preserved. Some agents also read other agents’ skill folders; removing a copy here does not disable copies elsewhere."))
+}
+
 fn build_settings_page_savebar(section: SettingsSection, shared: &SharedState) -> ElementDef {
     let close_state = shared.clone();
     let reset_state = shared.clone();
@@ -1041,6 +1118,7 @@ fn build_settings_page_savebar(section: SettingsSection, shared: &SharedState) -
     // sections reset appearance settings.
     let (reset_label, reset_cmd) = match section {
         SettingsSection::Keybinds => ("restore defaults", "keybind.reset_all"),
+        SettingsSection::AgentSkills => ("refresh status", "flow.skill.refresh"),
         _ => ("reset", "appearance.reset"),
     };
     ElementDef::new(Tag::Div)
@@ -1134,9 +1212,7 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
         item = item.on_click(move || {
             mutate_with(&s, |st| {
                 st.settings_section = target;
-                if target == SettingsSection::Sessions {
-                    crate::state::refresh_sessions(st);
-                }
+                crate::state::refresh_settings_section(st, target);
             });
         });
         nav = nav.with_child(item);
@@ -1151,6 +1227,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Keybinds => build_keybinds_section(state, shared),
         SettingsSection::Sessions => build_sessions_section(state, shared),
         SettingsSection::Notifications => build_notifications_section(shared),
+        SettingsSection::AgentSkills => build_agent_skills_section(state, shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)
@@ -2441,6 +2518,43 @@ mod tests {
         state.ui_snapshot()
     }
 
+    #[test]
+    fn flow_skill_controls_follow_installation_status_without_touching_disk() {
+        use crate::flow_explorer::skills::{InstallStatus, SkillAgent, SkillInstallation};
+        let mut snapshot = make_snapshot_section(SettingsSection::AgentSkills);
+        snapshot.flow_skill_installations = SkillAgent::ALL
+            .into_iter()
+            .zip([
+                InstallStatus::Missing,
+                InstallStatus::Installed,
+                InstallStatus::UpdateAvailable,
+                InstallStatus::Conflict,
+            ])
+            .map(|(agent, status)| SkillInstallation {
+                agent,
+                status,
+                path: std::path::PathBuf::from(agent.relative_dir()).join("SKILL.md"),
+            })
+            .collect();
+        let page = build_settings_page(&snapshot, &make_shared());
+        for id in [
+            "flow-skill-install-codex",
+            "flow-skill-remove-claude",
+            "flow-skill-install-cursor",
+            "flow-skill-remove-cursor",
+        ] {
+            assert!(find_by_id(&page, id).unwrap().on_click.is_some());
+        }
+        for id in [
+            "flow-skill-remove-codex",
+            "flow-skill-install-claude",
+            "flow-skill-install-copilot",
+            "flow-skill-remove-copilot",
+        ] {
+            assert!(find_by_id(&page, id).is_none());
+        }
+    }
+
     fn text_of(el: &ElementDef) -> Option<&str> {
         match &el.content {
             ElementContent::Text(s) => Some(s.as_str()),
@@ -3044,8 +3158,8 @@ mod tests {
         let thumb_luma =
             u16::from(thumb_sample[0]) + u16::from(thumb_sample[1]) + u16::from(thumb_sample[2]);
         assert!(
-            thumb_luma > page_luma + 2 && thumb_luma < 100,
-            "idle settings scrollbar should be visible but subdued, page={page_sample:?}, thumb={thumb_sample:?}"
+            thumb_luma > page_luma + 90,
+            "idle settings scrollbar should be clearly visible, page={page_sample:?}, thumb={thumb_sample:?}"
         );
     }
 
@@ -3838,10 +3952,10 @@ mod tests {
         let snap = make_snapshot_section(SettingsSection::Appearance);
         let rail = build_settings_page_rail(&snap, &shared);
         let nav = &rail.children[2];
-        let shell = &nav.children[2];
-        let keybinds = &nav.children[5];
-        let notifications = &nav.children[6];
-        let danger = &nav.children[7];
+        let shell = find_first_with_class(nav, "nav-shell").unwrap();
+        let keybinds = find_first_with_class(nav, "nav-keybinds").unwrap();
+        let notifications = find_first_with_class(nav, "nav-notifications").unwrap();
+        let danger = find_first_with_class(nav, "nav-danger-zone").unwrap();
 
         assert!(shell.classes.contains(&"nav-shell".to_string()));
         assert!(keybinds.classes.contains(&"nav-keybinds".to_string()));
@@ -3903,10 +4017,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_nav_has_six_items() {
+    fn modal_nav_includes_every_section() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        assert_eq!(el.children.len(), 6);
+        assert_eq!(el.children.len(), SettingsSection::all().len());
     }
 
     #[test]
@@ -3951,7 +4065,12 @@ mod tests {
     fn modal_nav_marks_danger_zone_active() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::DangerZone, &shared);
-        assert!(el.children[5].classes.contains(&"active".to_string()));
+        assert!(el
+            .children
+            .last()
+            .unwrap()
+            .classes
+            .contains(&"active".to_string()));
     }
 
     #[test]
@@ -4583,7 +4702,7 @@ mod tests {
     fn nav_item_click_changes_to_danger_zone() {
         let shared = make_shared();
         let el = build_modal_nav(SettingsSection::Appearance, &shared);
-        (el.children[5].on_click.as_ref().unwrap())();
+        (el.children.last().unwrap().on_click.as_ref().unwrap())();
         assert_eq!(
             shared.lock().unwrap().settings_section,
             SettingsSection::DangerZone
@@ -4794,6 +4913,7 @@ mod tests {
                 mem_bytes: 400 * 1024 * 1024,
                 process_count: 5,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         // ptyd's tree includes the console hosts it spawned.
@@ -4804,6 +4924,7 @@ mod tests {
                 mem_bytes: 80 * 1024 * 1024,
                 process_count: 3,
                 root_exe: None,
+                processes: Default::default(),
             },
         );
         let snap = state.ui_snapshot();

@@ -289,21 +289,21 @@ pub(crate) fn parse_unified_diff_with_cap(input: &str, cap: usize) -> DiffDocume
                         let (old_no, new_no) = match kind {
                             DiffRowKind::Context => {
                                 let pair = (Some(ctx.old_no), Some(ctx.new_no));
-                                ctx.old_no += 1;
-                                ctx.new_no += 1;
+                                ctx.old_no = ctx.old_no.saturating_add(1);
+                                ctx.new_no = ctx.new_no.saturating_add(1);
                                 old_rem = old_rem.saturating_sub(1);
                                 new_rem = new_rem.saturating_sub(1);
                                 pair
                             }
                             DiffRowKind::Added => {
                                 let pair = (None, Some(ctx.new_no));
-                                ctx.new_no += 1;
+                                ctx.new_no = ctx.new_no.saturating_add(1);
                                 new_rem = new_rem.saturating_sub(1);
                                 pair
                             }
                             _ => {
                                 let pair = (Some(ctx.old_no), None);
-                                ctx.old_no += 1;
+                                ctx.old_no = ctx.old_no.saturating_add(1);
                                 old_rem = old_rem.saturating_sub(1);
                                 pair
                             }
@@ -1545,6 +1545,15 @@ mod tests {
             split_git_paths("a/x b/y.rs b/x b/y.rs"),
             (Some("x b/y.rs".to_string()), Some("x b/y.rs".to_string()))
         );
+    }
+
+    #[test]
+    fn external_patch_line_numbers_do_not_overflow() {
+        let doc = parse_unified_diff(
+            "diff --git a/a.txt b/a.txt\n@@ -4294967295 +4294967295 @@\n-old\n+new\n",
+        );
+        assert_eq!(doc.rows[2].old_no, Some(u32::MAX));
+        assert_eq!(doc.rows[3].new_no, Some(u32::MAX));
     }
 
     // A missing count in a hunk header means exactly one line; a malformed

@@ -581,6 +581,7 @@ struct AppState {
     dw_rasterizer: DwRasterizer,
     interaction: InteractionState,
     needs_rebuild: bool,
+    pending_scroll_into_view: Option<String>,
     needs_restyle: bool,
     needs_relayout: bool,
     /// When `Some`, the next `needs_restyle` pass cascades from this node
@@ -714,6 +715,26 @@ struct AppState {
     /// zero. Only used when [`AppConfig::tree_fn_bump`] is set; left
     /// unused otherwise.
     frame_arena: FrameArena,
+}
+
+/// Reveal an element by its HTML id in its nearest scroll container, and
+/// cancel any in-flight smooth-scroll animation that would move it away
+/// again. No-op when the id has no live element or no scrollable ancestor.
+fn reveal_element_by_id(state: &mut AppState, id: &str) {
+    let Some(target) = state
+        .arena
+        .iter()
+        .find(|(_, element)| element.id.as_deref() == Some(id))
+        .map(|(node, _)| node)
+    else {
+        return;
+    };
+    let Some(container) = scroll::scroll_into_view(&mut state.arena, &state.taffy, target) else {
+        return;
+    };
+    if state.smooth_scroll.is_some_and(|animation| animation.node_id == container) {
+        state.smooth_scroll = None;
+    }
 }
 
 const WINDOW_RESIZE_GRIP_SIZE: f32 = 14.0;
@@ -3060,6 +3081,7 @@ impl AppHandler {
             dw_rasterizer,
             interaction: InteractionState::default(),
             needs_rebuild: false,
+            pending_scroll_into_view: None,
             needs_restyle: false,
             needs_relayout: false,
             restyle_root: None,
@@ -3208,6 +3230,10 @@ impl ApplicationHandler for AppHandler {
         for event in self.event_rx.try_iter() {
             match event {
                 ExternalEvent::RequestRebuild => {
+                    coalescer.observe(true);
+                }
+                ExternalEvent::ScrollIntoView(id) => {
+                    state.pending_scroll_into_view = Some(id);
                     coalescer.observe(true);
                 }
                 ExternalEvent::RequestRedraw => {
@@ -3898,6 +3924,9 @@ impl ApplicationHandler for AppHandler {
                             ) {
                                 state.smooth_scroll = None;
                                 match hit.part {
+                                    ScrollbarPart::Decrement | ScrollbarPart::Increment => {
+                                        scroll::scroll_from_arrow(&mut state.arena, &hit);
+                                    }
                                     ScrollbarPart::Thumb => {
                                         let grab_offset = match hit.axis {
                                             ScrollbarAxis::Vertical => {
@@ -4489,12 +4518,20 @@ impl ApplicationHandler for AppHandler {
                                         modifiers: combo.modifiers,
                                         text: event.text.as_ref().map(|t| t.to_string()),
                                     });
+                                    let mut reveal_id = None;
                                     if let Some(element) = state.arena.get(focused_id) {
                                         for (et, handler) in &element.handlers {
                                             if *et == EventType::KeyboardCapture {
-                                                handler(&kbd_event);
+                                                if let Some(response) = handler(&kbd_event) {
+                                                    if let Ok(request) = response.downcast::<unshit_core::event::RequestScrollIntoView>() {
+                                                        reveal_id = Some(request.0);
+                                                    }
+                                                }
                                             }
                                         }
+                                    }
+                                    if let Some(id) = reveal_id {
+                                        reveal_element_by_id(state, &id);
                                     }
                                     state.needs_rebuild = true;
                                     state.window.request_redraw();
@@ -5137,6 +5174,9 @@ impl ApplicationHandler for AppHandler {
                         metrics.layout_us = t3.elapsed().as_micros() as u64;
                     }
 
+                    if let Some(id) = state.pending_scroll_into_view.take() {
+                        reveal_element_by_id(state, &id);
+                    }
                     metrics.node_count = state.arena.len();
                     state.needs_rebuild = false;
                     state.needs_restyle = false;

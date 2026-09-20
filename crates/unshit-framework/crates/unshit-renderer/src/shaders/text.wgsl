@@ -43,7 +43,15 @@ fn vs_main(
         instance.xform.x + 1.0, instance.xform.y,
         instance.xform.z, instance.xform.w + 1.0,
     );
-    let pixel_pos = xform_m * local_pixel_pos + instance.xform_translate;
+    var pixel_pos = xform_m * local_pixel_pos + instance.xform_translate;
+    // Coverage bitmaps already encode subpixel positioning. At 1:1 scale,
+    // place their texels on device pixels after all translations (including
+    // cached-row scrolling). Half-pixel quads put nearest samples on texel
+    // boundaries, where interpolation error tears strokes across triangles.
+    // Keep scaled/rotated text on its original affine transform.
+    if all(instance.xform == vec4<f32>(0.0)) {
+        pixel_pos = floor(pixel_pos + vec2<f32>(0.5));
+    }
     let ndc = vec2(
         (pixel_pos.x / uniforms.viewport.x) * 2.0 - 1.0,
         1.0 - (pixel_pos.y / uniforms.viewport.y) * 2.0,

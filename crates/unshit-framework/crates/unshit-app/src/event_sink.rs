@@ -6,6 +6,8 @@ use winit::event_loop::EventLoopProxy;
 pub enum ExternalEvent {
     /// Request a full tree rebuild + re-render.
     RequestRebuild,
+    /// Rebuild, then reveal an element by id after its new layout is available.
+    ScrollIntoView(String),
     /// Request re-render without rebuilding the tree (repaint only).
     RequestRedraw,
     /// Request an animation repaint. This bypasses redraw coalescing once so

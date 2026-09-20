@@ -1,19 +1,33 @@
 ---
 name: flow-explorer
-description: Author a Flow Explorer JSON model of one user-facing flow through a codebase (explain a flow, or review the flows a change touches) for the Unshit Terminal Manager Flow Explorer pane.
+description: Visualize a concept, explanation, process, code flow, or change as an interactive flow in Unshit Terminal Manager. Use when the user asks for a flow diagram or wants to visualize what you are explaining. Produces Flow Explorer JSON, not HTML or Mermaid.
 ---
 
 # Flow Explorer producer
 
-You are writing a structured model of **one user-facing flow** through a
-codebase so a reviewer can navigate it as a call stack, Miller columns and
-a swim-lane graph instead of reading a raw diff. The app renders the JSON
-you write; you do the analysis.
+Turn **one coherent explanation or flow** into a structured model the user
+can navigate as a call stack, Miller columns and a swim-lane graph. The app
+renders the JSON you write; you supply the explanation and relationships.
 
-This is a read-only task: do not edit repository files, do not commit, do
-not run the build. Run the analysis in the repository you were started in.
+Creating a diagram does not require editing source code, committing, or
+running a build. For code flows, analyze the repository you were started in.
+For concepts, use the current conversation; a repository is not required.
+Preserve the user's broader task if they ask for a diagram during other work.
 
 ## Modes
+
+**concepts and explanations** — use `mode: "explain"`. If the user says
+"visualize that", use the explanation already in the conversation. Map its
+steps, causes, decisions, and outcomes. Use `processes` for actors or logical
+lanes, `function` nodes for operations (they need not be real functions),
+`event` nodes for triggers or messages, and `state` nodes for conditions or
+results. Represent branch outcomes as named events (for example, `Cache hit`
+and `Cache miss`) so their meaning is visible in each view. Use the existing
+edge kinds to connect these steps. Set `repo_root` to `"."`,
+omit `git_ref`, `diff_range`, and `location`, and give every visible step a
+process. Only use a `carrier` when it has a real meaning in the explanation.
+Do not invent files, line numbers, or code symbols. Label assumptions in the
+summary and keep the diagram grounded in the explanation the user requested.
 
 **explain** — the request names a flow ("Send a prompt", "Open a file
 from the palette"). Start from the user-facing entry points that match the
@@ -56,13 +70,14 @@ because calldiff is missing, and never install it.
   grep for: `sessions.prompt`, `sessions.prompt resolves`,
   `Cmd/Ctrl+Enter in the composer`. Put what crosses the wire in `payload`
   (`{ sessionId, text } over the MessagePort`).
-- `kind` is `function`, `event` or `state`. Events carry a `carrier`
+- `kind` is `function`, `event` or `state`. Events may carry a `carrier`
   (`ui`, `ipc`, `rpc`, `http`, `fs`, `process`, `network`, `in_memory`).
   Functions carry a `process` id from `processes`.
-- Ids are stable and unique: `<file basename>::<Symbol>` for functions
+- Ids are stable and unique: short dotted names for conceptual steps;
+  `<file basename>::<Symbol>` for code functions
   (`Editor.tsx::handleKeyDown`), a dotted name for events
   (`rpc.sessions.prompt`, `rpc.sessions.prompt.resolves`).
-- `location.file` is relative to `repo_root`, forward slashes, no `..`;
+- Source-backed nodes only: `location.file` is relative to `repo_root`, forward slashes, no `..`;
   `line`/`end_line` are 1-based and must point at the real definition.
 - `edges` are ordered: the array order is the call order the reviewer
   reads top to bottom. `calls` (function → function or function → event),
@@ -76,8 +91,13 @@ because calldiff is missing, and never install it.
 ## Output
 
 Write exactly one JSON document (no Markdown fences, no prose around it)
-to the output path you were given. Write it to `<path>.tmp` first, then
-rename it to `<path>`, so a half-written file is never picked up.
+to the output path you were given. For a standalone conversation with no
+specified path, use the default output directory in the Local installation
+section below, or `~/.unshit/flows/` if there is no such section. Create that
+directory if needed and choose a new descriptive filename with a unique
+suffix, such as `cache-lookup-<uuid>.json`; preserve existing diagrams.
+Write to `<path>.tmp` first, then rename to `<path>`, so a half-written file
+is never picked up.
 
 If you cannot produce the flow (no matching entry point, the change is
 empty, the repo is not a git checkout in review mode), write the same
@@ -142,4 +162,18 @@ show the reason.
 `git_ref` is `<branch>@<short sha>` of the tree you analysed. Keep the
 document under 8 MiB (a flow is usually a few KiB).
 
-When the file is written, say so in one line and stop; the app opens it.
+## Open the result
+
+For an app-launched task with an explicit output path, the app picks up the
+file automatically. Say it was written in one line and stop.
+
+For a standalone conversation, invoke the application executable from Local
+installation below, or `terminal-manager` on PATH, with arguments
+`flow open <absolute-output-path>`. Quote paths as individual arguments for
+the current shell (PowerShell needs `&` before a quoted executable path).
+This opens the flow in the running app through local IPC; it does not start
+another UI. Keep inherited Terminal Manager environment variables intact.
+Check the exit code before saying the flow opened. If the app is unavailable,
+keep the JSON, give its full path, and tell the user to choose **Open flow…**
+in Unshit's command palette. Do not claim the visualization opened on failure.
+Continue the conversation after providing the diagram when appropriate.

@@ -11,6 +11,10 @@ A GPU-accelerated UI framework for Rust. CSS-styled, flexbox-layouted, wgpu-rend
 - **Canvas API** for custom drawing with lyon
 - **Async support** with tokio-based subscriptions and event streams
 - **Clipboard** integration
+- **Scrollbars** for overflowing `overflow: auto` / `scroll` containers: visible
+  tracks and thumbs, thumb dragging, track clicks, and arrow buttons that move
+  40 logical pixels per click. Both axes use neutral gray controls on light and dark
+  surfaces and overlay the content without changing layout. Arrow buttons do not auto-repeat.
 
 ## Quick start
 
