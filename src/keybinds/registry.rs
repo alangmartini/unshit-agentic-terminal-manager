@@ -306,6 +306,7 @@ mod tests_copy_paste_bindings {
         // Unconditional copy command. Bare Ctrl+C is handled in the
         // terminal keyboard handler and is conditional (only copies if
         // a selection exists, otherwise sends SIGINT).
+        #[cfg(target_os = "macos")]
         assert_eq!(find(&primary_combo("C")).as_deref(), Some("terminal.copy"));
         assert_eq!(find("Ctrl+Shift+C").as_deref(), Some("terminal.copy"));
     }
