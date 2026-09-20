@@ -11,6 +11,13 @@ use dwrote::{
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// A bundled font, in the same order supplied to the shaping font database.
+pub enum CustomFontSource {
+    Path(PathBuf),
+    Bytes(Arc<[u8]>),
+}
 
 /// A rasterized glyph with RGBA subpixel coverage data.
 pub struct RasterizedGlyph {
@@ -49,11 +56,21 @@ impl DwRasterizer {
     /// Create a new rasterizer and optional custom collection from bundled
     /// font files declared by the app stylesheet/configuration.
     pub fn new_with_custom_font_paths(font_name: &str, custom_font_paths: Vec<PathBuf>) -> Self {
+        Self::new_with_custom_fonts(
+            font_name,
+            custom_font_paths.into_iter().map(CustomFontSource::Path).collect(),
+        )
+    }
+
+    /// Resolve the primary face from bundled files or embedded bytes before
+    /// system fonts. Embedded data remains owned by DirectWrite's font loader.
+    pub fn new_with_custom_fonts(font_name: &str, custom_fonts: Vec<CustomFontSource>) -> Self {
         let collection = FontCollection::system();
-        let (family, resolved_name) = collection
-            .font_family_by_name(font_name)
-            .ok()
-            .flatten()
+        let custom_collection = custom_collection_from_sources(custom_fonts);
+        let (family, resolved_name) = custom_collection
+            .as_ref()
+            .and_then(|fonts| fonts.font_family_by_name(font_name).ok().flatten())
+            .or_else(|| collection.font_family_by_name(font_name).ok().flatten())
             .map(|f| (f, font_name.to_string()))
             .or_else(|| {
                 collection
@@ -82,7 +99,7 @@ impl DwRasterizer {
         Self {
             font_face,
             system_collection: collection,
-            custom_collection: custom_collection_from_paths(custom_font_paths),
+            custom_collection,
             gdi_interop,
             rendering_params,
             design_units_per_em,
@@ -249,8 +266,14 @@ struct UiFontFace {
     design_units_per_em: u16,
 }
 
-fn custom_collection_from_paths(paths: Vec<PathBuf>) -> Option<FontCollection> {
-    let files = paths.into_iter().filter_map(FontFile::new_from_path).collect::<Vec<_>>();
+fn custom_collection_from_sources(sources: Vec<CustomFontSource>) -> Option<FontCollection> {
+    let files = sources
+        .into_iter()
+        .filter_map(|source| match source {
+            CustomFontSource::Path(path) => FontFile::new_from_path(path),
+            CustomFontSource::Bytes(bytes) => FontFile::new_from_buffer(Arc::new(bytes)),
+        })
+        .collect::<Vec<_>>();
     if files.is_empty() {
         return None;
     }

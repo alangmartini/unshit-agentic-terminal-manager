@@ -3454,9 +3454,9 @@ impl ApplicationHandler for AppHandler {
                     _ => None,
                 })
                 .unwrap_or("Consolas");
-            DwRasterizer::new_with_custom_font_paths(
+            DwRasterizer::new_with_custom_fonts(
                 font_name,
-                collect_directwrite_font_paths(&self.app.config.fonts, &stylesheet),
+                collect_directwrite_fonts(&self.app.config.fonts, &stylesheet),
             )
         };
 
@@ -6521,22 +6521,27 @@ fn apply_cursor_icon(window: &dyn Window, arena: &NodeArena, hovered: NodeId) {
 }
 
 #[cfg(target_os = "windows")]
-fn collect_directwrite_font_paths(
+fn collect_directwrite_fonts(
     config_fonts: &[crate::font::FontSource],
     stylesheet: &CompiledStylesheet,
-) -> Vec<PathBuf> {
+) -> Vec<unshit_renderer::dw_rasterizer::CustomFontSource> {
     use unshit_core::style::parse::FontFaceSrc;
+    use unshit_renderer::dw_rasterizer::CustomFontSource;
 
     let mut paths = Vec::new();
     for source in config_fonts {
-        if let crate::font::FontSource::Path(path) = source {
-            paths.push(path.clone());
+        match source {
+            crate::font::FontSource::Path(path) => paths.push(CustomFontSource::Path(path.clone())),
+            crate::font::FontSource::Bytes(bytes) => {
+                paths.push(CustomFontSource::Bytes(Arc::clone(bytes)))
+            }
+            _ => {}
         }
     }
     for rule in &stylesheet.font_faces {
         if let FontFaceSrc::Url(url) = &rule.src {
             if !url.starts_with("data:") {
-                paths.push(PathBuf::from(url));
+                paths.push(CustomFontSource::Path(PathBuf::from(url)));
             }
         }
     }

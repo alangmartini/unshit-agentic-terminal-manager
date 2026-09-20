@@ -185,7 +185,7 @@ static LAST_TERMINAL_RENDER_TRACE_HASH: AtomicU64 = AtomicU64::new(0);
 const WINDOWS_TERMINAL_PARITY_CALIBRATED_FG: Color = Color { r: 196, g: 196, b: 196, a: 255 };
 const WINDOWS_TERMINAL_PARITY_LITERAL_FG: Color = Color { r: 204, g: 204, b: 204, a: 255 };
 const ENV_PARITY_CELL_WIDTH_SCALE: &str = "TM_PARITY_CELL_WIDTH_SCALE";
-const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 0.996;
+const WINDOWS_TERMINAL_PARITY_CELL_WIDTH_SCALE: f32 = 1.0;
 
 fn aligned_text_x(
     render_x: f32,
@@ -1541,6 +1541,34 @@ fn stamp_xform_glyphs(glyphs: &mut [GlyphInstance], xform: [f32; 4], translate: 
     }
 }
 
+fn stamp_grid_quads(quads: &mut [QuadInstance], transform: Affine2, viewport: [f32; 4]) {
+    for quad in quads {
+        // Grid primitives use the shared viewport, except rounded corners
+        // whose cell-local rectangle is intentionally stored here instead.
+        if quad.clip_rect != viewport {
+            // Primitive-local clips are cached before viewport intersection.
+            // Move them with the content, then clip against the fixed pane.
+            let [x, y, w, h] = quad.clip_rect;
+            let points = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]];
+            let mut bounds = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+            for [px, py] in points {
+                let tx = transform.a * px + transform.c * py + transform.e;
+                let ty = transform.b * px + transform.d * py + transform.f;
+                bounds[0] = bounds[0].min(tx);
+                bounds[1] = bounds[1].min(ty);
+                bounds[2] = bounds[2].max(tx);
+                bounds[3] = bounds[3].max(ty);
+            }
+            quad.clip_rect = intersect_clip_rect(
+                viewport,
+                [bounds[0], bounds[1], bounds[2] - bounds[0], bounds[3] - bounds[1]],
+            );
+        }
+        quad.xform = transform.xform_delta();
+        quad.xform_translate = transform.xform_translate();
+    }
+}
+
 /// The transform applied to grid-emitted primitives: the grid's fractional
 /// render offset is a content-space translate applied before the node's own
 /// CSS transform, so the cells slide vertically inside the (untranslated)
@@ -1792,7 +1820,7 @@ fn walk_for_batch(
     // so the flush block below can stamp a vertical translate onto exactly
     // that range. The node's own background/border stay untranslated: only
     // the grid cells slide (see `ElementContent::Grid` arm).
-    let mut grid_offset_stamp: Option<(usize, usize, f32)> = None;
+    let mut grid_offset_stamp: Option<(usize, usize, f32, [f32; 4])> = None;
 
     let is_visible = style.visibility == Visibility::Visible;
     let opacity = style.opacity;
@@ -2711,7 +2739,7 @@ fn walk_for_batch(
             }
             ElementContent::Grid(ref grid) if is_visible => {
                 // cell_h derives from CSS line_height (the source of truth).
-                let cell_h = style.font_size * style.line_height;
+                let cell_h = grid_cell_extent(style.font_size * style.line_height);
                 // Grid cell width must match the active glyph shaping/raster
                 // path. When TM_FORCE_DIRECTWRITE_GRID is off, the terminal
                 // uses swash/cosmic-text on Windows too, so use the same
@@ -2730,6 +2758,12 @@ fn walk_for_batch(
                 #[cfg(not(target_os = "windows"))]
                 let cell_w = measure_monospace_cell_width(font_system, style.font_size, cell_h);
 
+                // Fixed terminal cells need the same raster phase in every
+                // column/row. Fractional advances made identical letters vary
+                // in weight across the line. Publish the snapped metrics too,
+                // so PTY resizing and hit testing use the rendered grid.
+                let cell_w = grid_cell_extent(cell_w * parity_terminal_cell_width_scale());
+
                 // Publish metrics so the app's resize handler can read them.
                 unshit_core::cell_grid::CellGrid::publish_cell_metrics(cell_w, cell_h);
 
@@ -2747,7 +2781,7 @@ fn walk_for_batch(
                 if let Some((cols, rows)) = grid_pending_resize_dims(grid, cols, rows) {
                     unshit_core::cell_grid::CellGrid::publish_pending_resize(cols, rows);
                 }
-                let render_cell_w = cell_w * parity_terminal_cell_width_scale();
+                let render_cell_w = cell_w;
 
                 // Overscan grids clip to the content box on both axes: the
                 // overscan row spills above the box and the offset-displaced
@@ -2795,12 +2829,13 @@ fn walk_for_batch(
                     // block can stamp the fractional scroll offset onto
                     // exactly these instances (cells, cursor, decorations)
                     // without moving the node's own background.
-                    if grid.render_offset_y() != 0.0 {
+                    {
                         let lb = batch.layer_mut(effective_layer);
                         grid_offset_stamp = Some((
                             lb.quad_instances.len(),
                             lb.glyph_instances.len(),
                             grid.render_offset_y(),
+                            grid_clip,
                         ));
                     }
                     emit_grid_cells(
@@ -2867,15 +2902,16 @@ fn walk_for_batch(
         // offset composed under the node transform. Runs after the node
         // stamp above so the grid range ends up with `node_xform ∘
         // translate(0, offset)` while the node's own background keeps the
-        // plain `node_xform`. The clip rect stays in fixed screen space;
-        // the shaders clip the translated fragments against it, containing
-        // the overscan/bottom spill.
-        if let Some((grid_quad_start, grid_glyph_start, offset_y)) = grid_offset_stamp {
+        // plain `node_xform`. The viewport stays fixed in screen space;
+        // primitive-local clips move with the grid before intersection.
+        if let Some((grid_quad_start, grid_glyph_start, offset_y, grid_clip)) = grid_offset_stamp {
             let grid_xform = grid_content_xform(node_xform, offset_y);
             let xf = grid_xform.xform_delta();
             let xt = grid_xform.xform_translate();
-            stamp_xform_quads(&mut lb.quad_instances[grid_quad_start..qend], xf, xt);
-            stamp_xform_glyphs(&mut lb.glyph_instances[grid_glyph_start..gend], xf, xt);
+            stamp_grid_quads(&mut lb.quad_instances[grid_quad_start..qend], grid_xform, grid_clip);
+            if offset_y != 0.0 {
+                stamp_xform_glyphs(&mut lb.glyph_instances[grid_glyph_start..gend], xf, xt);
+            }
         }
     }
 
@@ -3665,6 +3701,10 @@ const TERMINAL_SHAPE_STYLE_REGULAR: u64 = 0;
 const TERMINAL_SHAPE_STYLE_ITALIC: u64 = 1 << 0;
 const TERMINAL_DIM_INTENSITY: f32 = 0.5;
 
+fn grid_cell_extent(measured: f32) -> f32 {
+    measured.round().max(1.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalCellRect {
     x: f32,
@@ -3852,12 +3892,28 @@ fn terminal_shape_style(attrs: CellAttrs) -> u64 {
 }
 
 fn terminal_text_attrs<'a>(
+    font_system: &FontSystem,
     family: cosmic_text::Family<'a>,
     attrs: CellAttrs,
 ) -> cosmic_text::Attrs<'a> {
     let mut text_attrs = cosmic_text::Attrs::new().family(family);
     if attrs.contains(CellAttrs::ITALIC) {
-        text_attrs = text_attrs.style(cosmic_text::Style::Oblique);
+        // Pick a slanted face within the family before handing attributes
+        // to cosmic-text, whose exact style filter otherwise changes family.
+        let style = font_system
+            .db()
+            .query(&cosmic_text::fontdb::Query {
+                families: &[family],
+                weight: cosmic_text::Weight::NORMAL,
+                stretch: cosmic_text::Stretch::Normal,
+                style: cosmic_text::Style::Italic,
+            })
+            .and_then(|id| font_system.db().face(id))
+            .map_or(cosmic_text::Style::Normal, |face| face.style);
+        text_attrs = text_attrs.style(style);
+        if style == cosmic_text::Style::Normal {
+            text_attrs.cache_key_flags.insert(cosmic_text::CacheKeyFlags::FAKE_ITALIC);
+        }
     }
     text_attrs
 }
@@ -4028,6 +4084,18 @@ fn terminal_block_rect(
             width: cell_w * 0.5 + overlap,
             height: cell_h + overlap * 2.0,
         }),
+        '\u{2594}' => Some(TerminalCellRect {
+            x: -overlap,
+            y: -overlap,
+            width: cell_w + overlap * 2.0,
+            height: cell_h / 8.0 + overlap,
+        }),
+        '\u{2595}' => Some(TerminalCellRect {
+            x: cell_w * 7.0 / 8.0,
+            y: -overlap,
+            width: cell_w / 8.0 + overlap,
+            height: cell_h + overlap * 2.0,
+        }),
         '\u{2581}'..='\u{2587}' => {
             let eighths = ch as u32 - 0x2580;
             let height = cell_h * (eighths as f32 / 8.0) + overlap;
@@ -4051,18 +4119,51 @@ fn terminal_block_rect(
     }
 }
 
-fn terminal_primitive_y_bias_for_parity(ch: char, parity_colors: bool) -> f32 {
-    if !parity_colors {
-        return 0.0;
+fn emit_quadrant_block_primitive(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    clip_rect: [f32; 4],
+    row_quads: &mut Vec<QuadInstance>,
+) -> bool {
+    // Unicode Block Elements: bits are UL, UR, LL, LR. These must use
+    // the same cell geometry as the half/full blocks they adjoin; a font
+    // glyph's side bearings and baseline otherwise tear terminal logos.
+    let mask = match ch {
+        '\u{2596}' => 0b0100,
+        '\u{2597}' => 0b1000,
+        '\u{2598}' => 0b0001,
+        '\u{2599}' => 0b1101,
+        '\u{259a}' => 0b1001,
+        '\u{259b}' => 0b0111,
+        '\u{259c}' => 0b1011,
+        '\u{259d}' => 0b0010,
+        '\u{259e}' => 0b0110,
+        '\u{259f}' => 0b1110,
+        _ => return false,
+    };
+    let xs = [-0.5, cell_w * 0.5, cell_w + 0.5];
+    let ys = [-0.5, cell_h * 0.5, cell_h + 0.5];
+    for quadrant in 0..4 {
+        if mask & (1 << quadrant) == 0 {
+            continue;
+        }
+        let x = quadrant % 2;
+        let y = quadrant / 2;
+        let rect = TerminalCellRect {
+            x: xs[x],
+            y: ys[y],
+            width: xs[x + 1] - xs[x],
+            height: ys[y + 1] - ys[y],
+        };
+        // Shared quarter boundaries must land between device pixels. Two
+        // separately blended half-covered edges otherwise leave a seam.
+        push_terminal_cell_rect_snapped(row_quads, cell_x, cell_y, rect, color, clip_rect);
     }
-
-    match ch {
-        '\u{2580}'..='\u{259f}' => 1.0,
-        '\u{2500}' | '\u{250c}' | '\u{252c}' | '\u{2510}' | '\u{251c}' | '\u{253c}'
-        | '\u{2524}' | '\u{2514}' | '\u{2534}' | '\u{2518}' => 1.0,
-        '\u{2501}' => 1.0,
-        _ => 0.0,
-    }
+    true
 }
 
 fn terminal_block_or_shade_char(ch: char) -> bool {
@@ -4147,8 +4248,11 @@ fn emit_shade_block_primitive(
     true
 }
 
-fn box_stroke_width(cell_h: f32, heavy: bool) -> f32 {
-    let light = (cell_h / 16.0).round().max(1.0);
+fn box_stroke_width(cell_w: f32, heavy: bool) -> f32 {
+    // Match Windows Terminal's built-in glyph proportions: line weight
+    // follows cell width, independently of user-configured line spacing.
+    // https://github.com/microsoft/terminal/blob/main/src/renderer/atlas/BuiltinGlyphs.cpp
+    let light = (cell_w / 6.0).round().max(1.0);
     if heavy {
         (light * 2.0).max(2.0)
     } else {
@@ -4197,12 +4301,50 @@ fn emit_box_drawing_primitive(
     clip_rect: [f32; 4],
     row_quads: &mut Vec<QuadInstance>,
 ) -> bool {
+    if matches!(ch, '\u{256d}'..='\u{2570}') {
+        // Clip one corner of a larger rounded outline to this cell. Its
+        // straight ends use the same centers and stroke as adjacent rules.
+        let right = matches!(ch, '\u{256d}' | '\u{2570}');
+        let down = matches!(ch, '\u{256d}' | '\u{256e}');
+        let stroke = box_stroke_width(cell_w, false);
+        let mut x = cell_x + cell_w * 0.5 - stroke * 0.5;
+        let mut y = cell_y + cell_h * 0.5 - stroke * 0.5;
+        if parity_colors {
+            x = x.round();
+            y = y.round();
+        }
+        let size = [cell_w * 2.0, cell_h * 2.0];
+        if !right {
+            x += stroke - size[0];
+        }
+        if !down {
+            y += stroke - size[1];
+        }
+        // Keep the complete local clip until the grid's final transform is
+        // stamped; intersecting early loses edges during overscan scrolling.
+        let corner_clip = [cell_x, cell_y - 1.0, cell_w, cell_h + 1.0];
+        let start = row_quads.len();
+        push_terminal_rounded_quad(
+            row_quads,
+            [x, y],
+            size,
+            color,
+            (cell_w * 0.5).min(cell_h * 0.5),
+            corner_clip,
+        );
+        if let Some(quad) = row_quads.get_mut(start) {
+            quad.color = [0.0; 4];
+            quad.border_color = color;
+            quad.border_width = [stroke; 4];
+        }
+        return true;
+    }
     let Some((left, right, up, down, heavy)) = box_connections(ch) else {
         return false;
     };
 
     let overlap = 0.5;
-    let stroke = box_stroke_width(cell_h, heavy);
+    let stroke = box_stroke_width(cell_w, heavy);
     let cx = cell_w * 0.5;
     let cy = cell_h * 0.5;
     let snap_to_pixels = parity_colors;
@@ -4296,7 +4438,7 @@ fn emit_double_box_drawing_primitive(
     };
 
     let overlap = 0.5;
-    let stroke = box_stroke_width(cell_h, false);
+    let stroke = box_stroke_width(cell_w, false);
     let cx = cell_w * 0.5;
     let cy = cell_h * 0.5;
     let x_offset = (cell_w * 0.15).round().max(stroke);
@@ -4474,7 +4616,7 @@ fn emit_geometric_square_primitive(
     let side = (cell_w * sq.frac).round().max(2.0);
     let x0 = (cell_x + (cell_w - side) * 0.5).round();
     let y0 = (cell_y + (cell_h - side) * 0.5).round();
-    let stroke = box_stroke_width(cell_h, false);
+    let stroke = (cell_h / 16.0).round().max(1.0);
 
     if sq.filled {
         push_terminal_quad(row_quads, [x0, y0], [side, side], color, clip_rect);
@@ -4862,7 +5004,7 @@ fn emit_terminal_cell_primitive(
 
     let cell_x = origin_x + col as f32 * cell_w;
     let cell_y = origin_y + row as f32 * cell_h;
-    let primitive_y = cell_y + terminal_primitive_y_bias_for_parity(cell.ch, parity_colors);
+    let primitive_y = cell_y;
     let trailing_edge_clamp =
         terminal_primitive_trailing_edge_clamp_for_parity(cell.ch, next_ch, parity_colors);
     let color = terminal_fg_color(cell, opacity);
@@ -4875,11 +5017,22 @@ fn emit_terminal_cell_primitive(
     }
 
     if let Some(rect) = terminal_block_rect(cell.ch, cell_w, cell_h, trailing_edge_clamp) {
-        if parity_colors {
-            push_terminal_cell_rect_snapped(row_quads, cell_x, primitive_y, rect, color, clip_rect);
-        } else {
-            push_terminal_cell_rect(row_quads, cell_x, primitive_y, rect, color, clip_rect);
-        }
+        // All block elements share device-pixel boundaries, including at
+        // fractional pane origins, so mixed full/half/quadrant runs join.
+        push_terminal_cell_rect_snapped(row_quads, cell_x, primitive_y, rect, color, clip_rect);
+        return true;
+    }
+
+    if emit_quadrant_block_primitive(
+        cell.ch,
+        cell_x,
+        primitive_y,
+        cell_w,
+        cell_h,
+        color,
+        clip_rect,
+        row_quads,
+    ) {
         return true;
     }
 
@@ -5517,7 +5670,7 @@ fn emit_grid_cell_glyph(
         let family = cosmic_text::Family::Monospace;
         // Silence unused on non-windows.
         let _ = family_name;
-        let attrs = terminal_text_attrs(family, cell.attrs);
+        let attrs = terminal_text_attrs(font_system, family, cell.attrs);
         // Miss path only (the ShapeCache keeps the result): a symbol the
         // terminal font lacks that resolved to the color-emoji face is
         // re-shaped onto the monochrome symbol face, matching the UI path.
@@ -6984,30 +7137,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_primitive_y_bias_is_parity_scoped_and_targeted() {
-        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2588}', false), 0.0);
-        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2588}', true), 1.0);
-        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2592}', true), 1.0);
-        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2501}', true), 1.0);
-        assert_eq!(terminal_primitive_y_bias_for_parity('\u{2554}', true), 0.0);
-        assert_eq!(
-            terminal_primitive_y_bias_for_parity('\u{2500}', true),
-            1.0,
-            "light horizontal table borders align one pixel lower in Windows Terminal"
-        );
-        assert_eq!(
-            terminal_primitive_y_bias_for_parity('\u{2502}', true),
-            0.0,
-            "vertical-only light borders keep their calibrated baseline"
-        );
-        assert_eq!(
-            terminal_primitive_y_bias_for_parity('\u{255f}', true),
-            0.0,
-            "mixed tee glyphs keep their calibrated double-stroke baseline"
-        );
-    }
-
-    #[test]
     fn terminal_primitive_trailing_edge_clamp_targets_run_end_only() {
         assert_eq!(
             terminal_primitive_trailing_edge_clamp_for_parity('\u{2588}', Some('\u{2593}'), true),
@@ -8212,8 +8341,10 @@ mod tests {
 
         assert!(emitted, "full block must be rendered by terminal primitive path");
         assert_eq!(quads.len(), 1);
-        assert!(quads[0].pos[0] < 26.0, "block should overlap left cell edge");
-        assert!(quads[0].pos[1] < 20.0, "block should overlap top cell edge");
+        assert!(quads[0].pos[0] <= 26.0, "block should cover left cell edge");
+        assert!(quads[0].pos[1] <= 20.0, "block should cover top cell edge");
+        assert_eq!(quads[0].pos[0].fract(), 0.0);
+        assert_eq!(quads[0].pos[1].fract(), 0.0);
         assert!(quads[0].size[0] > 8.0, "block width should cover the full cell plus seam guard");
         assert!(quads[0].size[1] > 16.0, "block height should cover the full cell plus seam guard");
     }
@@ -8239,7 +8370,7 @@ mod tests {
 
         assert!(emitted);
         assert_eq!(quads.len(), 1);
-        assert_eq!(quads[0].pos, [26.0, 21.0]);
+        assert_eq!(quads[0].pos, [26.0, 20.0]);
         assert_eq!(quads[0].size, [8.0, 17.0]);
     }
 
@@ -8305,6 +8436,45 @@ mod tests {
         assert!(terminal_emoji_marker('\u{26A0}').is_some(), "⚠ warning sign");
         assert!(terminal_emoji_marker('a').is_none(), "plain ascii defers to glyph path");
         assert!(terminal_emoji_marker('\u{2500}').is_none(), "box drawing defers to its path");
+    }
+
+    #[test]
+    fn terminal_quadrants_cover_only_the_named_quarters() {
+        for (ch, filled) in [
+            ('\u{2596}', [false, false, true, false]),
+            ('\u{2597}', [false, false, false, true]),
+            ('\u{2598}', [true, false, false, false]),
+            ('\u{2599}', [true, false, true, true]),
+            ('\u{259a}', [true, false, false, true]),
+            ('\u{259b}', [true, true, true, false]),
+            ('\u{259c}', [true, true, false, true]),
+            ('\u{259d}', [false, true, false, false]),
+            ('\u{259e}', [false, true, true, false]),
+            ('\u{259f}', [false, true, true, true]),
+        ] {
+            let mut quads = Vec::new();
+            assert!(emit_quadrant_block_primitive(
+                ch,
+                0.25,
+                0.75,
+                12.0,
+                24.0,
+                [1.0; 4],
+                [0.0, 0.0, 100.0, 100.0],
+                &mut quads,
+            ));
+            for (quarter, expected) in filled.into_iter().enumerate() {
+                let x = 0.25 + 3.0 + (quarter % 2) as f32 * 6.0;
+                let y = 0.75 + 6.0 + (quarter / 2) as f32 * 12.0;
+                let covered = quads.iter().any(|q| {
+                    x >= q.pos[0]
+                        && x < q.pos[0] + q.size[0]
+                        && y >= q.pos[1]
+                        && y < q.pos[1] + q.size[1]
+                });
+                assert_eq!(covered, expected, "{ch} quarter {quarter}");
+            }
+        }
     }
 
     #[test]
@@ -8627,11 +8797,11 @@ mod tests {
             "shade primitives should snap to integer pixel rows"
         );
         assert!(
-            (1..=16).all(|row| light_quads.iter().any(|quad| quad.pos[1] == row as f32)),
+            (0..16).all(|row| light_quads.iter().any(|quad| quad.pos[1] == row as f32)),
             "Windows Terminal shade lattice keeps light pixels on every row"
         );
         assert!(
-            (1..=16).all(|row| dark_quads
+            (0..16).all(|row| dark_quads
                 .iter()
                 .any(|quad| { quad.pos[1] == row as f32 && quad.size[0] < 8.0 })),
             "dark shade keeps a gap on every row instead of alternating solid rows"
@@ -8843,15 +9013,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn terminal_text_attrs_maps_sgr_italic_to_oblique_without_bold_face() {
+    fn terminal_text_attrs_requests_italic_without_bold_face() {
         let attrs = terminal_text_attrs(
+            &FontSystem::new(),
             cosmic_text::Family::Name("Consolas"),
             CellAttrs::BOLD | CellAttrs::ITALIC,
         );
 
         assert_eq!(attrs.weight, cosmic_text::Weight::NORMAL);
-        assert_eq!(attrs.style, cosmic_text::Style::Oblique);
+        assert_eq!(attrs.style, cosmic_text::Style::Italic);
+        assert!(!attrs.cache_key_flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC));
+    }
+
+    #[test]
+    fn terminal_missing_italic_face_rasterizes_slanted_ink() {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../../unshit-app/tests/fixtures/FiraMono-Medium.ttf").to_vec(),
+        );
+        let mut fs = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let mut buffer = cosmic_text::Buffer::new(&mut fs, Metrics::new(24.0, 30.0));
+        buffer.set_size(&mut fs, Some(100.0), None);
+        let attrs =
+            terminal_text_attrs(&fs, cosmic_text::Family::Name("Fira Mono"), CellAttrs::ITALIC);
+        buffer.set_text(&mut fs, "I", attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut fs, false);
+        let mut glyph = buffer.layout_runs().next().unwrap().glyphs[0].clone();
+        assert_eq!(fs.db().face(glyph.font_id).unwrap().style, cosmic_text::Style::Normal);
+        let mut swash = SwashCache::new();
+        let italic =
+            swash.get_image_uncached(&mut fs, glyph.physical((0.0, 0.0), 1.0).cache_key).unwrap();
+        glyph.cache_key_flags.remove(cosmic_text::CacheKeyFlags::FAKE_ITALIC);
+        let upright =
+            swash.get_image_uncached(&mut fs, glyph.physical((0.0, 0.0), 1.0).cache_key).unwrap();
+        assert_ne!(upright.data, italic.data, "SGR italic must change the rasterized ink");
+        assert!(italic.placement.width > upright.placement.width, "slanted I extends horizontally");
     }
 
     #[test]

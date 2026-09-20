@@ -2,11 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::cell::Cell;
 
+mod storage;
+use storage::Storage;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     rows: usize,
     cols: usize,
-    cells: Vec<Cell>,
+    cells: Storage,
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
@@ -17,7 +20,7 @@ impl Grid {
         Self {
             rows,
             cols,
-            cells: vec![Cell::BLANK; rows * cols],
+            cells: vec![Cell::BLANK; rows * cols].into(),
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
@@ -67,7 +70,7 @@ impl Grid {
     pub fn row(&self, row: usize) -> Option<&[Cell]> {
         if row < self.rows {
             let start = row * self.cols;
-            Some(&self.cells[start..start + self.cols])
+            Some(self.cells.row(start, self.cols))
         } else {
             None
         }
@@ -85,7 +88,7 @@ impl Grid {
                 next[r * cols + c] = self.cells[r * self.cols + c];
             }
         }
-        self.cells = next;
+        self.cells = next.into();
         self.rows = rows;
         self.cols = cols;
         if self.rows == 0 {
@@ -104,9 +107,7 @@ impl Grid {
         if row >= self.rows {
             return;
         }
-        let start = row * self.cols + col.min(self.cols);
-        let end = (row + 1) * self.cols;
-        self.cells[start..end].fill(Cell::BLANK);
+        self.cells.row_mut(row * self.cols, self.cols)[col.min(self.cols)..].fill(Cell::BLANK);
     }
 
     pub fn erase_all(&mut self) {
@@ -123,14 +124,8 @@ impl Grid {
         }
         let take = n.min(self.rows);
         let mut evicted: Vec<Vec<Cell>> = Vec::with_capacity(take);
-        for r in 0..take {
-            let start = r * self.cols;
-            evicted.push(self.cells[start..start + self.cols].to_vec());
-        }
-        self.cells.copy_within(take * self.cols.., 0);
-        let tail_start = (self.rows - take) * self.cols;
-        for slot in &mut self.cells[tail_start..] {
-            *slot = Cell::BLANK;
+        for _ in 0..take {
+            evicted.push(self.cells.scroll_up(self.cols));
         }
         evicted
     }
@@ -160,23 +155,24 @@ impl Grid {
         for r in 0..self.rows {
             let src = r * self.cols;
             let dst = (r + n) * self.cols;
-            next[dst..dst + self.cols].copy_from_slice(&self.cells[src..src + self.cols]);
+            next[dst..dst + self.cols].copy_from_slice(self.cells.row(src, self.cols));
         }
-        self.cells = next;
+        self.cells = next.into();
         self.rows = new_rows;
+    }
+
+    /// Advance the grid after the caller has captured any needed first-row data.
+    pub(crate) fn scroll_up_discard(&mut self) {
+        if self.rows > 0 && self.cols > 0 {
+            self.cells.advance_row(self.cols);
+        }
     }
 
     pub fn scroll_up(&mut self) -> Vec<Cell> {
         if self.rows == 0 || self.cols == 0 {
             return Vec::new();
         }
-        let evicted: Vec<Cell> = self.cells[..self.cols].to_vec();
-        self.cells.copy_within(self.cols.., 0);
-        let tail_start = (self.rows - 1) * self.cols;
-        for slot in &mut self.cells[tail_start..] {
-            *slot = Cell::BLANK;
-        }
-        evicted
+        self.cells.scroll_up(self.cols)
     }
 }
 
@@ -185,6 +181,33 @@ mod tests {
     use super::*;
     use crate::cell::CellAttrs;
     use crate::color::Color;
+
+    #[test]
+    fn scroll_without_capture_matches_capturing_scroll_through_rotations() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (1, 1), (4, 5)] {
+            let mut actual = Grid::new(rows, cols);
+            let mut expected = actual.clone();
+            for step in 0..20 {
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let cell = Cell {
+                            ch: char::from_u32(65 + step + col as u32).unwrap(),
+                            ..Cell::BLANK
+                        };
+                        actual.set(row, col, cell);
+                        expected.set(row, col, cell);
+                    }
+                }
+                actual.scroll_up_discard();
+                let _ = expected.scroll_up();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    bincode::serialize(&actual).unwrap(),
+                    bincode::serialize(&expected).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn new_grid_is_blank_with_cursor_at_origin() {
@@ -198,6 +221,109 @@ mod tests {
                 assert_eq!(g.get(r, c), Some(&Cell::BLANK));
             }
         }
+    }
+
+    #[test]
+    fn circular_rows_match_flat_grid_through_scroll_erase_and_resize() {
+        for rows in 1..8 {
+            for cols in 1..10 {
+                let mut grid = Grid::new(rows, cols);
+                let mut expected = vec![Cell::BLANK; rows * cols];
+                for step in 0..rows * 4 + 3 {
+                    for col in 0..cols {
+                        let cell = Cell::new(
+                            char::from(b'A' + (step % 26) as u8),
+                            Color::WHITE,
+                            Color::BLACK,
+                            CellAttrs::BOLD,
+                        );
+                        grid.set(rows - 1, col, cell);
+                        expected[(rows - 1) * cols + col] = cell;
+                    }
+                    assert_eq!(grid.scroll_up(), expected[..cols]);
+                    expected.copy_within(cols.., 0);
+                    expected[(rows - 1) * cols..].fill(Cell::BLANK);
+                    let erase_row = step % rows;
+                    let erase_col = step % cols;
+                    grid.erase_to_line_end(erase_row, erase_col);
+                    expected[erase_row * cols + erase_col..(erase_row + 1) * cols]
+                        .fill(Cell::BLANK);
+                    for row in 0..rows {
+                        assert_eq!(
+                            grid.row(row).unwrap(),
+                            &expected[row * cols..(row + 1) * cols]
+                        );
+                    }
+                    // A decoded snapshot has normalized storage but identical
+                    // logical contents and remains mutable after another wrap.
+                    let wire = serde_json::to_vec(&grid).unwrap();
+                    let mut decoded: Grid = serde_json::from_slice(&wire).unwrap();
+                    assert_eq!(grid, decoded);
+                    let mut wrapped = grid.clone();
+                    for _ in 0..rows + 1 {
+                        assert_eq!(decoded.scroll_up(), wrapped.scroll_up());
+                        assert_eq!(decoded, wrapped);
+                    }
+                    let mut resized = grid.clone();
+                    resized.resize(rows + 1, cols + 1);
+                    for row in 0..rows {
+                        assert_eq!(
+                            &resized.row(row).unwrap()[..cols],
+                            &expected[row * cols..(row + 1) * cols]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_grid_keeps_legacy_flat_cell_wire_format() {
+        #[derive(Serialize)]
+        struct LegacyGrid {
+            rows: usize,
+            cols: usize,
+            cells: Vec<Cell>,
+            cursor_row: usize,
+            cursor_col: usize,
+            cursor_visible: bool,
+        }
+        let mut grid = Grid::new(3, 2);
+        for row in 0..3 {
+            grid.set(
+                row,
+                0,
+                Cell::new(
+                    char::from(b'A' + row as u8),
+                    Color::WHITE,
+                    Color::BLACK,
+                    CellAttrs::BOLD,
+                ),
+            );
+        }
+        grid.scroll_up();
+        grid.set_cursor(2, 1);
+        grid.set_cursor_visible(false);
+        let legacy = LegacyGrid {
+            rows: 3,
+            cols: 2,
+            cells: (0..3)
+                .flat_map(|r| grid.row(r).unwrap().iter().copied())
+                .collect(),
+            cursor_row: 2,
+            cursor_col: 1,
+            cursor_visible: false,
+        };
+        assert_eq!(
+            serde_json::to_vec(&grid).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&grid).unwrap(),
+            bincode::serialize(&legacy).unwrap()
+        );
+        let decoded: Grid = serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(decoded, grid);
     }
 
     #[test]

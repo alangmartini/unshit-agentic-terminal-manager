@@ -277,6 +277,13 @@ impl LineQuadCache {
             return None;
         }
         if cached.cached_row != current_row {
+            // A cell-local clip cannot be translated like a viewport clip:
+            // its intersection with the viewport may have discarded edges.
+            // Re-emit such rows at their new position; ordinary text and
+            // full-viewport primitives keep the scroll replay fast path.
+            if cached.quads.iter().any(|q| q.clip_rect.map(f32::to_bits) != geometry.clip_bits) {
+                return None;
+            }
             let dy = (current_row as f32 - cached.cached_row as f32) * cell_h;
             for q in cached.quads.iter_mut() {
                 q.pos[1] += dy;
@@ -653,6 +660,27 @@ mod tests {
             (hit.quads[0].pos[1] - stored_y).abs() < f32::EPSILON,
             "Y must remain at {stored_y} when cached_row == current_row",
         );
+    }
+
+    #[test]
+    fn scrolling_cell_clipped_primitives_requires_reemission() {
+        let mut cache = LineQuadCache::new();
+        let node = NodeId { index: 0, generation: 0 };
+        let viewport = [0.0, 0.0, 100.0, 100.0];
+        let sig = LineGeometrySig::new(0.0, 0.0, 10.0, 20.0, 16.0, 1.0, viewport, 10, 0);
+        let mut quad = QuadInstance::zeroed();
+        quad.pos = [5.0, 30.0];
+        quad.clip_rect = [0.0, 20.0, 10.0, 20.0];
+        cache.store(node, 7, 1, sig, vec![quad], vec![], vec![], vec![], 1);
+        assert!(cache.lookup_and_retarget(node, 7, 1, sig, 1, 20.0).is_some());
+        assert!(cache.lookup_and_retarget(node, 7, 1, sig, 0, 20.0).is_none());
+        assert_eq!(cache.get(node, 7).unwrap().cached_row, 1);
+        // Viewport clips remain stationary while normal quads move.
+        quad.clip_rect = viewport;
+        cache.store(node, 8, 1, sig, vec![quad], vec![], vec![], vec![], 1);
+        let hit = cache.lookup_and_retarget(node, 8, 1, sig, 0, 20.0).unwrap();
+        assert_eq!(hit.quads[0].pos[1], 10.0);
+        assert_eq!(hit.quads[0].clip_rect, viewport);
     }
 
     #[test]

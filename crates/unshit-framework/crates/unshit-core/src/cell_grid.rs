@@ -12,6 +12,8 @@ use std::time::Instant;
 use crate::style::types::Color;
 use bitflags::bitflags;
 
+mod storage;
+
 /// Global cell metrics published by the renderer. Application code reads
 /// these to compute PTY column/row counts that match the renderer exactly.
 static GLOBAL_CELL_W: AtomicU32 = AtomicU32::new(0);
@@ -162,7 +164,8 @@ impl Cell {
 /// pattern. `first_dirty_col..=last_dirty_col` is inclusive on both ends and
 /// invalid (no damage) when `first_dirty_col > last_dirty_col`.
 ///
-/// The monotonic `seqno` is bumped on every cell write on that row. The
+/// The monotonic `seqno` is bumped by mutations affecting that row. A bulk
+/// write may replace multiple cells with one increment. The
 /// renderer checkpoints the last seqno it rendered and may skip a row when
 /// the stored seqno matches the checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +175,7 @@ pub struct LineDamage {
     /// Last dirty column (inclusive). `0` when the row is clean (paired with
     /// `first_dirty_col == u16::MAX` to indicate clean state).
     pub last_dirty_col: u16,
-    /// Monotonically increasing write counter for this row. The renderer
+    /// Monotonically increasing mutation version for this row. The renderer
     /// compares this against its last-seen value to decide whether the row
     /// needs re-rendering even when `first_dirty_col..=last_dirty_col` was
     /// already processed by an earlier pass this frame.
@@ -298,7 +301,7 @@ impl BgRun {
 pub struct CellGrid {
     rows: usize,
     cols: usize,
-    cells: Vec<Cell>,
+    cells: storage::Storage,
     /// Per-cell dirty bits. When a cell is modified via `set_cell`, its
     /// corresponding entry is set to `true`. The renderer reads and clears
     /// these to determine which cells need re-batching.
@@ -466,7 +469,7 @@ impl CellGrid {
         Self {
             rows,
             cols,
-            cells: vec![Cell::default(); len],
+            cells: storage::Storage::new(vec![Cell::default(); len], cols),
             dirty: vec![true; len],
             line_damage,
             line_ids,
@@ -549,7 +552,7 @@ impl CellGrid {
             let n = src.len().min(self.cols);
             new_row[..n].copy_from_slice(&src[..n]);
         }
-        self.cells.splice(0..0, new_row);
+        self.cells.prepend_row(new_row);
         self.dirty.splice(0..0, std::iter::repeat_n(true, self.cols));
         let mut damage = LineDamage::default();
         damage.mark_range(0, Self::last_col_u16(self.cols));
@@ -559,9 +562,10 @@ impl CellGrid {
         self.cursor_row = (self.cursor_row + 1).min(self.rows.saturating_sub(1));
     }
 
-    /// Access the underlying cell slice (read-only).
+    /// Access cells in logical row order (read-only). A wrapped live grid
+    /// materializes a contiguous view once; cloned snapshots are already contiguous.
     pub fn cells(&self) -> &[Cell] {
-        &self.cells
+        self.cells.as_slice()
     }
 
     /// Access the dirty-tracking slice (read-only).
@@ -909,6 +913,45 @@ impl CellGrid {
         }
     }
 
+    /// Copy cells into a logical row, clipping at its right edge. Marks only
+    /// the written columns dirty and retains the row's line identity. Empty
+    /// input or an out-of-bounds starting position leaves the grid unchanged.
+    /// The row mutation version advances once for the whole write.
+    pub fn set_row_cells(&mut self, row: usize, col: usize, cells: &[Cell]) {
+        if row >= self.rows || col >= self.cols || cells.is_empty() {
+            return;
+        }
+        let cells = &cells[..cells.len().min(self.cols - col)];
+        self.cells.write_row(row, col, cells);
+        let start = row * self.cols + col;
+        self.dirty[start..start + cells.len()].fill(true);
+        self.line_damage[row].mark_range(
+            col.min(u16::MAX as usize) as u16,
+            (col + cells.len() - 1).min(u16::MAX as usize) as u16,
+        );
+    }
+
+    /// Fill a logical row with `cell` and mark all its columns dirty.
+    /// The row retains its line identity; callers replacing a logical line
+    /// can separately call [`Self::reset_line_identity`]. Out-of-bounds rows
+    /// and zero-column grids are unchanged.
+    pub fn fill_row(&mut self, row: usize, cell: Cell) {
+        if row >= self.rows || self.cols == 0 {
+            return;
+        }
+        self.cells.fill_row(row, cell);
+        let start = row * self.cols;
+        self.dirty[start..start + self.cols].fill(true);
+        self.line_damage[row].mark_range(0, Self::last_col_u16(self.cols));
+    }
+
+    /// Borrow the cells in a logical row without copying or flattening the
+    /// grid. Returns an empty slice for a valid zero-column row, or `None`
+    /// when `row` is out of bounds. Damage and line identity are unchanged.
+    pub fn row_cells(&self, row: usize) -> Option<&[Cell]> {
+        (row < self.rows).then(|| self.cells.row_cells(row))
+    }
+
     /// Read the cell at `(row, col)`. Returns `None` if out of bounds.
     pub fn get_cell(&self, row: usize, col: usize) -> Option<&Cell> {
         self.idx(row, col).map(|i| &self.cells[i])
@@ -984,7 +1027,7 @@ impl CellGrid {
         self.cells.copy_within(shift..total, 0);
 
         let clear_start = total - shift;
-        self.cells[clear_start..].fill(Cell::default());
+        self.cells.fill_from(clear_start, Cell::default());
 
         self.dirty.fill(true);
 
@@ -1029,7 +1072,7 @@ impl CellGrid {
             let src_start = r * self.cols;
             let dst_start = r * new_cols;
             new_cells[dst_start..dst_start + copy_cols]
-                .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
+                .copy_from_slice(&self.cells.as_slice()[src_start..src_start + copy_cols]);
         }
 
         // Preserve line identity for rows that survive the resize. New rows
@@ -1046,7 +1089,7 @@ impl CellGrid {
 
         self.rows = new_rows;
         self.cols = new_cols;
-        self.cells = new_cells;
+        self.cells = storage::Storage::new(new_cells, new_cols);
         self.dirty = vec![true; new_rows * new_cols];
         // Rebuild `line_damage` sized to `new_rows` and mark every row fully
         // damaged with a fresh seqno so renderers re-render regardless of
@@ -1060,6 +1103,70 @@ impl CellGrid {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wrapped_scroll_snapshots_survive_mutation_resize_and_overscan() {
+        let mut grid = CellGrid::new(4, 5);
+        let mut expected = vec![Cell::default(); 20];
+        for step in 0..13 {
+            grid.clear_dirty();
+            let ids = grid.line_ids().to_vec();
+            grid.scroll_up(1);
+            expected.copy_within(5..20, 0);
+            expected[15..].fill(Cell::default());
+            assert_eq!(grid.cells(), expected);
+            assert_eq!(&grid.line_ids()[..3], &ids[1..]);
+            assert!(!ids.contains(&grid.line_ids()[3]));
+            assert!(grid.dirty_flags().iter().all(|dirty| *dirty));
+            assert!(grid.line_damage()[..3].iter().all(LineDamage::is_clean));
+            assert_eq!(grid.line_damage()[3].first_dirty_col, 0);
+            assert_eq!(grid.line_damage()[3].last_dirty_col, 4);
+            let snapshot = grid.clone();
+            let cell = Cell::with_char(char::from_u32(65 + step).unwrap());
+            grid.set_cell(3, 2, cell);
+            expected[17] = cell;
+            assert_eq!(grid.cells(), expected);
+            assert_eq!(snapshot.get_cell(3, 2), Some(&Cell::default()));
+            assert_eq!(grid.get_cell(3, 2), Some(&cell));
+        }
+        let kept_ids = grid.line_ids().to_vec();
+        grid.resize(6, 7);
+        let mut resized = vec![Cell::default(); 42];
+        for row in 0..4 {
+            resized[row * 7..row * 7 + 5].copy_from_slice(&expected[row * 5..row * 5 + 5]);
+        }
+        assert_eq!(grid.cells(), resized);
+        assert_eq!(&grid.line_ids()[..4], kept_ids);
+        assert!(grid.dirty_flags().iter().all(|dirty| *dirty));
+        assert!(grid.line_damage().iter().all(|damage| !damage.is_clean()));
+        let ids = grid.line_ids().to_vec();
+        let overscan = vec![Cell::with_char('O'); 7];
+        grid.insert_overscan_row_top(Some(&overscan), u64::MAX);
+        resized.splice(0..0, overscan);
+        assert_eq!(grid.cells(), resized);
+        assert_eq!(grid.line_ids()[0], u64::MAX);
+        assert_eq!(&grid.line_ids()[1..], ids);
+        assert_eq!(grid.rows(), 7);
+        assert!(grid.dirty_flags()[..7].iter().all(|dirty| *dirty));
+        assert!(!grid.line_damage()[0].is_clean());
+    }
+
+    #[test]
+    fn zero_dimension_grids_can_scroll_resize_and_insert_overscan() {
+        for (rows, cols) in [(0, 5), (4, 0), (0, 0)] {
+            let mut grid = CellGrid::new(rows, cols);
+            grid.scroll_up(1);
+            grid.shift_rows(0, 1, 3);
+            assert!(grid.cells().is_empty());
+            grid.insert_overscan_row_top(None, u64::MAX);
+            assert_eq!(grid.cells().len(), cols);
+            grid.resize(3, 4);
+            assert_eq!(grid.cells(), vec![Cell::default(); 12]);
+            grid.scroll_up(1);
+            grid.set_cell(2, 3, Cell::with_char('x'));
+            assert_eq!(grid.cells()[11], Cell::with_char('x'));
+        }
+    }
     use super::*;
 
     #[test]
@@ -1289,6 +1396,148 @@ mod tests {
                 g.line_damage_for(row).map(|ld| ld.is_clean()).unwrap_or(false),
                 "row {row} must remain clean after a write to row 3",
             );
+        }
+    }
+
+    #[test]
+    fn set_row_cells_matches_scalar_writes_through_ring_rotations() {
+        for target in 0..4 {
+            for col in 0..7 {
+                for len in [0, 1, 3, 8] {
+                    let mut grid = CellGrid::new(4, 5);
+                    for step in 0..9 {
+                        grid.shift_rows(0, 1, 3);
+                        grid.clear_dirty();
+                        let _ = grid.cells(); // Warm the wrapped logical snapshot.
+                        let mut expected = grid.clone();
+                        let cells: Vec<_> = (0..len)
+                            .map(|i| Cell {
+                                ch: char::from_u32(65 + i as u32 + step).unwrap(),
+                                attrs: CellAttrs::BOLD,
+                                ..Cell::default()
+                            })
+                            .collect();
+                        let before = grid.clone();
+                        grid.set_row_cells(target, col, &cells);
+                        for (offset, cell) in cells.iter().enumerate() {
+                            expected.set_cell(target, col + offset, *cell);
+                        }
+                        assert_eq!(grid.cells(), expected.cells());
+                        assert_eq!(grid.dirty_flags(), expected.dirty_flags());
+                        assert_eq!(grid.line_ids(), expected.line_ids());
+                        for row in 0..4 {
+                            let actual = grid.line_damage[row];
+                            let scalar = expected.line_damage[row];
+                            assert_eq!(
+                                (actual.first_dirty_col, actual.last_dirty_col),
+                                (scalar.first_dirty_col, scalar.last_dirty_col)
+                            );
+                            if row == target && col < 5 && len > 0 {
+                                assert!(actual.seqno > before.line_damage[row].seqno);
+                            } else {
+                                assert_eq!(actual, before.line_damage[row]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_row_cells_empty_and_out_of_bounds_are_noops() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            let before = grid.clone();
+            grid.set_row_cells(rows, 0, &[Cell::with_char('x')]);
+            grid.set_row_cells(0, cols, &[Cell::with_char('x')]);
+            grid.set_row_cells(usize::MAX, usize::MAX, &[Cell::with_char('x')]);
+            grid.set_row_cells(0, 0, &[]);
+            assert_eq!(grid, before);
+        }
+    }
+
+    #[test]
+    fn row_cells_follows_logical_order_without_mutating_the_grid() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            for row in 0..rows {
+                for col in 0..cols {
+                    grid.set_cell(
+                        row,
+                        col,
+                        Cell::with_char((b'a' + (row * cols + col) as u8) as char),
+                    );
+                }
+            }
+            for _ in 0..9 {
+                if rows > 0 {
+                    grid.shift_rows(0, 1, rows - 1);
+                }
+                grid.clear_dirty();
+                let before = grid.clone();
+                for row in 0..rows {
+                    let expected: Vec<_> =
+                        (0..cols).map(|col| *grid.get_cell(row, col).unwrap()).collect();
+                    assert_eq!(grid.row_cells(row), Some(expected.as_slice()));
+                }
+                assert_eq!(grid.row_cells(rows), None);
+                assert_eq!(grid.row_cells(usize::MAX), None);
+                assert_eq!(grid, before);
+            }
+        }
+    }
+
+    #[test]
+    fn fill_row_updates_wrapped_cells_and_damage_without_changing_identity() {
+        for target in 0..4 {
+            let mut grid = CellGrid::new(4, 5);
+            for row in 0..4 {
+                for col in 0..5 {
+                    grid.set_cell(row, col, Cell::with_char((b'a' + row as u8) as char));
+                }
+            }
+            for _ in 0..9 {
+                grid.shift_rows(0, 1, 3);
+                grid.clear_dirty();
+                // Warm the logical snapshot before mutation, including when
+                // its physical row order wraps around the backing storage.
+                let before = grid.cells().to_vec();
+                let ids = grid.line_ids.clone();
+                let damage = grid.line_damage.clone();
+                let fill = Cell { ch: '?', attrs: CellAttrs::BOLD, ..Cell::default() };
+                grid.fill_row(target, fill);
+                assert_eq!(grid.line_ids, ids);
+                for row in 0..4 {
+                    for col in 0..5 {
+                        let expected = if row == target { fill } else { before[row * 5 + col] };
+                        assert_eq!(grid.get_cell(row, col), Some(&expected));
+                        assert_eq!(grid.cells()[row * 5 + col], expected);
+                        assert_eq!(grid.dirty[row * 5 + col], row == target);
+                    }
+                    let actual = grid.line_damage[row];
+                    if row == target {
+                        assert_eq!((actual.first_dirty_col, actual.last_dirty_col), (0, 4));
+                        assert!(actual.seqno > damage[row].seqno);
+                    } else {
+                        assert_eq!(actual, damage[row]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_row_ignores_empty_grids_and_out_of_bounds_rows() {
+        for (rows, cols) in [(0, 0), (0, 5), (4, 0), (4, 5)] {
+            let mut grid = CellGrid::new(rows, cols);
+            let before = grid.clone();
+            grid.fill_row(rows, Cell::with_char('x'));
+            grid.fill_row(usize::MAX, Cell::with_char('x'));
+            if cols == 0 {
+                grid.fill_row(0, Cell::with_char('x'));
+            }
+            assert_eq!(grid, before);
         }
     }
 
