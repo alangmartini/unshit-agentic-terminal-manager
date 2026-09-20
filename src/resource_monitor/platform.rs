@@ -49,6 +49,64 @@ pub fn logical_cpus() -> usize {
         .unwrap_or(1)
 }
 
+/// Rebuild a command line from an argument vector using the quoting
+/// `crate::agents::process::next_argument` understands: an argument with
+/// whitespace or a quote is wrapped in whichever quote character it does not
+/// contain. An argument holding both kinds is left bare; the classifier
+/// rejects it and the pane keeps its membership, which is the safe outcome.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn join_arguments<'a>(arguments: impl IntoIterator<Item = &'a str>) -> String {
+    let mut joined = String::new();
+    for argument in arguments {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        let needs_quotes = argument.is_empty()
+            || argument.contains(char::is_whitespace)
+            || argument.contains(['"', '\'']);
+        if !needs_quotes {
+            joined.push_str(argument);
+        } else if !argument.contains('"') {
+            joined.push('"');
+            joined.push_str(argument);
+            joined.push('"');
+        } else if !argument.contains('\'') {
+            joined.push('\'');
+            joined.push_str(argument);
+            joined.push('\'');
+        } else {
+            joined.push_str(argument);
+        }
+    }
+    joined
+}
+
+/// Parse a `KERN_PROCARGS2` sysctl payload: a native-endian `argc`, the
+/// executable path, NUL padding, then `argc` NUL-terminated arguments. The
+/// environment strings that follow are never read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_procargs2(payload: &[u8]) -> Option<String> {
+    let argc = u32::from_ne_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+    let mut rest = &payload[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[path_end..];
+    let first = rest.iter().position(|&b| b != 0)?;
+    rest = &rest[first..];
+    let mut arguments = Vec::with_capacity(argc.min(64));
+    for _ in 0..argc {
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        arguments.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+        rest = &rest[(end + 1).min(rest.len())..];
+    }
+    if arguments.is_empty() {
+        return None;
+    }
+    Some(join_arguments(arguments.iter().map(String::as_str)))
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{HashMap, ProcSample, ProcessRecord};
@@ -398,6 +456,48 @@ mod imp {
         Some((records, names))
     }
 
+    /// Read the argument vector of an owned session descendant through
+    /// `sysctl(KERN_PROCARGS2)`, the same source `ps -o args` uses. Processes
+    /// of other users or ones that already exited yield `None`.
+    pub fn process_command_line(pid: u32) -> Option<String> {
+        let pid = pid_arg(pid)?;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size: libc::size_t = 0;
+        // SAFETY: `mib` is a valid three-entry name and a null `oldp` asks
+        // the kernel only for the payload size.
+        let sized = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if sized != 0 || size == 0 {
+            return None;
+        }
+        let mut payload = vec![0u8; size];
+        // SAFETY: `payload` has exactly `size` writable bytes and the kernel
+        // updates `size` to the number actually written.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                payload.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        payload.truncate(size);
+        super::parse_procargs2(&payload)
+    }
+
     pub fn sample_process(pid: u32) -> Option<ProcSample> {
         let bsd = read_bsd_info(pid)?;
         let task = read_task_info(pid)?;
@@ -565,9 +665,93 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod procargs_tests {
+    use super::{join_arguments, parse_procargs2};
+
+    fn payload(argc: u32, path: &str, arguments: &[&str], environment: &[&str]) -> Vec<u8> {
+        let mut bytes = argc.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[0, 0, 0]);
+        for argument in arguments {
+            bytes.extend_from_slice(argument.as_bytes());
+            bytes.push(0);
+        }
+        for variable in environment {
+            bytes.extend_from_slice(variable.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn parses_arguments_and_ignores_the_environment() {
+        let bytes = payload(
+            2,
+            "/usr/local/bin/node",
+            &["node", "/opt/node_modules/@openai/codex/bin/codex.js"],
+            &["HOME=/Users/me", "SECRET=nope"],
+        );
+        assert_eq!(
+            parse_procargs2(&bytes).as_deref(),
+            Some("node /opt/node_modules/@openai/codex/bin/codex.js")
+        );
+    }
+
+    #[test]
+    fn quotes_arguments_with_spaces_for_the_classifier() {
+        let bytes = payload(
+            2,
+            "/usr/local/bin/node",
+            &[
+                "node",
+                "/Users/Alan Beelink/node_modules/@openai/codex/bin/codex.js",
+            ],
+            &[],
+        );
+        let command = parse_procargs2(&bytes).expect("parsed");
+        assert_eq!(
+            command,
+            "node \"/Users/Alan Beelink/node_modules/@openai/codex/bin/codex.js\""
+        );
+        assert_eq!(
+            crate::agents::process::classify_process("node", Some(&command)).map(|p| p.id),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn tolerates_short_and_empty_payloads() {
+        assert_eq!(parse_procargs2(&[]), None);
+        assert_eq!(parse_procargs2(&1u32.to_ne_bytes()), None);
+        assert_eq!(parse_procargs2(&payload(0, "/bin/sh", &[], &[])), None);
+        assert_eq!(
+            parse_procargs2(&payload(3, "/bin/sh", &["sh", "-c"], &[])).as_deref(),
+            Some("sh -c")
+        );
+    }
+
+    #[test]
+    fn join_uses_the_quote_the_argument_lacks() {
+        assert_eq!(
+            join_arguments(["a", "b c", "d\"e", ""]),
+            "a \"b c\" 'd\"e' \"\""
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
+
+    #[test]
+    fn reads_own_command_line() {
+        let command = process_command_line(std::process::id()).expect("own argv is readable");
+        let exe = std::env::current_exe().expect("test exe path");
+        let stem = exe.file_stem().and_then(|s| s.to_str()).expect("exe stem");
+        assert!(command.contains(stem), "{command} should name {stem}");
+        assert_eq!(process_command_line(u32::MAX - 1), None);
+    }
 
     #[test]
     fn samples_the_current_process() {
