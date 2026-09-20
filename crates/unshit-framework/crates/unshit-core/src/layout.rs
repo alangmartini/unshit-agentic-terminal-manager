@@ -279,7 +279,10 @@ impl TextMeasureCache {
             max_width,
         );
         self.map.insert(key.clone(), result);
-        if max_width.is_some() && result.0 <= max_width.unwrap_or_default() {
+        // A wrapped measurement fitting its constraint is not an intrinsic
+        // width. Reusing it after widening would keep stale wrapping/height.
+        let single_line = result.1 <= (font_size * line_height).ceil();
+        if single_line && max_width.is_some() && result.0 <= max_width.unwrap_or_default() {
             let mut unconstrained = key;
             unconstrained.max_width_tenths = -1;
             self.map.entry(unconstrained).or_insert(result);
@@ -1631,6 +1634,37 @@ mod tests {
                 .is_none(),
             "a narrower width may wrap and must be measured separately"
         );
+    }
+
+    #[test]
+    fn text_measure_cache_does_not_reuse_wrapped_measurement_after_widening() {
+        let mut font_system = FontSystem::new();
+        let mut cache = TextMeasureCache::new();
+        let text = "one two three four five six seven eight";
+        let narrow = measure_text_cached(
+            text,
+            16.0,
+            1.2,
+            0.0,
+            Some(60.0),
+            &mut font_system,
+            Some(&mut cache),
+        );
+        let wide = measure_text_cached(
+            text,
+            16.0,
+            1.2,
+            0.0,
+            Some(400.0),
+            &mut font_system,
+            Some(&mut cache),
+        );
+        let expected = measure_text(text, 16.0, 1.2, 0.0, Some(400.0), &mut font_system);
+        assert!(narrow.1 > expected.1, "fixture must wrap at the narrow width");
+        assert_eq!(wide, expected);
+        let unconstrained =
+            measure_text_cached(text, 16.0, 1.2, 0.0, None, &mut font_system, Some(&mut cache));
+        assert_eq!(unconstrained, measure_text(text, 16.0, 1.2, 0.0, None, &mut font_system));
     }
 
     #[test]
