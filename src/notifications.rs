@@ -772,18 +772,15 @@ fn apply_ipc_request(
             match crate::flow_explorer::FlowPane::open(&path) {
                 Ok(pane) => {
                     let opened = mutate_with(shared, |state| {
-                        let target = match workspace_id {
-                            Some(id) => state.workspaces.iter().position(|w| w.num == id),
-                            None => Some(state.active_workspace),
-                        };
-                        let Some(target) = target.filter(|&i| i < state.workspaces.len()) else {
+                        let target = resolve_workspace_index(state, workspace_id)
+                            .filter(|&i| i < state.workspaces.len());
+                        let Some(target) = target else {
                             return false;
                         };
                         if target != state.active_workspace {
                             crate::state::mutate_switch_workspace(state, target);
                         }
-                        crate::state::record_flow_pane_event(&pane, "flow.open", "info", None);
-                        crate::state::mutate_add_flow_tab(state, pane);
+                        crate::state::open_flow_tab(state, pane);
                         state.settings_open = false;
                         state.diff_review = None;
                         true
@@ -912,6 +909,18 @@ fn apply_ipc_request(
     effect
 }
 
+/// Resolve a `--workspace-id`/`workspace_id` argument to an index, or the
+/// caller's active workspace when absent.
+fn resolve_workspace_index(
+    state: &crate::state::AppState,
+    workspace_id: Option<u32>,
+) -> Option<usize> {
+    match workspace_id {
+        Some(id) => state.workspaces.iter().position(|w| w.num == id),
+        None => Some(state.active_workspace),
+    }
+}
+
 /// Resolve and run a `NewAgent` IPC request against live state. Returns
 /// the machine-readable rejection reason so both the log line and the
 /// telemetry record name the same cause.
@@ -925,11 +934,7 @@ fn apply_new_agent_request(
         crate::agents::telemetry::AgentEventRecord::new("agent.cli", "info", &correlation_id);
     event.source = Some("cli");
     event.workspace_id = workspace_id;
-    let ws_idx = match workspace_id {
-        Some(id) => state.workspaces.iter().position(|w| w.num == id),
-        None => Some(state.active_workspace),
-    };
-    let Some(ws_idx) = ws_idx else {
+    let Some(ws_idx) = resolve_workspace_index(state, workspace_id) else {
         event.level = "warn";
         event.outcome = Some("rejected");
         event.reason = Some("workspace_not_found");

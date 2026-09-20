@@ -165,12 +165,7 @@ fn settings_nav_item(
     item.on_click(move || {
         mutate_with(&s, |st| {
             st.settings_section = section;
-            if section == SettingsSection::Sessions {
-                crate::state::refresh_sessions(st);
-            }
-            if section == SettingsSection::AgentSkills {
-                crate::state::refresh_flow_skills(st);
-            }
+            crate::state::refresh_settings_section(st, section);
         });
     })
 }
@@ -1217,12 +1212,7 @@ fn build_modal_nav(active: SettingsSection, shared: &SharedState) -> ElementDef 
         item = item.on_click(move || {
             mutate_with(&s, |st| {
                 st.settings_section = target;
-                if target == SettingsSection::Sessions {
-                    crate::state::refresh_sessions(st);
-                }
-                if target == SettingsSection::AgentSkills {
-                    crate::state::refresh_flow_skills(st);
-                }
+                crate::state::refresh_settings_section(st, target);
             });
         });
         nav = nav.with_child(item);

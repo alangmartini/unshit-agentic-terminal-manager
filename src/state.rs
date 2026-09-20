@@ -2020,6 +2020,12 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     pane_id
 }
 
+/// Record the `flow.open` lifecycle event and open the pane as a new tab.
+pub(crate) fn open_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    record_flow_pane_event(&pane, "flow.open", "info", None);
+    mutate_add_flow_tab(state, pane)
+}
+
 /// Open a Flow Explorer pane as a new single-pane tab. Mirrors
 /// `mutate_add_editor_tab`: no PTY; the pane id maps into `state.flows`.
 pub fn mutate_add_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
@@ -5886,7 +5892,7 @@ fn record_editor_pane_event(
 
 /// Emit one flow lifecycle event carrying the pane's flow id, source path
 /// and counts — never node names, prose or source text.
-pub(crate) fn record_flow_pane_event(
+fn record_flow_pane_event(
     pane: &crate::flow_explorer::FlowPane,
     event: &'static str,
     level: &'static str,
@@ -7328,8 +7334,7 @@ pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
     let path = std::path::PathBuf::from(trimmed);
     match crate::flow_explorer::FlowPane::open(&path) {
         Ok(pane) => {
-            record_flow_pane_event(&pane, "flow.open", "info", None);
-            let pane_id = mutate_add_flow_tab(state, pane);
+            let pane_id = open_flow_tab(state, pane);
             record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
         }
         Err(err) => {
@@ -8451,12 +8456,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             state.settings_open = true;
             state.settings_section = section;
-            if section == SettingsSection::Sessions {
-                refresh_sessions(state);
-            }
-            if section == SettingsSection::AgentSkills {
-                refresh_flow_skills(state);
-            }
+            refresh_settings_section(state, section);
             true
         }
         other if other.starts_with("tab.switch:") => {
@@ -9898,7 +9898,7 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
 }
 
 /// Refresh only on settings navigation/actions; rendering reads the snapshot.
-pub fn refresh_flow_skills(state: &mut AppState) {
+fn refresh_flow_skills(state: &mut AppState) {
     use crate::flow_explorer::skills::{
         InstallStatus, SkillAgent, SkillInstallation, SkillInstaller,
     };
@@ -9916,6 +9916,16 @@ pub fn refresh_flow_skills(state: &mut AppState) {
             })
             .collect(),
     };
+}
+
+/// Refresh whichever section's data goes stale while the settings page is
+/// closed. Call after navigating to `section`, whether or not it changed.
+pub fn refresh_settings_section(state: &mut AppState, section: SettingsSection) {
+    match section {
+        SettingsSection::Sessions => refresh_sessions(state),
+        SettingsSection::AgentSkills => refresh_flow_skills(state),
+        _ => {}
+    }
 }
 
 fn dispatch_flow_skill_change(state: &mut AppState, id: &str, remove: bool) -> bool {
