@@ -14,7 +14,7 @@ Unshit Terminal Manager is a native macOS and Windows terminal multiplexer built
 - **Command palette** (`Ctrl+Shift+P`) — a VS Code-style launcher with fuzzy search and typed modes: `>` for actions, `@` for agents, `:` for navigation, and `/` for scrollback. Drive splits, tabs, renames, the sidebar, and settings without leaving the keyboard.
 - **Quick Prompt** (`Cmd+Shift+I` on macOS, `Ctrl+Shift+Q` elsewhere) — type a prompt, attach images, and launch an agent CLI (`claude` or `codex`) in a fresh git worktree. When the active workspace is a git repo it runs `git worktree add` so the agent works on an anonymous branch without disturbing your checkout; otherwise it falls back to a plain scratch directory.
 - **Flow Explorer** — review a change as the *flows* it touches instead of a raw diff. **Explain flow…** / **Review change as flows…** in the palette ask your default agent (running in the workspace directory with the shipped `flow-explorer` skill) to write a small JSON model of one user-facing flow: the events, handlers, IPC hops and state it crosses, each with a one-sentence description, a source location and, in review mode, a diff status. The result opens as a native pane with three views: a collapsible call stack with inline source excerpts, Miller columns, and a swim-lane graph with numbered events you can zoom into. **Open flow…** opens a JSON an agent wrote elsewhere.
-- **Agents subtab** — every workspace lists its panes under `terminals` and `agents`. A pane moves to `agents` when the app launched the agent, when a SessionStart hook reported it, or simply when the guest title looks like a known agent CLI (Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI, OpenRouter), and it moves back when the agent exits. `Ctrl+Shift+A`, the palette, a **New agent ›** flyout on the workspace and subtab context menus, and `terminal-manager agent` from any shell all start a new agent tab in the workspace directory; **Kill all agents** on the subtab menu stops only the agent panes.
+- **Agents subtab** — every workspace lists its panes under `terminals` and `agents`. A pane moves to `agents` when the app launched the agent, a SessionStart hook reported it, or automatic detection recognizes its running process or guest title (Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI, OpenRouter). Process detection runs in the Windows background monitor, including known Node/Bun/Python entrypoints, so manually started harnesses do not need to set a window title. Process-detected panes return to `terminals` when the agent exits. `Ctrl+Shift+A`, the palette, a **New agent ›** flyout on the workspace and subtab context menus, and `terminal-manager agent` from any shell all start a new agent tab in the workspace directory; **Kill all agents** on the subtab menu stops only the agent panes.
 - **Agent conversation recovery** — if the PTY daemon is lost in a reboot or crash, a saved pane with an exact or unambiguous provider conversation id offers a provider-specific **Resume Claude/Codex** button the next time Terminal Manager is opened. Automatic recovery and **Start at Windows sign-in** are separate, default-off controls under **Settings → Sessions**; enable both for unattended recovery after a PC restart. A normal UI-only restart still reattaches to the already-running agent instead of launching a duplicate.
 - **Git awareness** — the sidebar detects the current branch for terminals whose working directory lives inside a repository.
 - **Themes** — bundled palettes (Amber, Catppuccin, Tokyo Night, Nord, Dracula, Everforest, Rosé Pine, Gruvbox, and more) plus a customizable accent/surface/foreground theme.
@@ -141,7 +141,7 @@ On macOS, app-level shortcuts generally use **Command (⌘)** where this guide s
 - **Flow Explorer:** open the palette and pick **Explain flow…** (name the flow, e.g. *Send a prompt*) or **Review change as flows…** (a `base..head`, blank for the default branch up to `HEAD`). An agent tab opens; approve its single write if your agent asks, and the flow appears as a new tab when it finishes. Inside the pane: `Ctrl+1/2/3` switch call stack / panes / graph, arrows and `Enter` walk the tree or columns, `s` opens the source excerpt, `e`/`c` expand or collapse everything.
 - **Flow skills:** in **Settings > Agent skills**, install the same `flow-explorer` skill for Codex, Claude Code, Cursor, or GitHub Copilot across your local projects. Ask an ordinary conversation to "use flow-explorer to visualize what you just explained": concepts use logical steps and lanes without requiring a repository or inventing source locations. The skill saves a unique JSON file and opens it in the running app with `terminal-manager flow open <path>`. If the app is closed, use **Open flow…** later. Settings shows each copy's path and status, offers updates, and preserves custom skills and edits. Some clients also discover other clients' skill folders; these controls manage copies, not client enable/disable preferences. Start a new agent session if the installed skill does not appear.
 - **Standalone skill flow HTML:** [skill-flow-html](assets/skill-flow-html/SKILL.md) maps a skill into a self-contained browser page with a compact overview, focused drill-down, storyline breadcrumbs and explicit right-click source viewing. Copy the folder into your project's `.agents/skills/skill-flow-html/` to install it. The [bundled example](assets/skill-flow-html/assets/example/create-worktree.flow.html) can be opened directly in a browser; this standalone renderer does not change the native Flow Explorer pane.
-- **Agents:** `Ctrl+Shift+A` starts the first installed agent CLI (checked in the order Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI; Claude Code when none is found) in the active workspace; right-click a workspace or its `agents` subtab for **New agent ›** with one row per installed CLI, or run `terminal-manager agent codex` from a terminal to open one in that terminal's workspace (`--workspace-id N` targets another). Panes whose title identifies an agent are filed under `agents` automatically and return to `terminals` when the agent exits. Right-click the `agents` subtab and choose **Kill all agents** to stop them; plain terminals are left alone.
+- **Agents:** `Ctrl+Shift+A` starts the first installed agent CLI (checked in the order Claude Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI; Claude Code when none is found) in the active workspace; right-click a workspace or its `agents` subtab for **New agent ›** with one row per installed CLI, or run `terminal-manager agent codex` from a terminal to open one in that terminal's workspace (`--workspace-id N` targets another). Manually started agents are detected by process on the next successful background scan (normally within one second), with guest titles as a fallback. OpenRouter-backed tools are recognized by their harness (for example, OpenCode or Aider); an OpenRouter title or executable also identifies the OpenRouter profile. Unknown wrappers may still need an identifying title. Right-click the `agents` subtab and choose **Kill all agents** to stop them; plain terminals are left alone.
 - **Agent recovery:** after a cold restart, open Terminal Manager and use the **Resume Claude/Codex** chip in an affected pane with an exact or unambiguous conversation id. For unattended recovery after Windows restarts, enable both **Start at Windows sign-in** and **Automatic agent resume** in **Settings → Sessions**. Enabling automatic resume immediately installs the minimal SessionStart capture hooks used to remember exact ids. Turning it off leaves those hooks installed for manual recovery; use **Remove recovery hooks** in the same section to remove only Terminal Manager's managed entries.
 - **Other:** `Ctrl+B` toggles the file explorer; `Ctrl+Shift+B` toggles the workspace sidebar, `Ctrl+,` opens Settings, `F2` renames the active session, `Ctrl+=` / `Ctrl+-` zoom the font, `F11` toggles fullscreen.
 
@@ -162,10 +162,11 @@ On macOS, the application data root is `~/Library/Application Support/com.godly.
 | What | Windows location (macOS uses the same relative path under the root above) |
 |------|----------|
 | Workspaces, tabs, and pane layout | `%APPDATA%\com.godly.terminal\workspaces.json` |
+| Custom agent detection rules | `%APPDATA%\com.godly.terminal\agent-detection.json` |
 | Quick Prompt agent worktrees | `%APPDATA%\com.godly.terminal\worktrees\` |
 | Redacted agent recovery events | `%APPDATA%\com.godly.terminal\agent-restore-events.jsonl` |
 | Renderer performance/recovery events | `%APPDATA%\com.godly.terminal\renderer-events.jsonl` |
-| Agent tab classification, launch and kill events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
+| Agent tab classification, launch, kill and detection-rule reload events | `%APPDATA%\com.godly.terminal\agent-events.jsonl` |
 | Terminal mode changes (alternate screen, mouse reporting) and selection auto-scroll events | `%APPDATA%\com.godly.terminal\terminal-events.jsonl` |
 | Editor pane opens, saves, pastes, find and quick open events | `%APPDATA%\com.godly.terminal\editor-events.jsonl` |
 | Diff pane requests, navigation and file opens | `%APPDATA%\com.godly.terminal\diff-events.jsonl` |
@@ -182,6 +183,36 @@ On macOS, the application data root is `~/Library/Application Support/com.godly.
 - **Recovery hooks** are merged into Claude Code and Codex user hook settings without replacing unrelated hooks. Disabling automatic launch keeps them installed so manual recovery can continue capturing ids; **Remove recovery hooks** removes only entries marked as managed by Terminal Manager.
 - **Windows login startup** stores a quoted absolute executable path directly in the current user's `Run` key. It does not use a command shell, request administrator access, or enable agent recovery consent. The installer removes only Terminal Manager's owned value during uninstall.
 - **Recovery IPC and files** are owner-scoped: clients verify the connected server's Windows SID or Unix uid before sending hook metadata, Unix servers reject other-owner peers, hook edits refuse symlinks/reparse points, and recovery state/telemetry use owner-private files. If the final close-state save fails, Terminal Manager stays open and offers a retry instead of allowing stale agent metadata to return on the next launch.
+
+### Custom agent detection
+
+Create `agent-detection.json` beside `workspaces.json` to recognize a harness that the built-in detector does not know. Copy [the example configuration](assets/agent-detection.example.json) and replace its names and paths:
+
+```json
+{
+  "rules": [
+    { "profile": "my-agent", "executable": "my-agent.exe" },
+    {
+      "profile": "openrouter",
+      "executable": "node.exe",
+      "args_prefix": ["C:/tools/router/cli.js"]
+    },
+    {
+      "profile": "my-python-agent",
+      "executable": "python.exe",
+      "args_prefix": ["-m", "my_agent"]
+    }
+  ]
+}
+```
+
+The Windows background monitor reloads this file once per second. Changes apply to running panes; deleting the file or setting `rules` to `[]` removes custom detection. Invalid edits keep the last valid rules active and log a warning. Repo builds use `%APPDATA%\com.godly.terminal.dev`; named profiles use `com.godly.terminal.<profile>`. `TM_CONFIG_DIR` overrides the directory.
+
+- `profile` is an existing profile ID (`claude`, `codex`, `gemini`, `opencode`, `aider`, `copilot`, `openrouter`) or a custom name displayed in Agents. Use 1–64 lowercase ASCII letters, digits, hyphens or underscores, starting with a letter or digit.
+- `executable` matches the running process's basename, ignoring case and an optional `.exe` suffix. Use the actual process image, not a `.cmd`/`.ps1` launcher. Paths and wildcards are not accepted.
+- `args_prefix` matches consecutive, complete arguments immediately after the executable. Shells and runtimes require it; include enough arguments to identify the harness, not just generic runtime flags. Quoted spaces are supported. Arguments containing `/` or `\` ignore slash style and ASCII case; all other arguments are case-sensitive. No substring search, environment expansion or command execution occurs.
+- For each process, built-in detection wins over custom rules; otherwise, the first matching rule wins. The outermost detected harness wins when agents launch other agents. Rules classify panes only; they do not add launch commands or conversation recovery. Process tags clear when a successful scan no longer finds a match; explicit launches and hooks retain priority.
+- Files are limited to 64 KiB and 64 rules. Each executable is at most 128 bytes; each prefix has at most 16 arguments of at most 1024 bytes each. Unknown JSON fields are rejected so typos do not silently broaden a rule.
 
 ## Development
 

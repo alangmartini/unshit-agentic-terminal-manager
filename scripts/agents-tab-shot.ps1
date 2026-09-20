@@ -20,9 +20,15 @@
   never touched. Afterwards it prints the `agent.*` lines from the isolated
   profile's agent-events.jsonl, which is the "did telemetry land" check.
 
+  Pass -Detect codex-entrypoint or -Detect custom-rule to file the pane by
+  process instead of by title (see the parameter help); the printed
+  agent-events.jsonl lines must then carry "source":"process".
+
 .EXAMPLE
   pwsh scripts/agents-tab-shot.ps1
   pwsh scripts/agents-tab-shot.ps1 -Title 'Codex' -NoMenu
+  pwsh scripts/agents-tab-shot.ps1 -Detect codex-entrypoint -NoMenu -Out codex-process.png
+  pwsh scripts/agents-tab-shot.ps1 -Detect custom-rule -NoMenu -Out custom-rule.png
 #>
 [CmdletBinding()]
 param(
@@ -37,6 +43,17 @@ param(
     # Extra `;`-separated dispatch commands appended after the tab is open,
     # e.g. 'agent.new:bogus' to land agent.launch_failed plus its toast.
     [string]$ExtraDispatch = "",
+    # What evidence files the pane under `agents`. 'title' (default) is the
+    # guest-title fixture above. 'codex-entrypoint' runs node.exe on a fixture
+    # script whose path ends in node_modules/@openai/codex/bin/codex.js, so
+    # only the built-in process scan can classify it (no title, no Codex
+    # install needed). 'custom-rule' writes an agent-detection.json into the
+    # isolated profile that matches the guest PowerShell's -File arguments
+    # and reports a plain title, so only the custom-rules scan can classify
+    # it (profile 'shot-agent'). Both process modes must land
+    # `agent.classified` with "source":"process" in agent-events.jsonl.
+    [ValidateSet('title', 'codex-entrypoint', 'custom-rule')]
+    [string]$Detect = 'title',
     [double]$AnchorX = 60,
     [double]$AnchorY = 150,
     [string]$ExeDir = "",
@@ -97,8 +114,13 @@ if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $repoRoot $Out
 # clashing with -Command/-EncodedCommand (which made PowerShell bail out
 # before the title was ever set). Writing the title into a file also keeps
 # it clear of the dispatch separator (`;`) and the JSON quoting.
+if ($Detect -eq 'custom-rule' -and -not $PSBoundParameters.ContainsKey('Title')) {
+    # Keep the title out of it so the custom rule is the only evidence.
+    $Title = 'Windows PowerShell'
+}
 $safeTitle = $Title.Replace("'", "''")
 $guestScript = Join-Path $env:TEMP ("tm-agents-shot-{0}.ps1" -f $PID)
+$fixtureDir = Join-Path $env:TEMP ("tm-agents-shot-{0}" -f $PID)
 @"
 `$t = '$safeTitle'
 # UTF-8 on the way out so the status glyph survives (the OEM code page would
@@ -112,7 +134,19 @@ $guestScript = Join-Path $env:TEMP ("tm-agents-shot-{0}.ps1" -f $PID)
 Write-Host 'agent ready'
 while (`$true) { Start-Sleep -Seconds 5 }
 "@ | Set-Content -LiteralPath $guestScript -Encoding UTF8
-$spec = @{ program = 'powershell.exe'; args = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $guestScript) } | ConvertTo-Json -Compress
+$guestArgs = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $guestScript)
+if ($Detect -eq 'codex-entrypoint') {
+    # The built-in scan recognises node.exe by its entrypoint path alone. The
+    # fixture only idles: nothing here runs Codex or sets a title. A TEMP
+    # path with spaces is deliberate; the scan must cope with quoted args.
+    $entrypoint = Join-Path $fixtureDir 'node_modules\@openai\codex\bin\codex.js'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $entrypoint) | Out-Null
+    Set-Content -LiteralPath $entrypoint -Value 'setInterval(function () {}, 5000);' -Encoding Ascii
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    $spec = @{ program = $node; args = @($entrypoint) } | ConvertTo-Json -Compress
+} else {
+    $spec = @{ program = 'powershell.exe'; args = $guestArgs } | ConvertTo-Json -Compress
+}
 $dispatch = "shell.set_workspace:0:$spec;tab.new"
 if ($ExtraDispatch) { $dispatch += ";$ExtraDispatch" }
 if (-not $NoMenu) {
@@ -121,6 +155,13 @@ if (-not $NoMenu) {
 
 $launched = $null
 $isolation = Enter-TmIsolation -Tag 'agentsshot'
+if ($Detect -eq 'custom-rule') {
+    # The monitor re-reads this file from the profile's config dir once a
+    # second; written before launch, the very first scan already has it.
+    # No BOM: serde_json rejects one.
+    $rules = @{ rules = @(@{ profile = 'shot-agent'; executable = 'powershell.exe'; args_prefix = $guestArgs }) } | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText((Join-Path $isolation.ConfigDir 'agent-detection.json'), $rules, (New-Object Text.UTF8Encoding $false))
+}
 $errLog = "$Out.err.txt"
 $env:TM_STARTUP_DISPATCH = $dispatch
 try {
@@ -130,7 +171,7 @@ try {
         Remove-Item Env:TM_STARTUP_DISPATCH -ErrorAction SilentlyContinue
     }
     $launched = $proc
-    Write-Host "Launched pid=$($proc.Id) title=$Title menu=$(-not $NoMenu)"
+    Write-Host "Launched pid=$($proc.Id) detect=$Detect title=$Title menu=$(-not $NoMenu)"
 
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $handle = [IntPtr]::Zero
@@ -194,4 +235,5 @@ try {
     }
     Exit-TmIsolation -Isolation $isolation -PtydExe $ptydExe
     Remove-Item -LiteralPath $guestScript -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
 }

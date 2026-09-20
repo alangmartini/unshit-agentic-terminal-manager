@@ -2858,12 +2858,65 @@ pub fn is_agent_pane(state: &AppState, pane_id: u32) -> bool {
     state.agent_restarts.contains_key(&pane_id) || state.pane_agents.contains_key(&pane_id)
 }
 
-/// Re-evaluate the title-derived agent tag of `pane_id` against a fresh
-/// guest title. Launched and hook tags are never touched here; a title
-/// tag is added when the title identifies an agent and dropped when it
-/// stops doing so (the agent exited back to the shell). Returns true
-/// when membership changed. Emits one `agent.classified` /
-/// `agent.untagged` record per transition, never per title update.
+/// Apply a successful background process observation. Explicit launches and
+/// session hooks win; process tags clear when the observed harness exits.
+pub fn classify_pane_process(state: &mut AppState, pane_id: u32, profile_id: Option<&str>) -> bool {
+    use crate::agents::{AgentTag, AgentTagSource};
+    if workspace_num_for_pane(state, pane_id).is_none() {
+        return false;
+    }
+    let existing = state.pane_agents.get(&pane_id);
+    if state.agent_restarts.contains_key(&pane_id)
+        || existing.is_some_and(|tag| {
+            matches!(tag.source, AgentTagSource::Launched | AgentTagSource::Hook)
+        })
+    {
+        return false;
+    }
+    if profile_id.is_some_and(|id| !crate::agents::rules::valid_profile_id(id)) {
+        return false;
+    }
+    let next = profile_id.map(|id| AgentTag::new(id, AgentTagSource::Process));
+    // A negative process scan only clears its own evidence. A title can
+    // identify a harness whose runtime/entrypoint we do not recognize yet.
+    if next.is_none() && !existing.is_some_and(|tag| tag.source == AgentTagSource::Process) {
+        return false;
+    }
+    if existing == next.as_ref() {
+        return false;
+    }
+    let previous = state.pane_agents.remove(&pane_id);
+    if let Some(tag) = next.as_ref() {
+        state.pane_agents.insert(pane_id, tag.clone());
+        expand_agents_subtab_for_pane(state, pane_id);
+    }
+    let mut event = crate::agents::telemetry::AgentEventRecord::new(
+        if next.is_some() {
+            "agent.classified"
+        } else {
+            "agent.untagged"
+        },
+        "info",
+        &state.restore_correlation_id,
+    );
+    event.workspace_id = workspace_num_for_pane(state, pane_id);
+    event.pane_id = Some(pane_id);
+    event.profile = next
+        .as_ref()
+        .or(previous.as_ref())
+        .map(|tag| tag.profile.as_str());
+    event.source = Some(AgentTagSource::Process.as_str());
+    event.reason = Some(if next.is_some() {
+        "process_detected"
+    } else {
+        "process_exited"
+    });
+    crate::agents::telemetry::record(&event);
+    true
+}
+
+/// Re-evaluate title evidence, preserving launch, hook and live process tags.
+/// Returns true only on a transition and emits no raw title or command text.
 pub fn classify_pane_title(state: &mut AppState, pane_id: u32, raw_title: &str) -> bool {
     use crate::agents::{AgentTag, AgentTagSource};
 
@@ -3061,7 +3114,10 @@ fn terminal_tab_from_persisted(
                     {
                         agent_restarts.insert(pp.id, restart.clone());
                     }
-                    if let Some(tag) = pp.agent_tag.as_ref() {
+                    if let Some(tag) = pp.agent_tag.as_ref().filter(|tag| {
+                        // A fresh process scan must verify a persisted observation.
+                        tag.source != crate::agents::AgentTagSource::Process
+                    }) {
                         pane_agents.insert(pp.id, tag.clone());
                     } else if pp.agent_restart.is_none() && !pp.custom_title {
                         // Files written before the tag existed: the
@@ -21531,6 +21587,57 @@ mod agents_tab_tests {
     }
 
     #[test]
+    fn process_classification_tracks_agents_without_window_titles() {
+        for id in [
+            "codex",
+            "copilot",
+            "gemini",
+            "opencode",
+            "aider",
+            "openrouter",
+        ] {
+            let mut state = seed_state();
+            state.workspaces[0].agents_expanded = false;
+            assert!(classify_pane_process(&mut state, 1, Some(id)));
+            assert!(is_agent_pane(&state, 1));
+            assert!(state.workspaces[0].agents_expanded);
+            assert_eq!(
+                state.pane_agents[&1],
+                AgentTag::new(id, AgentTagSource::Process)
+            );
+            assert!(!classify_pane_process(&mut state, 1, Some(id)));
+            assert!(!classify_pane_title(&mut state, 1, "Windows PowerShell"));
+            assert!(!state.ui_snapshot().workspaces[0].agent_entries.is_empty());
+            assert!(classify_pane_process(&mut state, 1, None));
+            assert!(!is_agent_pane(&state, 1));
+            assert!(!classify_pane_process(&mut state, 1, None));
+        }
+    }
+
+    #[test]
+    fn process_classification_preserves_stronger_tags_and_ignores_closed_panes() {
+        let mut state = seed_state();
+        for source in [AgentTagSource::Launched, AgentTagSource::Hook] {
+            state.pane_agents.insert(1, AgentTag::new("claude", source));
+            assert!(!classify_pane_process(&mut state, 1, Some("codex")));
+            assert!(!classify_pane_process(&mut state, 1, None));
+            assert_eq!(state.pane_agents[&1], AgentTag::new("claude", source));
+        }
+        assert!(!classify_pane_process(&mut state, 999, Some("codex")));
+        assert!(!state.pane_agents.contains_key(&999));
+    }
+
+    #[test]
+    fn custom_process_profile_appears_in_agents_and_clears_on_exit() {
+        let mut state = seed_state();
+        assert!(classify_pane_process(&mut state, 1, Some("my-router")));
+        assert_eq!(agent_tag_for_pane(&state, 1).unwrap().label(), "my-router");
+        assert!(!state.ui_snapshot().workspaces[0].agent_entries.is_empty());
+        assert!(classify_pane_process(&mut state, 1, None));
+        assert!(!is_agent_pane(&state, 1));
+    }
+
+    #[test]
     fn title_classification_adds_keeps_and_clears_the_tag_on_transitions() {
         let mut state = seed_state();
         assert!(!classify_pane_title(&mut state, 1, "Windows PowerShell"));
@@ -21801,6 +21908,19 @@ mod agents_tab_tests {
         restore_layout(&mut state, &persisted);
         assert_eq!(state.pane_agents[&1].profile, "aider");
         assert!(state.custom_titled_panes.contains(&1));
+    }
+
+    #[test]
+    fn restored_process_tags_require_a_fresh_observation() {
+        let mut persisted = crate::persist::PersistedState::from_state(&seed_state());
+        let pane = &mut persisted.workspaces[0].tabs[0].panes[0][0];
+        pane.title = "Windows PowerShell".into();
+        pane.agent_tag = Some(AgentTag::new("codex", AgentTagSource::Process));
+        let mut state = test_state();
+        restore_layout(&mut state, &persisted);
+        assert!(!is_agent_pane(&state, 1));
+        assert!(classify_pane_process(&mut state, 1, Some("codex")));
+        assert!(is_agent_pane(&state, 1));
     }
 }
 

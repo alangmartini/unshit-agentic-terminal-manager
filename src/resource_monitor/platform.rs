@@ -26,6 +26,12 @@ pub fn sample_process(pid: u32) -> Option<ProcSample> {
     imp::sample_process(pid)
 }
 
+/// Read a runtime's entrypoint on the monitor thread. Call only for owned
+/// session descendants; the returned command line must never be logged or persisted.
+pub fn process_command_line(pid: u32) -> Option<String> {
+    imp::process_command_line(pid)
+}
+
 /// Wall clock in FILETIME units (100ns since 1601-01-01 UTC), comparable
 /// with `ProcSample::creation_100ns`.
 pub fn now_100ns() -> u64 {
@@ -46,11 +52,14 @@ pub fn logical_cpus() -> usize {
 #[cfg(windows)]
 mod imp {
     use super::{HashMap, ProcSample, ProcessRecord};
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE, SYSTEMTIME};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -61,6 +70,73 @@ mod imp {
 
     fn filetime_to_u64(ft: FILETIME) -> u64 {
         (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+    }
+
+    pub fn process_command_line(pid: u32) -> Option<String> {
+        type Query = unsafe extern "system" fn(HANDLE, i32, *mut c_void, u32, *mut u32) -> i32;
+        #[repr(C)]
+        struct UnicodeString {
+            length: u16,
+            maximum_length: u16,
+            buffer: *const u16,
+        }
+        // PROCESSINFOCLASS 60 returns a local UNICODE_STRING plus its text.
+        // Definition: https://github.com/winsiderss/phnt/blob/master/ntpsapi.h
+        // Resolve dynamically as Microsoft recommends for this internal API:
+        // https://learn.microsoft.com/windows/win32/api/winternl/nf-winternl-ntqueryinformationprocess
+        // SAFETY: ntdll is already loaded for the lifetime of this process.
+        // Every handle is closed, buffer size is bounded, and the returned
+        // pointer/length are checked against our allocation before reading.
+        unsafe {
+            let module = GetModuleHandleW(windows_sys::w!("ntdll.dll"));
+            if module.is_null() {
+                return None;
+            }
+            let address = GetProcAddress(module, windows_sys::s!("NtQueryInformationProcess"))?;
+            let query: Query = std::mem::transmute(address);
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let result = (|| {
+                let mut required = 0;
+                query(handle, 60, std::ptr::null_mut(), 0, &mut required);
+                if !(std::mem::size_of::<UnicodeString>() as u32..=128 * 1024).contains(&required) {
+                    return None;
+                }
+                // usize storage supplies the alignment required by UNICODE_STRING.
+                let mut storage =
+                    vec![0usize; (required as usize).div_ceil(std::mem::size_of::<usize>())];
+                if query(
+                    handle,
+                    60,
+                    storage.as_mut_ptr().cast(),
+                    required,
+                    &mut required,
+                ) < 0
+                {
+                    return None;
+                }
+                let header = &*storage.as_ptr().cast::<UnicodeString>();
+                let start = storage.as_ptr() as usize;
+                let end = start + std::mem::size_of_val(storage.as_slice());
+                let text = header.buffer as usize;
+                let length = usize::from(header.length);
+                if length % 2 != 0
+                    || text % 2 != 0
+                    || text < start + std::mem::size_of::<UnicodeString>()
+                    || text.checked_add(length)? > end
+                {
+                    return None;
+                }
+                Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                    header.buffer,
+                    length / 2,
+                )))
+            })();
+            CloseHandle(handle);
+            result
+        }
     }
 
     fn zero_filetime() -> FILETIME {
@@ -371,6 +447,10 @@ mod imp {
 mod imp {
     use super::{HashMap, ProcSample, ProcessRecord};
 
+    pub fn process_command_line(_pid: u32) -> Option<String> {
+        None
+    }
+
     pub fn enumerate_processes_named() -> Option<(Vec<ProcessRecord>, HashMap<u32, String>)> {
         None
     }
@@ -397,6 +477,14 @@ mod imp {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn reads_own_command_line_and_handles_a_missing_process() {
+        let command =
+            process_command_line(std::process::id()).expect("own command line is readable");
+        assert!(command.contains("terminal_manager"));
+        assert!(process_command_line(u32::MAX).is_none());
+    }
 
     #[test]
     fn samples_the_current_process_with_limited_access() {

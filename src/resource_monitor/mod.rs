@@ -109,6 +109,16 @@ pub struct ResourceReport {
     pub listing: Option<DaemonListing>,
     /// Whether the daemon could not be listed, so cached rows may be stale.
     pub listing_failed: bool,
+    /// Process observations for owned sessions. Missing rows mean unknown,
+    /// while a row with no profile means a successful scan found no agent.
+    pub agents: Vec<ProcessAgentObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessAgentObservation {
+    pub pane_id: u32,
+    pub session_id: u64,
+    pub profile: Option<String>,
 }
 
 /// Write a report into the state. Returns whether anything the status bar
@@ -150,7 +160,19 @@ pub fn apply_report(state: &mut AppState, report: &ResourceReport) -> bool {
         }
     }
 
-    DisplayKey::of(state) != before
+    let mut agents_changed = false;
+    for observation in &report.agents {
+        // The pane may have closed or reattached while the sampler was
+        // outside the state lock. Never apply evidence from its old session.
+        if state.pty_manager.session_id(observation.pane_id) == Some(observation.session_id) {
+            agents_changed |= crate::state::classify_pane_process(
+                state,
+                observation.pane_id,
+                observation.profile.as_deref(),
+            );
+        }
+    }
+    agents_changed || DisplayKey::of(state) != before
 }
 
 /// Every pane the UI can show: the active tab's live layout lives in
@@ -316,6 +338,37 @@ mod tests {
 
     fn first_pane_id(state: &AppState) -> u32 {
         state.panes[0][0].id.0
+    }
+
+    #[test]
+    fn process_observations_move_panes_and_only_rebuild_on_transitions() {
+        let mut state = seed_state();
+        let pane_id = first_pane_id(&state);
+        state
+            .pty_manager
+            .test_install_broken_inner_with_session(pane_id, 42);
+        let mut report = ResourceReport::default();
+        apply_report(&mut state, &report);
+        report.agents.push(ProcessAgentObservation {
+            pane_id,
+            session_id: 42,
+            profile: Some("codex".into()),
+        });
+        assert!(apply_report(&mut state, &report));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        assert!(!apply_report(&mut state, &report));
+        // An unavailable sample does not claim the process exited.
+        assert!(!apply_report(&mut state, &ResourceReport::default()));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        // A stale report cannot clear a pane now attached to another session.
+        report.agents[0].session_id = 41;
+        report.agents[0].profile = None;
+        assert!(!apply_report(&mut state, &report));
+        assert!(crate::state::is_agent_pane(&state, pane_id));
+        report.agents[0].session_id = 42;
+        assert!(apply_report(&mut state, &report));
+        assert!(!crate::state::is_agent_pane(&state, pane_id));
+        assert!(!apply_report(&mut state, &report));
     }
 
     #[test]
