@@ -1051,6 +1051,25 @@ mod tests {
     }
 
     #[test]
+    fn conceptual_flow_renders_all_views_without_source_locations() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flow-explorer/cache-concept.json");
+        let mut pane = FlowPane::open(&path).unwrap();
+        assert!(pane.flow.git_ref.is_none());
+        assert!(pane.flow.nodes.iter().all(|node| node.location.is_none()));
+        for view in [FlowView::CallStack, FlowView::Panes, FlowView::Graph] {
+            pane.set_view(view);
+            let body = build_flow_pane_body(PaneId(1), false, &pane, &shared());
+            assert!(text_of(&body).contains("How a cache serves a request"));
+            assert!(all(&body, &["flow-src"]).is_empty());
+            assert!(!text_of(&body).contains("source unavailable"));
+        }
+        let graph = build_flow_pane_body(PaneId(1), false, &pane, &shared());
+        assert_eq!(all(&graph, &["flow-graph-node"]).len(), 6);
+        assert!(text_of(&graph).contains("Cache miss"));
+    }
+
+    #[test]
     fn empty_summary_is_omitted() {
         let mut p = pane();
         p.flow.summary = "   ".into();

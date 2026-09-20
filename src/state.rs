@@ -352,6 +352,7 @@ pub enum SettingsSection {
     Keybinds,
     Sessions,
     Notifications,
+    AgentSkills,
     DangerZone,
 }
 
@@ -363,17 +364,19 @@ impl SettingsSection {
             SettingsSection::Keybinds => "keybinds",
             SettingsSection::Sessions => "sessions",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::AgentSkills => "agent skills",
             SettingsSection::DangerZone => "danger zone",
         }
     }
 
-    pub fn all() -> [SettingsSection; 6] {
+    pub fn all() -> [SettingsSection; 7] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
             SettingsSection::Keybinds,
             SettingsSection::Sessions,
             SettingsSection::Notifications,
+            SettingsSection::AgentSkills,
             SettingsSection::DangerZone,
         ]
     }
@@ -954,6 +957,7 @@ pub struct AppState {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     /// Theme id that was last published to visible terminal grids. Empty
@@ -1282,6 +1286,7 @@ impl AppState {
             active_pane: self.active_pane,
             settings_open: self.settings_open,
             settings_section: self.settings_section,
+            flow_skill_installations: self.flow_skill_installations.clone(),
             theme: self.theme.clone(),
             custom_theme: self.custom_theme,
             config_font_size_pt: self.config_font_size_pt,
@@ -1424,6 +1429,7 @@ pub struct UiSnapshot {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
     pub config_font_size_pt: u32,
@@ -1641,6 +1647,7 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
+        flow_skill_installations: Vec::new(),
         theme: theme::default_theme_id().to_string(),
         custom_theme: theme::default_custom_theme(),
         last_terminal_theme_painted: String::new(),
@@ -2082,6 +2089,12 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
     pane_id
+}
+
+/// Record the `flow.open` lifecycle event and open the pane as a new tab.
+pub(crate) fn open_flow_tab(state: &mut AppState, pane: crate::flow_explorer::FlowPane) -> PaneId {
+    record_flow_pane_event(&pane, "flow.open", "info", None);
+    mutate_add_flow_tab(state, pane)
 }
 
 /// Open a Flow Explorer pane as a new single-pane tab. Mirrors
@@ -7392,8 +7405,7 @@ pub fn dispatch_flow_open_path(state: &mut AppState, raw_path: &str) -> bool {
     let path = std::path::PathBuf::from(trimmed);
     match crate::flow_explorer::FlowPane::open(&path) {
         Ok(pane) => {
-            record_flow_pane_event(&pane, "flow.open", "info", None);
-            let pane_id = mutate_add_flow_tab(state, pane);
+            let pane_id = open_flow_tab(state, pane);
             record_diagnostic_pty_event(state, format!("flow_open pane={}", pane_id.0));
         }
         Err(err) => {
@@ -7999,6 +8011,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 state.keybinds.error = None;
             } else {
                 state.settings_open = true;
+                if state.settings_section == SettingsSection::AgentSkills {
+                    refresh_flow_skills(state);
+                }
             }
             true
         }
@@ -8534,9 +8549,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             };
             state.settings_open = true;
             state.settings_section = section;
-            if section == SettingsSection::Sessions {
-                refresh_sessions(state);
-            }
+            refresh_settings_section(state, section);
             true
         }
         other if other.starts_with("tab.switch:") => {
@@ -8809,6 +8822,16 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "agent.auto_resume.toggle" => dispatch_agent_auto_resume_toggle(state),
         "agent.recovery_hooks.remove" => dispatch_agent_recovery_hooks_remove(state),
+        "flow.skill.refresh" => {
+            refresh_flow_skills(state);
+            true
+        }
+        other if other.starts_with("flow.skill.install:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.install:".len()..], false)
+        }
+        other if other.starts_with("flow.skill.remove:") => {
+            dispatch_flow_skill_change(state, &other["flow.skill.remove:".len()..], true)
+        }
         "settings.start_at_login.toggle" => dispatch_start_at_login_toggle(state),
         "settings.start_at_login.remove" => dispatch_start_at_login_remove(state),
         other if other.starts_with("agent.resume:") => dispatch_agent_resume(state, other),
@@ -9967,6 +9990,56 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
     true
 }
 
+/// Refresh only on settings navigation/actions; rendering reads the snapshot.
+fn refresh_flow_skills(state: &mut AppState) {
+    use crate::flow_explorer::skills::{
+        InstallStatus, SkillAgent, SkillInstallation, SkillInstaller,
+    };
+    state.flow_skill_installations = match SkillInstaller::for_current_user() {
+        Ok(installer) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| installer.inspect(agent))
+            .collect(),
+        Err(error) => SkillAgent::ALL
+            .into_iter()
+            .map(|agent| SkillInstallation {
+                agent,
+                path: std::path::PathBuf::from(agent.relative_dir()),
+                status: InstallStatus::Unavailable(error.to_string()),
+            })
+            .collect(),
+    };
+}
+
+/// Refresh whichever section's data goes stale while the settings page is
+/// closed. Call after navigating to `section`, whether or not it changed.
+pub fn refresh_settings_section(state: &mut AppState, section: SettingsSection) {
+    match section {
+        SettingsSection::Sessions => refresh_sessions(state),
+        SettingsSection::AgentSkills => refresh_flow_skills(state),
+        _ => {}
+    }
+}
+
+fn dispatch_flow_skill_change(state: &mut AppState, id: &str, remove: bool) -> bool {
+    use crate::flow_explorer::skills::{SkillAgent, SkillInstaller};
+    let Some(agent) = SkillAgent::from_id(id) else {
+        return false;
+    };
+    let result = SkillInstaller::for_current_user().and_then(|installer| {
+        if remove {
+            installer.remove(agent)
+        } else {
+            installer.install(agent)
+        }
+    });
+    if let Err(error) = result {
+        push_error_toast(state, format!("{} Flow skill: {error}", agent.label()));
+    }
+    refresh_flow_skills(state);
+    true
+}
+
 /// Hydrate the runtime mirror from Windows before the first UI snapshot. The
 /// registry remains authoritative; a failed read keeps the existing safe
 /// default and is recorded without exposing paths or localized OS messages.
@@ -11008,6 +11081,7 @@ pub(crate) mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().to_string(),
             custom_theme: crate::theme::default_custom_theme(),
             last_terminal_theme_painted: String::new(),
@@ -11101,15 +11175,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settings_section_all_returns_six() {
+    fn settings_section_all_includes_agent_skills() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
         assert_eq!(all[3], SettingsSection::Sessions);
         assert_eq!(all[4], SettingsSection::Notifications);
-        assert_eq!(all[5], SettingsSection::DangerZone);
+        assert_eq!(all[5], SettingsSection::AgentSkills);
+        assert_eq!(all[6], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------

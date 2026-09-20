@@ -9,6 +9,8 @@
   which works even when another window covers the app. The default dispatch
   opens the committed fixture flow; pass -Dispatch to chain view commands,
   e.g. "flow.open:<path>;flow.view:panes;flow.select:0:ui.cmd-enter".
+  Pass -ViaCli to start on Agent skills settings, then open the fixture through
+  the running app's IPC endpoint with `terminal-manager flow open`.
 
   Runs under a throwaway TM_PROFILE so the installed app's daemon, sessions
   and config are never touched.
@@ -19,6 +21,7 @@ param(
     [string]$Dispatch = "",
     [string]$Fixture = "",
     [string]$ExeDir = "",
+    [switch]$ViaCli,
     [int]$SettleMs = 7000,
     [int]$Width = 1400,
     [int]$Height = 900
@@ -63,7 +66,9 @@ $exe = Join-Path $ExeDir 'terminal-manager.exe'
 $ptydExe = Join-Path $ExeDir 'unshit-ptyd.exe'
 if (-not (Test-Path $exe)) { throw "Missing exe: $exe (run cargo build first)" }
 if (-not $Fixture) { $Fixture = Join-Path $repoRoot 'tests\fixtures\flow-explorer\send-a-prompt.json' }
-if (-not $Dispatch) { $Dispatch = "flow.open:$Fixture" }
+if (-not $Dispatch) {
+    $Dispatch = if ($ViaCli) { 'settings.section:agent-skills' } else { "flow.open:$Fixture" }
+}
 if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $repoRoot $Out }
 
 $launched = $null
@@ -72,7 +77,7 @@ $errLog = "$Out.err.txt"
 $env:TM_STARTUP_DISPATCH = $Dispatch
 try {
     try {
-        $proc = Start-Process -FilePath $exe -WorkingDirectory $repoRoot -PassThru -RedirectStandardError $errLog
+        $proc = Start-Process -FilePath $exe -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru -RedirectStandardError $errLog
     } finally {
         Remove-Item Env:TM_STARTUP_DISPATCH -ErrorAction SilentlyContinue
     }
@@ -99,6 +104,13 @@ try {
     if ($again -ne [IntPtr]::Zero) { $handle = $again }
     [FlowShotWin]::SetWindowPos($handle, [IntPtr]::Zero, 40, 120, $Width, $Height, 0x14) | Out-Null
     Start-Sleep -Milliseconds 800
+
+    if ($ViaCli) {
+        $flowSocket = '\\.\pipe\terminal-manager-notify-' + $isolation.Token
+        & $exe flow open $Fixture --socket $flowSocket
+        if ($LASTEXITCODE -ne 0) { throw 'Flow CLI handoff failed' }
+        Start-Sleep -Milliseconds 800
+    }
 
     $rect = New-Object FlowShotWin+RECT
     [FlowShotWin]::GetWindowRect($handle, [ref]$rect) | Out-Null
@@ -140,6 +152,11 @@ try {
     if ($launched -and -not $launched.HasExited) {
         try { $launched.Kill() } catch {}
         try { $launched.WaitForExit(5000) | Out-Null } catch {}
+    }
+    $cleanupRoot = [IO.Path]::GetFullPath((Join-Path $env:TEMP 'tm-isolated')).TrimEnd('\') + '\'
+    $cleanupTarget = [IO.Path]::GetFullPath($isolation.ConfigDir)
+    if (-not $cleanupTarget.StartsWith($cleanupRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing cleanup outside the isolated test directory: $cleanupTarget"
     }
     Exit-TmIsolation -Isolation $isolation -PtydExe $ptydExe
 }
