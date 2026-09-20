@@ -64,6 +64,22 @@ pipe and survive UI restarts via the daemon, exactly like before.
 
 ## Cleaning up dev/test leftovers
 
+On macOS and Linux:
+
+```bash
+scripts/kill-all.sh --dry-run  # preview without stopping anything
+scripts/kill-all.sh            # stop only this checkout's target/ and target-*/ builds
+scripts/kill-all.sh --all      # also stop installed copies and other checkouts
+```
+
+The default checks executable paths and spares installed apps, `dist/` bundles,
+other checkouts, and processes whose executable path cannot be determined.
+Custom build directories outside `target/` or `target-*/` are also spared.
+Stopping a selected daemon ends all of its sessions, including any terminal
+running this command. Use `--dry-run` first. `--quiet` suppresses normal output.
+
+On Windows:
+
 ```powershell
 scripts\kill-all.ps1        # repo-scoped: kills only processes running from this repo
 scripts\kill-all.ps1 -All   # also kills the installed app + its daemon
