@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use unshit::core::element::*;
 use unshit::core::style::parse::StyleDeclaration;
 use unshit::core::style::types::{
-    Background, Color, Dimension, Display, FlexDirection, GradientStop, GradientStopPosition,
-    LinearGradient, Overflow, TextAlign,
+    Background, Color, Dimension, Display, FlexDirection, FontStyle, FontWeight, GradientStop,
+    GradientStopPosition, LinearGradient, Overflow, TextAlign,
 };
 use unshit::prelude::SvgNode;
+use unshit::renderer::batch::UiGlyphPrewarm;
 
 use unshit::core::event::Modifiers;
 use unshit::core::shortcut::KeyCombo;
@@ -18,6 +19,121 @@ use crate::state::{
 };
 use crate::theme;
 use crate::ui::icons::*;
+
+/// Exact visible Appearance strings, rasterized while the startup splash is
+/// visible. Prewarming complete runs (rather than an alphabet) matters here:
+/// the atlas key includes each glyph's shaped subpixel position.
+const SETTINGS_PREWARM_FAMILY: &str =
+    "JetBrains Mono, Berkeley Mono, SF Mono, Menlo, Consolas, monospace";
+
+macro_rules! settings_prewarm {
+    ($text:expr, $weight:expr, $size:expr, $line:expr, $spacing:expr) => {
+        UiGlyphPrewarm {
+            text: $text,
+            font_family: SETTINGS_PREWARM_FAMILY,
+            font_weight: $weight,
+            font_style: FontStyle::Normal,
+            font_size: $size,
+            line_height: $line,
+            letter_spacing: $spacing,
+        }
+    };
+}
+
+pub const SETTINGS_GLYPH_PREWARM: &[UiGlyphPrewarm] = &[
+    settings_prewarm!("Appearance", FontWeight::W(700), 11.0, 1.4, 0.0),
+    settings_prewarm!("Shell", FontWeight::W(600), 11.0, 1.4, 0.0),
+    settings_prewarm!("Sessions", FontWeight::W(600), 11.0, 1.4, 0.0),
+    settings_prewarm!("Keybinds", FontWeight::W(600), 11.0, 1.4, 0.0),
+    settings_prewarm!("Notifications", FontWeight::W(600), 11.0, 1.4, 0.0),
+    settings_prewarm!("Danger Zone", FontWeight::W(600), 11.0, 1.4, 0.0),
+    settings_prewarm!("settings · Appearance", FontWeight::Normal, 10.0, 1.4, 0.0),
+    settings_prewarm!("Appearance", FontWeight::W(600), 16.0, 1.3, 0.0),
+    settings_prewarm!(
+        "Themes, density, and the visual feel of the terminal. Changes apply immediately.",
+        FontWeight::Normal,
+        10.0,
+        1.4,
+        0.0
+    ),
+    settings_prewarm!("Color theme", FontWeight::W(700), 11.0, 1.4, 0.2),
+    settings_prewarm!(
+        "Sets surface, text, accent, and syntax tints across the whole app.",
+        FontWeight::Normal,
+        10.0,
+        1.4,
+        0.2
+    ),
+    settings_prewarm!("Amber", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Catppuccin", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Tokyo Night", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Nord", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Dracula", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Everforest", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Rosé Pine", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Gruvbox", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Kanagawa", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!("Custom", FontWeight::W(700), 12.0, 1.35, 0.0),
+    settings_prewarm!(
+        "ember on walnut · default",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "mocha · soothing pastels",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!("neon-lit nightscape", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!(
+        "arctic · frost & aurora",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "high contrast · neon vampire",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "dark hard · mossy forest",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "soho cottage · all natural",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "retro warm · dark hard",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!(
+        "the great wave · muted ink",
+        FontWeight::W(600),
+        10.0,
+        1.35,
+        0.0
+    ),
+    settings_prewarm!("pick your own", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!("✓❯+", FontWeight::W(600), 24.0, 1.0, 0.0),
+];
 
 pub fn build_settings_modal(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
@@ -154,7 +270,11 @@ fn settings_nav_item(
         .with_child(svg_icon(settings_nav_icon(section)))
         .with_child(ElementDef::new(Tag::Span).with_text(settings_section_title(section)));
     if section == active {
-        item = item.with_class("active");
+        item = item
+            .with_class("active")
+            .with_style(StyleDeclaration::Background(Background::Color(
+                Color::TRANSPARENT,
+            )));
     }
     item.on_click(move || {
         mutate_with(&s, |st| {
@@ -536,13 +656,26 @@ fn build_theme_chip(
 }
 
 fn build_theme_swatch_strip(swatches: &[String]) -> ElementDef {
+    let last = swatches.len().saturating_sub(1).max(1) as f32;
+    let stops: smallvec::SmallVec<[GradientStop; 4]> = swatches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, color)| {
+            theme::parse_hex_color(color).map(|color| GradientStop {
+                color,
+                position: GradientStopPosition::Percent(index as f32 / last),
+            })
+        })
+        .collect();
     let mut strip = ElementDef::new(Tag::Div).with_class("theme-chip-foot");
-    for color in swatches {
-        let mut swatch = ElementDef::new(Tag::Span);
-        if let Some(color) = theme::parse_hex_color(color) {
-            swatch = swatch.with_style(StyleDeclaration::Background(Background::Color(color)));
-        }
-        strip = strip.with_child(swatch);
+    if stops.len() >= 2 {
+        strip = strip.with_style(StyleDeclaration::Background(Background::LinearGradient(
+            LinearGradient {
+                angle_deg: 90.0,
+                stops,
+                repeating: false,
+            },
+        )));
     }
     strip
 }
@@ -3245,6 +3378,10 @@ mod tests {
             FontWeight::W(700),
             "theme chip label should use the filled Claude target weight"
         );
+        assert_eq!(
+            amber_name.computed_style.font_family, SETTINGS_GLYPH_PREWARM[2].font_family,
+            "the prewarm key must match the renderer's resolved CSS family list"
+        );
         let header_blurb = harness
             .query(".set-page-header .blurb")
             .expect("settings header blurb");
@@ -3753,7 +3890,7 @@ mod tests {
             ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: #d4a348;\n  border-color: #d4a348;\n  color: #746445;\n  border-radius: 4px;"
         ));
         assert!(css.contains("box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);"));
-        assert!(css.contains(".app.settings .settings-titlebar .titlebar-left"));
+        assert!(css.contains(".settings-titlebar .titlebar-left"));
         assert!(css.contains("top: -1px;"));
         assert!(css.contains(".settings-tb-breadcrumb"));
         assert!(css.contains("padding-left: 11px;"));
@@ -3775,18 +3912,18 @@ mod tests {
             ".set-page-nav-item.nav-keybinds span {\n  position: relative;\n  top: 1px;"
         ));
         assert!(css.contains(".brand-term"));
-        assert!(css.contains(".app.settings .settings-titlebar .brand-term"));
+        assert!(css.contains(".settings-titlebar .brand-term"));
         assert!(css.contains("left: 6px;"));
         assert!(css.contains("color: #e4d2a6;"));
         assert!(
-            css_lf.contains(".app.settings .settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: #d1bd94;")
+            css_lf.contains(".settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: #d1bd94;")
         );
         assert!(css_lf.contains(
-            ".app.settings .settings-titlebar .brand-name .dot {\n  position: relative;\n  left: 4px;"
+            ".settings-titlebar .brand-name .dot {\n  position: relative;\n  left: 4px;"
         ));
-        assert!(css_lf.contains(
-            ".app.settings .settings-titlebar .brand-mark {\n  position: relative;\n  top: 3px;"
-        ));
+        assert!(
+            css_lf.contains(".settings-titlebar .brand-mark {\n  position: relative;\n  top: 3px;")
+        );
         assert!(css.contains("font-size: 14px;"));
         assert!(css.contains("padding-right: 8px;"));
         assert!(
@@ -3794,13 +3931,13 @@ mod tests {
         );
         assert!(css.contains("letter-spacing: 1.4px;"));
         assert!(css_lf.contains(
-            ".app.settings .statusbar {\n  grid-column: 1;\n  grid-row: 3;\n  padding-left: 8px;"
+            ".settings-statusbar {\n  grid-column: 1;\n  grid-row: 3;\n  padding-left: 8px;"
         ));
-        assert!(css.contains(".app.settings .settings-statusbar .sb-cell"));
+        assert!(css.contains(".settings-statusbar .sb-cell"));
         assert!(css.contains("height: 14px;"));
-        assert!(css.contains(".app.settings .settings-statusbar .sb-cell.sage"));
+        assert!(css.contains(".settings-statusbar .sb-cell.sage"));
         assert!(css.contains("padding-right: 16px;"));
-        assert!(css.contains(".app.settings .settings-statusbar .statusbar-right .sb-cell.amber"));
+        assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber"));
         assert!(css.contains("padding-right: 11px;"));
         assert!(css.contains("color: #e0a342;"));
         assert!(css.contains(".settings-page .set-label"));

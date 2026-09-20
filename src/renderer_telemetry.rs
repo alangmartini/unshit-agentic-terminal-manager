@@ -248,6 +248,8 @@ struct SlowFrameRecord {
     node_count: usize,
     quad_count: u32,
     glyph_count: u32,
+    atlas_fill_ratio: f32,
+    gpu_upload_bytes: u64,
 }
 
 impl SlowFrameRecord {
@@ -277,6 +279,8 @@ impl SlowFrameRecord {
             node_count: metrics.node_count,
             quad_count: metrics.quad_count,
             glyph_count: metrics.glyph_count,
+            atlas_fill_ratio: metrics.atlas_fill_ratio,
+            gpu_upload_bytes: metrics.gpu_upload_bytes,
         }
     }
 }

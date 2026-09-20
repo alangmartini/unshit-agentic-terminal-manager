@@ -163,7 +163,11 @@ mod tests {
         use crate::snapshot::Snapshot;
         let grid = Grid::new(45, 150);
         let scrollback: Vec<Vec<Cell>> = (0..100).map(|_| vec![Cell::BLANK; 150]).collect();
-        let snap = Snapshot { grid, scrollback };
+        let snap = Snapshot {
+            grid,
+            scrollback,
+            mouse_modes: Default::default(),
+        };
         let bytes = serde_json::to_vec(&snap).unwrap();
         assert!(
             bytes.len() < 1024 * 1024,

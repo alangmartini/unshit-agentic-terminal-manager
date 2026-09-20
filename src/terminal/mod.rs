@@ -717,6 +717,11 @@ impl Terminal {
         self.grid.set_cursor_visible(snapshot.grid.cursor_visible());
 
         self.scrollback.clear();
+        self.mouse_report_1000 = snapshot.mouse_modes.report_1000;
+        self.mouse_report_1002 = snapshot.mouse_modes.report_1002;
+        self.mouse_report_1003 = snapshot.mouse_modes.report_1003;
+        self.mouse_sgr = snapshot.mouse_modes.sgr;
+        self.mouse_wheel_accum = 0.0;
         self.scrollback.reserve(snapshot.scrollback.len());
         for line in &snapshot.scrollback {
             let converted: Vec<Cell> = line.iter().map(|c| core_cell_to_ui(*c)).collect();
@@ -1644,17 +1649,15 @@ impl Terminal {
     }
 
     /// `true` when the active scroll region covers the full screen.
-    /// Used by `scroll_up` to decide whether the evicted top row should
-    /// be pushed into scrollback. A DECSTBM-narrowed region is part of
-    /// a TUI's redraw machinery (vim's status line, htop's header), so
-    /// rows scrolled off it must NOT pollute scrollback.
+    /// Used to preserve full-screen margins when resizing.
     fn region_is_full_screen(&self) -> bool {
         self.scroll_top == 0 && self.scroll_bot == self.rows
     }
 
-    /// Scroll the active region up by one line. When the region covers
-    /// the whole screen, the top row is also saved to scrollback before
-    /// it scrolls off; with a narrowed region scrollback is left alone.
+    /// Scroll the active region up by one line. On the main screen,
+    /// lines leaving the screen's top enter scrollback even if the bottom
+    /// margin reserves an input/status area (as in Codex's inline UI).
+    /// Interior regions and alternate-screen redraws do not enter history.
     fn scroll_up(&mut self) {
         if self.rows == 0 || self.scroll_bot <= self.scroll_top {
             return;
@@ -1662,8 +1665,7 @@ impl Terminal {
         let top = self.scroll_top;
         let bot = self.scroll_bot;
 
-        // Only the full-screen region feeds scrollback.
-        if self.region_is_full_screen() {
+        if top == 0 && self.alt_grid.is_none() {
             let mut row = Vec::with_capacity(self.cols);
             for col in 0..self.cols {
                 row.push(self.grid.get_cell(top, col).copied().unwrap_or_default());
@@ -5651,6 +5653,30 @@ mod tests {
     // -- apply_snapshot -------------------------------------------------------
 
     #[test]
+    fn reattached_session_preserves_wheel_reporting() {
+        for mode in [1000, 1002, 1003] {
+            let mut daemon = unshit_terminal_core::Terminal::new(3, 10, 100);
+            daemon.process_bytes(format!("\x1b[?{mode};1006h").as_bytes());
+            let encoded = serde_json::to_vec(&daemon.snapshot(100)).unwrap();
+            let snapshot = serde_json::from_slice(&encoded).unwrap();
+            let mut ui = Terminal::new(3, 10);
+            ui.apply_snapshot(&snapshot);
+            assert!(ui.mouse_reporting_active());
+            assert_eq!(ui.encode_wheel_reports(20.0, 20.0), b"\x1b[<64;1;1M");
+            assert_eq!(ui.encode_wheel_reports(-20.0, 20.0), b"\x1b[<65;1;1M");
+
+            // A later snapshot must also clear disabled modes and partial motion.
+            assert!(ui.encode_wheel_reports(10.0, 20.0).is_empty());
+            daemon.process_bytes(format!("\x1b[?{mode};1006l").as_bytes());
+            ui.apply_snapshot(&daemon.snapshot(100));
+            assert!(!ui.mouse_reporting_active());
+            ui.process_bytes(b"\x1b[?1000h");
+            assert!(ui.encode_wheel_reports(10.0, 20.0).is_empty());
+            assert_eq!(ui.encode_wheel_reports(10.0, 20.0), b"\x1b[M`!!");
+        }
+    }
+
+    #[test]
     fn apply_snapshot_replaces_grid_and_cursor() {
         use unshit_terminal_core::Terminal as CoreTerminal;
 
@@ -5943,6 +5969,51 @@ mod tests {
     }
 
     #[test]
+    fn top_anchored_history_region_retains_scrollback() {
+        let mut t = Terminal::new(5, 8);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nINPUT\r\nSTATUS");
+        // Codex inserts history above its pinned composer using DECSTBM + LF.
+        t.process_bytes(b"\x1b[1;3r\x1b[3;1H\r\nDD\r\nEE\x1b[r");
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(row_text(&t, 0), "CC");
+        assert_eq!(row_text(&t, 1), "DD");
+        assert_eq!(row_text(&t, 2), "EE");
+        assert_eq!(row_text(&t, 3), "INPUT");
+        assert_eq!(row_text(&t, 4), "STATUS");
+        let mut daemon = unshit_terminal_core::Terminal::new(5, 8, 100);
+        daemon.process_bytes(b"AA\r\nBB\r\nCC\r\nINPUT\r\nSTATUS");
+        daemon.process_bytes(b"\x1b[1;3r\x1b[3;1H\r\nDD\r\nEE\x1b[r");
+        let snapshot = daemon.snapshot(100);
+        let mut restored = Terminal::new(5, 8);
+        restored.apply_snapshot(&snapshot);
+        assert_eq!(restored.scrollback_len(), 2);
+        restored.scroll_view_up(2);
+        t.scroll_view_up(2);
+        assert_eq!(t.selection_text((0, 0), (1, 7)), "AA\nBB");
+        assert_eq!(restored.selection_text((0, 0), (1, 7)), "AA\nBB");
+        let history: Vec<String> = snapshot
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(history, vec!["AA", "BB"]);
+    }
+
+    #[test]
+    fn alternate_screen_scrolls_do_not_enter_history() {
+        let mut t = Terminal::new(5, 8);
+        t.process_bytes(b"\x1b[?1049hAA\r\nBB\r\nCC\r\nDD\r\nEE\r\nFF");
+        t.process_bytes(b"\x1b[1;3r\x1b[3;1H\r\nGG");
+        assert_eq!(t.scrollback_len(), 0);
+    }
+
+    #[test]
     fn decstbm_lf_at_region_bottom_scrolls_region_only() {
         // Issue Claude Code symptom: input prompt pinned below the region.
         let mut t = Terminal::new(5, 4);
@@ -6032,9 +6103,8 @@ mod tests {
 
     #[test]
     fn decstbm_region_does_not_pollute_scrollback() {
-        // TUIs use scroll regions to redraw status lines; that scrolling
-        // must NOT leak into scrollback (which would let the user scroll
-        // up and see partial frames).
+        // Interior regions do not reach the screen's top, so their
+        // redraws must not leak partial frames into scrollback.
         let mut t = Terminal::new(4, 4);
         t.process_bytes(b"AA\r\nBB\r\nCC\r\nDD");
         let scrollback_before = t.scrollback_len();
@@ -6045,7 +6115,7 @@ mod tests {
         assert_eq!(
             t.scrollback_len(),
             scrollback_before,
-            "narrowed-region scrolls must not push to scrollback",
+            "interior-region scrolls must not push to scrollback",
         );
     }
 }

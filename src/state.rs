@@ -1002,6 +1002,9 @@ pub struct AppState {
     pub next_id: u32,
     pub pty_manager: crate::pty::DaemonPty,
     pub terminals: std::collections::HashMap<u32, SharedTerminal>,
+    /// Mounted terminal-grid nodes, addressed by PTY output events so a
+    /// changed pane can repaint without rebuilding unrelated UI chrome.
+    pub terminal_grid_refs: std::collections::HashMap<u32, unshit::core::id::NodeRef>,
     /// Editor panes keyed by pane id, mirroring `terminals`. A pane id
     /// present here is a file-editor pane and must never enter PTY
     /// spawn/resize/write paths.
@@ -1161,6 +1164,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn terminal_grid_ref(&mut self, pane_id: u32) -> unshit::core::id::NodeRef {
+        self.terminal_grid_refs.entry(pane_id).or_default().clone()
+    }
+
+    pub fn mounted_terminal_grid_ref(&self, pane_id: u32) -> Option<unshit::core::id::NodeRef> {
+        self.terminal_grid_refs
+            .get(&pane_id)
+            .filter(|node| node.get().is_some())
+            .cloned()
+    }
+
     pub fn record_diagnostic_scroll_sample(&mut self, telemetry: &unshit::app::ScrollTelemetry) {
         if matches!(telemetry.phase, unshit::app::ScrollTelemetryPhase::Started) {
             self.diagnostic_scroll_samples.clear();
@@ -1175,87 +1189,105 @@ impl AppState {
     /// Clone everything except the non-Clone PTY manager and terminals.
     /// UI builders call this to get a snapshot for rendering.
     pub fn ui_snapshot(&self) -> UiSnapshot {
+        self.ui_snapshot_with_workspace_entries(true)
+    }
+
+    /// Snapshot tailored to the current root route.
+    ///
+    /// Settings and diff review replace the workspace chrome, so their tree
+    /// builders never consume the sidebar's derived terminal and agent entry
+    /// lists. Skipping that projection keeps opening those routes independent
+    /// of the number of panes across saved workspaces. The raw workspace,
+    /// tab, and pane data remain available for overlays such as the command
+    /// palette and close dialog.
+    pub fn ui_snapshot_for_render(&self) -> UiSnapshot {
+        self.ui_snapshot_with_workspace_entries(!self.settings_open && self.diff_review.is_none())
+    }
+
+    fn ui_snapshot_with_workspace_entries(&self, include_workspace_entries: bool) -> UiSnapshot {
         let mut workspaces = self.workspaces.clone();
-        let active_idx = self.active_workspace;
-        for (idx, ws) in workspaces.iter_mut().enumerate() {
-            // Pending must not render as an error: on a cold start every
-            // workspace is Pending for a few hundred milliseconds, and
-            // flashing "no git" in red at each one would be a lie the user
-            // sees on every single launch.
-            let (branch_text, branch_muted, branch_error) = match &ws.git_branch {
-                GitBranch::Known(b) => (b.clone(), false, false),
-                GitBranch::Absent => ("no git".to_string(), false, true),
-                GitBranch::Pending => ("...".to_string(), true, false),
-            };
-            let entry_from = |p: &Pane| TerminalEntry {
-                name: p.title.clone(),
-                branch: branch_text.clone(),
-                branch_muted,
-                branch_error,
-                pane_id: p.id,
-                agent: agent_tag_for_pane(self, p.id.0),
-                usage: (p.pid != 0 && self.sidebar_width >= SIDEBAR_USAGE_MIN_WIDTH)
-                    .then(|| self.resource_trees.get(&p.pid).cloned())
-                    .flatten(),
-            };
-            let entries: Vec<TerminalEntry> = if idx == active_idx {
-                // Active workspace: live panes for the active tab, saved
-                // panes for every other tab. Every pane across every tab
-                // shows up as its own entry.
-                self.tabs
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(t_idx, tab)| {
-                        if t_idx == self.active_tab {
-                            self.panes
-                                .iter()
-                                .flatten()
-                                .map(&entry_from)
-                                .collect::<Vec<_>>()
-                        } else {
-                            tab.panes
-                                .iter()
-                                .flatten()
-                                .map(&entry_from)
-                                .collect::<Vec<_>>()
+        if include_workspace_entries {
+            let active_idx = self.active_workspace;
+            for (idx, ws) in workspaces.iter_mut().enumerate() {
+                // Pending must not render as an error: on a cold start every
+                // workspace is Pending for a few hundred milliseconds, and
+                // flashing "no git" in red at each one would be a lie the user
+                // sees on every single launch.
+                let (branch_text, branch_muted, branch_error) = match &ws.git_branch {
+                    GitBranch::Known(b) => (b.clone(), false, false),
+                    GitBranch::Absent => ("no git".to_string(), false, true),
+                    GitBranch::Pending => ("...".to_string(), true, false),
+                };
+                let entry_from = |p: &Pane| TerminalEntry {
+                    name: p.title.clone(),
+                    branch: branch_text.clone(),
+                    branch_muted,
+                    branch_error,
+                    pane_id: p.id,
+                    agent: agent_tag_for_pane(self, p.id.0),
+                    usage: (p.pid != 0 && self.sidebar_width >= SIDEBAR_USAGE_MIN_WIDTH)
+                        .then(|| self.resource_trees.get(&p.pid).cloned())
+                        .flatten(),
+                };
+                let entries: Vec<TerminalEntry> = if idx == active_idx {
+                    // Active workspace: live panes for the active tab, saved
+                    // panes for every other tab. Every pane across every tab
+                    // shows up as its own entry.
+                    self.tabs
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(t_idx, tab)| {
+                            if t_idx == self.active_tab {
+                                self.panes
+                                    .iter()
+                                    .flatten()
+                                    .map(&entry_from)
+                                    .collect::<Vec<_>>()
+                            } else {
+                                tab.panes
+                                    .iter()
+                                    .flatten()
+                                    .map(&entry_from)
+                                    .collect::<Vec<_>>()
+                            }
+                        })
+                        .collect()
+                } else {
+                    // Inactive workspace: everything is in saved state.
+                    ws.tabs
+                        .iter()
+                        .flat_map(|tab| tab.panes.iter().flatten().map(&entry_from))
+                        .collect()
+                };
+                // Split by agent membership: agent panes only ever show under
+                // `agents`, everything else under `terminals`. A subtab is
+                // "active" when it holds the workspace's active pane so the
+                // amber rail follows focus between the two lists.
+                let (agent_entries, terminal_entries): (Vec<TerminalEntry>, Vec<TerminalEntry>) =
+                    entries.into_iter().partition(|e| e.agent.is_some());
+                let active_pane = if idx == active_idx {
+                    Some(self.active_pane)
+                } else {
+                    ws.tabs.get(ws.active_tab).map(|t| t.active_pane)
+                };
+                for sub in &mut ws.subtabs {
+                    match SubtabKind::parse(&sub.label) {
+                        Some(SubtabKind::Terminals) => {
+                            sub.count = Some(terminal_entries.len() as u32);
+                            sub.active = active_pane
+                                .is_some_and(|p| terminal_entries.iter().any(|e| e.pane_id == p));
                         }
-                    })
-                    .collect()
-            } else {
-                // Inactive workspace: everything is in saved state.
-                ws.tabs
-                    .iter()
-                    .flat_map(|tab| tab.panes.iter().flatten().map(&entry_from))
-                    .collect()
-            };
-            // Split by agent membership: agent panes only ever show under
-            // `agents`, everything else under `terminals`. A subtab is
-            // "active" when it holds the workspace's active pane so the
-            // amber rail follows focus between the two lists.
-            let (agent_entries, terminal_entries): (Vec<TerminalEntry>, Vec<TerminalEntry>) =
-                entries.into_iter().partition(|e| e.agent.is_some());
-            let active_pane = if idx == active_idx {
-                Some(self.active_pane)
-            } else {
-                ws.tabs.get(ws.active_tab).map(|t| t.active_pane)
-            };
-            for sub in &mut ws.subtabs {
-                match SubtabKind::parse(&sub.label) {
-                    Some(SubtabKind::Terminals) => {
-                        sub.count = Some(terminal_entries.len() as u32);
-                        sub.active = active_pane
-                            .is_some_and(|p| terminal_entries.iter().any(|e| e.pane_id == p));
+                        Some(SubtabKind::Agents) => {
+                            sub.count = Some(agent_entries.len() as u32);
+                            sub.active = active_pane
+                                .is_some_and(|p| agent_entries.iter().any(|e| e.pane_id == p));
+                        }
+                        None => {}
                     }
-                    Some(SubtabKind::Agents) => {
-                        sub.count = Some(agent_entries.len() as u32);
-                        sub.active = active_pane
-                            .is_some_and(|p| agent_entries.iter().any(|e| e.pane_id == p));
-                    }
-                    None => {}
                 }
+                ws.terminal_entries = terminal_entries;
+                ws.agent_entries = agent_entries;
             }
-            ws.terminal_entries = terminal_entries;
-            ws.agent_entries = agent_entries;
         }
         let agent_pane_ids: BTreeSet<u32> = self
             .pane_agents
@@ -1263,14 +1295,17 @@ impl AppState {
             .chain(self.agent_restarts.keys())
             .copied()
             .collect();
-        let (active_terminal_cols, active_terminal_rows) = self
-            .terminals
-            .get(&self.active_pane.0)
-            .map(|terminal| {
-                let terminal = terminal.lock_recover();
-                (terminal.grid().cols() as u16, terminal.grid().rows() as u16)
-            })
-            .unwrap_or((80, 24));
+        let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
+            self.terminals
+                .get(&self.active_pane.0)
+                .map(|terminal| {
+                    let terminal = terminal.lock_recover();
+                    (terminal.grid().cols() as u16, terminal.grid().rows() as u16)
+                })
+                .unwrap_or((80, 24))
+        } else {
+            (80, 24)
+        };
 
         UiSnapshot {
             workspaces,
@@ -1666,6 +1701,7 @@ pub fn seed_state() -> AppState {
         next_id: 2,
         pty_manager: crate::pty::DaemonPty::new(),
         terminals: std::collections::HashMap::new(),
+        terminal_grid_refs: std::collections::HashMap::new(),
         editors: std::collections::HashMap::new(),
         flows: std::collections::HashMap::new(),
         file_index: None,
@@ -5794,6 +5830,34 @@ static EDITOR_DIALOG_OPEN: std::sync::atomic::AtomicBool =
 
 pub fn register_editor_open_hooks(hooks: EditorOpenHooks) {
     let _ = EDITOR_OPEN_HOOKS.set(std::sync::Arc::new(hooks));
+}
+
+/// Open the workspace-folder chooser outside the active winit event handler.
+///
+/// macOS delivers native dialog events synchronously. Opening an `rfd`
+/// picker from an element click callback would therefore try to re-enter
+/// winit while it is already dispatching the click, which panics. The picker
+/// runs on the same worker-thread path as the editor chooser and posts its
+/// resulting state change back through the normal rebuild hook.
+pub fn spawn_workspace_folder_picker() {
+    let Some(hooks) = EDITOR_OPEN_HOOKS.get().cloned() else {
+        log::warn!("workspace folder dialog requested before UI hooks were installed");
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if let Some(folder) = rfd::FileDialog::new()
+            .set_title("Select workspace folder")
+            .pick_folder()
+        {
+            {
+                let mut guard = hooks.shared.lock_recover();
+                mutate_add_workspace_with_path(&mut guard, Some(folder));
+                crate::persist::save_workspaces(&guard);
+            }
+            (hooks.request_rebuild)();
+        }
+    });
 }
 
 /// Handle `editor.open` (no path): native file picker, routed back
@@ -10946,6 +11010,7 @@ pub(crate) mod tests {
             next_id: 2,
             pty_manager: crate::pty::DaemonPty::new(),
             terminals: std::collections::HashMap::new(),
+            terminal_grid_refs: std::collections::HashMap::new(),
             editors: std::collections::HashMap::new(),
             flows: std::collections::HashMap::new(),
             file_index: None,
@@ -10995,6 +11060,49 @@ pub(crate) mod tests {
             default_shell: crate::shell::ShellSpec::default(),
             quick_prompt: None,
         }
+    }
+
+    #[test]
+    fn render_snapshot_skips_terminal_dimension_lock_when_workspace_is_hidden() {
+        let mut state = test_state();
+        state.terminals.insert(
+            state.active_pane.0,
+            Arc::new(Mutex::new(crate::terminal::Terminal::new(37, 91))),
+        );
+
+        let workspace = state.ui_snapshot_for_render();
+        assert_eq!(
+            (
+                workspace.active_terminal_cols,
+                workspace.active_terminal_rows
+            ),
+            (91, 37)
+        );
+
+        state.settings_open = true;
+        let settings = state.ui_snapshot_for_render();
+        assert_eq!(
+            (settings.active_terminal_cols, settings.active_terminal_rows),
+            (80, 24),
+            "settings does not render terminal dimensions, so it must avoid locking the live grid"
+        );
+    }
+
+    #[test]
+    fn mounted_terminal_grid_ref_ignores_unmounted_routes() {
+        let mut state = test_state();
+        let node = state.terminal_grid_ref(state.active_pane.0);
+        assert!(state
+            .mounted_terminal_grid_ref(state.active_pane.0)
+            .is_none());
+
+        node.set(unshit::core::id::NodeId {
+            index: 7,
+            generation: 3,
+        });
+        assert!(state
+            .mounted_terminal_grid_ref(state.active_pane.0)
+            .is_some());
     }
 
     // -- SettingsSection ------------------------------------------------------

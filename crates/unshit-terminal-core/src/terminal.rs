@@ -133,6 +133,7 @@ pub struct Terminal {
     scroll_bot: usize,
     pending_response: Vec<u8>,
     synchronized_output_active: bool,
+    mouse_modes: crate::snapshot::MouseModes,
 }
 
 impl Terminal {
@@ -160,6 +161,7 @@ impl Terminal {
             scroll_bot: rows,
             pending_response: Vec::new(),
             synchronized_output_active: false,
+            mouse_modes: crate::snapshot::MouseModes::default(),
         }
     }
 
@@ -277,12 +279,13 @@ impl Terminal {
         Snapshot {
             grid: self.grid.clone(),
             scrollback: self.scrollback.tail(scrollback_lines),
+            mouse_modes: self.mouse_modes,
         }
     }
 
     fn scroll_up_and_capture(&mut self) {
         let evicted = self.grid.scroll_up();
-        if !evicted.is_empty() {
+        if self.alt_grid.is_none() && !evicted.is_empty() {
             self.scrollback.push(evicted);
         }
     }
@@ -360,6 +363,14 @@ impl Terminal {
 
         let top = self.scroll_top;
         let bot = self.scroll_bot;
+        // Inline TUIs reserve bottom rows for input while scrolling history
+        // off the main screen's top. Preserve that history for reattachment.
+        if top == 0 && self.alt_grid.is_none() {
+            let line = (0..self.cols)
+                .filter_map(|col| self.grid.get(top, col).copied())
+                .collect();
+            self.scrollback.push(line);
+        }
         for row in top..bot.saturating_sub(1) {
             self.copy_row(row, row + 1);
         }
@@ -517,6 +528,10 @@ impl Perform for Performer<'_> {
                     for code in &pv {
                         match *code {
                             25 => t.grid.set_cursor_visible(on),
+                            1000 => t.mouse_modes.report_1000 = on,
+                            1002 => t.mouse_modes.report_1002 = on,
+                            1003 => t.mouse_modes.report_1003 = on,
+                            1006 => t.mouse_modes.sgr = on,
                             2026 => t.synchronized_output_active = on,
                             47 | 1047 | 1049 if on => t.enter_alt_screen(),
                             47 | 1047 | 1049 => t.exit_alt_screen(),
@@ -1284,6 +1299,41 @@ mod tests {
 
         assert_eq!(row_text(&t, 0), "");
         assert_eq!(row_text(&t, 1), "line1");
+    }
+
+    #[test]
+    fn top_anchored_history_region_retains_scrollback() {
+        let mut t = Terminal::new(5, 8, 100);
+        t.process_bytes(b"AA\r\nBB\r\nCC\r\nINPUT\r\nSTATUS");
+        // Codex inserts history above its pinned composer using DECSTBM + LF.
+        t.process_bytes(b"\x1b[1;3r\x1b[3;1H\r\nDD\r\nEE\x1b[r");
+        assert_eq!(t.scrollback().len(), 2);
+        assert_eq!(row_text(&t, 0), "CC");
+        assert_eq!(row_text(&t, 1), "DD");
+        assert_eq!(row_text(&t, 2), "EE");
+        assert_eq!(row_text(&t, 3), "INPUT");
+        assert_eq!(row_text(&t, 4), "STATUS");
+        let snapshot = t.snapshot(100);
+        let history: Vec<String> = snapshot
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(history, vec!["AA", "BB"]);
+    }
+
+    #[test]
+    fn alternate_screen_scrolls_do_not_enter_history() {
+        let mut t = Terminal::new(5, 8, 100);
+        t.process_bytes(b"\x1b[?1049hAA\r\nBB\r\nCC\r\nDD\r\nEE\r\nFF");
+        t.process_bytes(b"\x1b[1;3r\x1b[3;1H\r\nGG");
+        assert_eq!(t.scrollback().len(), 0);
     }
 
     #[test]

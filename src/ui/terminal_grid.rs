@@ -141,6 +141,18 @@ pub fn build_terminal_grid(
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
+    build_terminal_grid_with_event_sink(state, shared, grids, None)
+}
+
+/// Build terminal panes with an optional UI event sink for paint-only resize
+/// patches. Tests and headless callers can omit it and retain the rebuild
+/// fallback used during initial mount.
+pub fn build_terminal_grid_with_event_sink(
+    state: &UiSnapshot,
+    shared: &SharedState,
+    grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+    event_sink: Option<unshit::app::EventSink>,
+) -> ElementDef {
     if state.panes.is_empty() {
         return build_empty_workspace(shared);
     }
@@ -187,7 +199,7 @@ pub fn build_terminal_grid(
                 && !state.palette_open
                 && state.confirm_dialog.is_none()
                 && state.diff_review.is_none();
-            let pane_el = build_pane(
+            let pane_el = build_pane_with_event_sink(
                 pane,
                 is_active,
                 capture_keyboard,
@@ -195,6 +207,7 @@ pub fn build_terminal_grid(
                 state,
                 shared,
                 grids,
+                event_sink.clone(),
             )
             .with_style(StyleDeclaration::FlexGrow(col_ratio));
             row_el = row_el.with_child(pane_el);
@@ -321,6 +334,7 @@ fn build_row_resizer(row_idx: usize, shared: &SharedState) -> ElementDef {
         })
 }
 
+#[cfg(test)]
 fn build_pane(
     pane: &Pane,
     is_active: bool,
@@ -329,6 +343,28 @@ fn build_pane(
     state: &UiSnapshot,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+) -> ElementDef {
+    build_pane_with_event_sink(
+        pane,
+        is_active,
+        capture_keyboard,
+        single_pane,
+        state,
+        shared,
+        grids,
+        None,
+    )
+}
+
+fn build_pane_with_event_sink(
+    pane: &Pane,
+    is_active: bool,
+    capture_keyboard: bool,
+    single_pane: bool,
+    state: &UiSnapshot,
+    shared: &SharedState,
+    grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+    event_sink: Option<unshit::app::EventSink>,
 ) -> ElementDef {
     // Stable keys on both the pane container and its children keep the
     // reconciler from positionally shuffling DOM nodes when optional
@@ -375,12 +411,13 @@ fn build_pane(
     } else if let Some(flow_pane) = state.flow_panes.get(&pane.id.0) {
         crate::ui::flow_pane::build_flow_pane_body(pane.id, capture_keyboard, flow_pane, shared)
     } else {
-        build_pane_body(
+        build_pane_body_with_event_sink(
             pane.id,
             capture_keyboard,
             state.terminal_font_size_pt,
             shared,
             grids,
+            event_sink,
         )
     }
     .with_key("pane-body");
@@ -564,25 +601,43 @@ fn scrolled_pane_snapshot(
     terminal: &crate::terminal::Terminal,
     pane: u32,
 ) -> unshit::core::cell_grid::CellGrid {
+    let mut grid = terminal_display_snapshot(
+        terminal,
+        st.active_pane.0 == pane,
+        &st.theme,
+        &st.custom_theme,
+        st.terminal_selections.get(&pane).copied(),
+        st.terminal_link_hover.filter(|hover| hover.pane == pane),
+    );
+    grid.mark_all_dirty();
+    grid
+}
+
+/// Clone a terminal grid exactly as its mounted pane presents it. PTY output
+/// uses this to patch the already-mounted grid directly, avoiding a full tree
+/// rebuild for an otherwise local content change.
+pub(crate) fn terminal_display_snapshot(
+    terminal: &crate::terminal::Terminal,
+    is_active: bool,
+    theme_id: &str,
+    custom_theme: &crate::theme::CustomTheme,
+    selection: Option<crate::state::TermSelection>,
+    link_hover: Option<crate::state::TerminalLinkHover>,
+) -> unshit::core::cell_grid::CellGrid {
     let mut grid = terminal.display_grid();
-    if st.active_pane.0 != pane {
+    if !is_active {
         grid.set_cursor_visible(false);
     }
     if !crate::truthy_env_value(std::env::var_os(ENV_PARITY_WINDOWS_TERMINAL_COLORS)) {
-        let palette = crate::theme::terminal_palette_for(&st.theme, &st.custom_theme);
+        let palette = crate::theme::terminal_palette_for(theme_id, custom_theme);
         crate::theme::apply_terminal_palette_to_grid(&mut grid, &palette);
     }
-    if let Some(sel) = st.terminal_selections.get(&pane) {
-        crate::state::apply_selection_highlight(&mut grid, terminal, sel);
+    if let Some(selection) = selection {
+        crate::state::apply_selection_highlight(&mut grid, terminal, &selection);
     }
-    if let Some(hover) = st
-        .terminal_link_hover
-        .as_ref()
-        .filter(|hover| hover.pane == pane)
-    {
-        crate::state::apply_terminal_link_hover(&mut grid, terminal, hover);
+    if let Some(link_hover) = link_hover {
+        crate::state::apply_terminal_link_hover(&mut grid, terminal, &link_hover);
     }
-    grid.mark_all_dirty();
     grid
 }
 
@@ -753,6 +808,7 @@ fn forward_wheel_if_mouse_mode(
     })
 }
 
+#[cfg(test)]
 fn build_pane_body(
     pane_id: PaneId,
     capture_keyboard: bool,
@@ -760,9 +816,22 @@ fn build_pane_body(
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
+    build_pane_body_with_event_sink(pane_id, capture_keyboard, font_size_pt, shared, grids, None)
+}
+
+fn build_pane_body_with_event_sink(
+    pane_id: PaneId,
+    capture_keyboard: bool,
+    font_size_pt: u32,
+    shared: &SharedState,
+    grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
+    event_sink: Option<unshit::app::EventSink>,
+) -> ElementDef {
     let mut body = ElementDef::new(Tag::Div).with_class("pane-body");
 
     if let Some(grid) = grids.get(&pane_id.0) {
+        let grid_ref = mutate_with(shared, |st| st.terminal_grid_ref(pane_id.0));
+        let resize_grid_ref = grid_ref.clone();
         // Real terminal grid rendering.
         let mut grid_el = ElementDef::new(Tag::Div)
             .with_class("terminal-content")
@@ -770,7 +839,8 @@ fn build_pane_body(
             .with_style(StyleDeclaration::LineHeight(terminal_line_height()))
             .with_style(StyleDeclaration::FontScale(1.0))
             .with_grid(grid.clone())
-            .with_persistent_buffer(true);
+            .with_persistent_buffer(true)
+            .with_ref(grid_ref);
         let content_x_offset = terminal_content_x_offset();
         if content_x_offset.abs() > f32::EPSILON {
             grid_el = grid_el.with_style(StyleDeclaration::Transform(Transform {
@@ -852,20 +922,26 @@ fn build_pane_body(
                         // Any other key while scrolled back snaps to live
                         // view (covers whole rows, sub-row fractions, and
                         // in-flight wheel animations).
-                        mutate_with(&kbd_shared, |st| {
+                        let snapped_to_live = mutate_with(&kbd_shared, |st| {
                             if let Some(handle) = st.terminals.get(&kbd_pane_id.0) {
                                 let mut terminal = handle.lock_recover();
                                 if terminal.is_view_scrolled() {
                                     terminal.reset_scroll();
+                                    return true;
                                 }
                             }
+                            false
                         });
 
                         if let Some(bytes) = crate::terminal::keys::encode_key(kb) {
                             let byte_count = bytes.len();
-                            mutate_with(&kbd_shared, |st| {
+                            let selection_cleared = mutate_with(&kbd_shared, |st| {
                                 // Typing dismisses any text selection so the
                                 // highlight does not linger over moving output.
+                                let had_selection = st
+                                    .terminal_selections
+                                    .get(&kbd_pane_id.0)
+                                    .is_some_and(|selection| !selection.is_empty());
                                 crate::state::clear_terminal_selection(st, kbd_pane_id.0);
                                 match st.pty_manager.write(kbd_pane_id.0, &bytes) {
                                     Ok(()) => record_diagnostic_pty_event(
@@ -883,7 +959,13 @@ fn build_pane_body(
                                         ),
                                     ),
                                 }
+                                had_selection
                             });
+                            return if snapped_to_live || selection_cleared {
+                                Some(Box::new(unshit::core::event::RequestRebuild))
+                            } else {
+                                Some(Box::new(unshit::core::event::RequestRedraw))
+                            };
                         } else if crate::terminal::keys::is_os_reserved_chord(
                             kb.key,
                             kb.modifiers,
@@ -945,7 +1027,8 @@ fn build_pane_body(
         // `build_terminal_grid`).
         let resize_shared = shared.clone();
         let resize_pane_id = pane_id;
-        grid_el = grid_el.on_resize(move |w, h| {
+        let resize_sink = event_sink.clone();
+        grid_el = grid_el.on_resize_rebuild(move |w, h| {
             use unshit::core::cell_grid::CellGrid;
 
             // A non-positive rect is never a real pane geometry -- it means
@@ -956,10 +1039,10 @@ fn build_pane_body(
             // are process-global and stay valid across frames, so they are
             // non-zero long before an individual pane has been laid out.
             if w <= 0.0 || h <= 0.0 {
-                return;
+                return false;
             }
 
-            mutate_with(&resize_shared, |st| {
+            let grid_patch = mutate_with(&resize_shared, |st| {
                 // Use the renderer's published cell metrics when available.
                 // On the first frame, metrics may be 0 because on_resize
                 // fires before the render pass. The on_cell_metrics callback
@@ -973,7 +1056,9 @@ fn build_pane_body(
                         let mut terminal = handle.lock().expect("terminal mutex poisoned");
                         let changed = terminal.grid().rows() != rows as usize
                             || terminal.grid().cols() != cols as usize;
-                        terminal.resize_viewport_growth(rows as usize, cols as usize);
+                        if changed {
+                            terminal.resize_viewport_growth(rows as usize, cols as usize);
+                        }
                         changed
                     } else {
                         false
@@ -986,10 +1071,50 @@ fn build_pane_body(
                     // change keeps a selection the user is still holding.
                     if dims_changed {
                         crate::state::clear_terminal_selection(st, resize_pane_id.0);
+                        // The PTY has the same cell geometry as the local
+                        // terminal until this boundary changes. Avoid
+                        // sending a control-plane resize for sub-cell layout
+                        // movement during a live drag.
+                        st.pty_manager.resize(resize_pane_id.0, cols, rows);
+                        let theme = st.theme.clone();
+                        let custom_theme = st.custom_theme;
+                        let selection = st.terminal_selections.get(&resize_pane_id.0).copied();
+                        let link_hover = st
+                            .terminal_link_hover
+                            .filter(|hover| hover.pane == resize_pane_id.0);
+                        let active = st.active_pane == resize_pane_id;
+                        let grid = st.terminals.get(&resize_pane_id.0).map(|handle| {
+                            let terminal = handle.lock().expect("terminal mutex poisoned");
+                            terminal_display_snapshot(
+                                &terminal,
+                                active,
+                                &theme,
+                                &custom_theme,
+                                selection,
+                                link_hover,
+                            )
+                        });
+                        return grid;
                     }
-                    st.pty_manager.resize(resize_pane_id.0, cols, rows);
+                    None
+                } else {
+                    None
                 }
             });
+            if let Some(grid) = grid_patch {
+                if let Some(sink) = &resize_sink {
+                    if resize_grid_ref.get().is_some() {
+                        let _ =
+                            sink.send_grid_resize_patch(resize_grid_ref.clone(), Box::new(grid));
+                        return false;
+                    }
+                }
+                // Initial mount, a stale node ref, and test/headless builds
+                // have no safe mounted target to patch. Preserve the legacy
+                // rebuild fallback for those cases.
+                return true;
+            }
+            false
         });
 
         // Mouse wheel scrolls the scrollback buffer.
@@ -1863,7 +1988,7 @@ mod tests {
         grids.insert(1, CellGrid::new(24, 80));
         let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
-        assert!(grid_el.on_resize.is_some());
+        assert!(grid_el.on_resize_rebuild.is_some());
     }
 
     #[test]
@@ -1892,7 +2017,7 @@ mod tests {
             "inactive pane must still scroll: the wheel follows the pointer"
         );
         assert!(
-            grid_el.on_resize.is_some(),
+            grid_el.on_resize_rebuild.is_some(),
             "inactive pane must still track its own geometry"
         );
     }
@@ -1930,7 +2055,7 @@ mod tests {
         grids.insert(1, CellGrid::new(24, 80));
         let el = build_pane_body(PaneId(1), true, 13, &shared, &grids);
         let grid_el = &el.children[0];
-        let resize_fn = grid_el.on_resize.as_ref().unwrap();
+        let resize_fn = grid_el.on_resize_rebuild.as_ref().unwrap();
         // Invoke with a 640x384 area (should yield 80 cols, 24 rows)
         (resize_fn)(640.0, 384.0);
         // The resize handler should not panic and should work
@@ -2122,7 +2247,7 @@ mod tests {
         );
     }
 
-    /// Active pane must register an on_resize handler so the PTY dimensions
+    /// Active pane must register a conditional resize handler so the PTY dimensions
     /// stay in sync with the visible grid area.
     #[test]
     fn active_pane_registers_resize_handler_base() {
@@ -2135,7 +2260,7 @@ mod tests {
         let body = build_pane_body(pane_id, true, 13, &shared, &grids);
         let content = find_terminal_content(&body).expect("terminal-content element should exist");
         assert!(
-            content.on_resize.is_some(),
+            content.on_resize_rebuild.is_some(),
             "active pane terminal-content must have a resize handler"
         );
     }
@@ -2178,14 +2303,17 @@ mod tests {
         let content =
             find_terminal_content(&body).expect("terminal-content must exist when grid present");
         let on_resize = content
-            .on_resize
+            .on_resize_rebuild
             .as_ref()
             .cloned()
-            .expect("active pane terminal-content must register on_resize");
+            .expect("active pane terminal-content must register a conditional resize handler");
 
         // Simulate a Win+Left snap: pane height grows from 576 px (24
         // rows × 24 px) to 1200 px (50 rows × 24 px). Width unchanged.
-        on_resize(800.0, 1200.0);
+        assert!(
+            on_resize(800.0, 1200.0),
+            "a row/column boundary change must request one follow-up tree snapshot"
+        );
 
         let guard = shared.lock().unwrap();
         let term = guard
@@ -2227,7 +2355,7 @@ mod tests {
         grids.insert(pane_id.0, CellGrid::new(24, 80));
         let initial = build_pane_body(pane_id, true, 13, &shared, &grids);
         let resize = find_terminal_content(&initial)
-            .and_then(|content| content.on_resize.as_ref())
+            .and_then(|content| content.on_resize_rebuild.as_ref())
             .cloned()
             .expect("active terminal must have a resize handler");
 
@@ -2308,10 +2436,10 @@ mod tests {
         let content =
             find_terminal_content(&body).expect("terminal-content must exist when grid present");
         let on_resize = content
-            .on_resize
+            .on_resize_rebuild
             .as_ref()
             .cloned()
-            .expect("every visible pane must register on_resize, not just the focused one");
+            .expect("every visible pane must register a conditional resize handler");
 
         // 1200x800 px of content at 10x20 px cells == 120 cols x 40 rows.
         on_resize(1200.0, 800.0);
@@ -2363,14 +2491,14 @@ mod tests {
         let content =
             find_terminal_content(&body).expect("terminal-content must exist when grid present");
         let on_resize = content
-            .on_resize
+            .on_resize_rebuild
             .as_ref()
             .cloned()
-            .expect("active pane terminal-content must register on_resize");
+            .expect("active pane terminal-content must register a conditional resize handler");
 
-        on_resize(0.0, 800.0);
-        on_resize(1200.0, 0.0);
-        on_resize(-1.0, -1.0);
+        assert!(!on_resize(0.0, 800.0));
+        assert!(!on_resize(1200.0, 0.0));
+        assert!(!on_resize(-1.0, -1.0));
 
         let guard = shared.lock().unwrap();
         {
@@ -2823,8 +2951,8 @@ mod tests_mouse_selection_copy_paste {
             "active pane must register Scroll handler"
         );
         assert!(
-            grid_active.on_resize.is_some(),
-            "active pane must register on_resize handler"
+            grid_active.on_resize_rebuild.is_some(),
+            "active pane must register a conditional resize handler"
         );
 
         let el_inactive = build_pane_body(PaneId(1), false, 13, &shared, &grids);
@@ -2844,8 +2972,8 @@ mod tests_mouse_selection_copy_paste {
             "inactive pane must register Scroll handler"
         );
         assert!(
-            grid_inactive.on_resize.is_some(),
-            "inactive pane must register on_resize handler: geometry is not input"
+            grid_inactive.on_resize_rebuild.is_some(),
+            "inactive pane must register a conditional resize handler: geometry is not input"
         );
     }
 
@@ -2909,6 +3037,36 @@ mod tests_mouse_selection_copy_paste {
             y: 0.0,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn wheel_reveals_inline_tui_history_live_and_after_reattach() {
+        for reattach in [false, true] {
+            let shared = make_shared();
+            let bytes = b"AA\r\nBB\r\nCC\r\nINPUT\r\nSTATUS\x1b[1;3r\x1b[3;1H\r\nDD\r\nEE\x1b[r";
+            let mut term = crate::terminal::Terminal::new(5, 8);
+            if reattach {
+                let mut daemon = unshit_terminal_core::Terminal::new(5, 8, 100);
+                daemon.process_bytes(bytes);
+                term.apply_snapshot(&daemon.snapshot(100));
+            } else {
+                term.process_bytes(bytes);
+            }
+            shared
+                .lock()
+                .unwrap()
+                .terminals
+                .insert(1, Arc::new(Mutex::new(term)));
+            let handler = scroll_handler_for_pane(&shared, 1);
+            let cell_h = CellGrid::global_cell_h().max(1.0);
+            let patch = handler(&wheel_event(cell_h * 2.0))
+                .unwrap()
+                .downcast::<unshit::app::app::ScrollGridPatch>()
+                .unwrap();
+            let grid = patch.grid.expect("history scroll must repaint");
+            assert_eq!(grid.get_cell(1, 0).map(|cell| cell.ch), Some('A'));
+            assert_eq!(grid.get_cell(2, 0).map(|cell| cell.ch), Some('B'));
+        }
     }
 
     #[test]

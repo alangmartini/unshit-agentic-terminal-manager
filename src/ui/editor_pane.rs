@@ -618,20 +618,26 @@ pub fn build_editor_pane_body(
     // cell capacity of the element. No PTY is involved for editors.
     let resize_shared = shared.clone();
     let resize_pane = pane_id;
-    grid_el = grid_el.on_resize(move |w, h| {
+    grid_el = grid_el.on_resize_rebuild(move |w, h| {
         use unshit::core::cell_grid::CellGrid;
         let cell_w = CellGrid::global_cell_w();
         let cell_h = CellGrid::global_cell_h();
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return;
+        if w <= 0.0 || h <= 0.0 || cell_w <= 0.0 || cell_h <= 0.0 {
+            return false;
         }
         let cols = (w / cell_w).max(1.0) as usize;
         let rows = (h / cell_h).max(1.0) as usize;
         mutate_with(&resize_shared, |st| {
             if let Some(editor) = st.editors.get_mut(&resize_pane.0) {
-                editor.resize(rows, cols);
+                let dims_changed = editor.grid.rows() != rows || editor.grid.cols() != cols;
+                if dims_changed {
+                    editor.resize(rows, cols);
+                }
+                dims_changed
+            } else {
+                false
             }
-        });
+        })
     });
 
     body = body.with_child(grid_el);

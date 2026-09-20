@@ -82,6 +82,12 @@ pub(crate) enum ReconcileOutcome {
 
 struct Inner {
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
+    /// Latest requested geometry per pane waiting to be delivered to the
+    /// daemon. A window or splitter drag can produce a new cell geometry
+    /// every frame, while the worker must await each IPC round trip; keeping
+    /// every intermediate geometry would let stale resize RPCs starve useful
+    /// work such as writes.
+    pending_resizes: Arc<Mutex<PendingResizes>>,
     sessions: HashMap<u32, u64>,
     /// Reconciliation cache populated on `connect_to` from the
     /// daemon's current session list. Entries are consumed by
@@ -97,6 +103,88 @@ struct Inner {
     /// by [`DaemonPty::take_write_errors`]; the bridge polls it and
     /// surfaces failures as toasts. Phase 2 of #135.
     write_error_rx: std_mpsc::Receiver<WriteError>,
+}
+
+/// A resize is latest-wins for a pane: the only geometry that matters after a
+/// drag settles is the final one. `flush_queued` bounds the command channel to
+/// one queued flush plus at most one in-flight batch.
+#[derive(Default)]
+struct PendingResizes {
+    by_pane: HashMap<u32, ResizeRequest>,
+    flush_queued: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResizeRequest {
+    session_id: u64,
+    pane_id: u32,
+    cols: u16,
+    rows: u16,
+}
+
+fn enqueue_latest_resize(inner: &Inner, request: ResizeRequest) {
+    let should_queue_flush = {
+        let mut pending = inner
+            .pending_resizes
+            .lock()
+            .expect("pending resize mutex poisoned");
+        pending.by_pane.insert(request.pane_id, request);
+        if pending.flush_queued {
+            false
+        } else {
+            pending.flush_queued = true;
+            true
+        }
+    };
+
+    if should_queue_flush
+        && inner
+            .cmd_tx
+            .send(Command::FlushResizes {
+                // The command carries the only worker-side sender clone.
+                // Keeping it on the worker itself would keep the channel
+                // alive forever and make DaemonPty::drop hang on join.
+                rescheduler: inner.cmd_tx.clone(),
+            })
+            .is_err()
+    {
+        let mut pending = inner
+            .pending_resizes
+            .lock()
+            .expect("pending resize mutex poisoned");
+        pending.flush_queued = false;
+    }
+}
+
+fn discard_pending_resize(inner: &Inner, pane_id: u32) {
+    inner
+        .pending_resizes
+        .lock()
+        .expect("pending resize mutex poisoned")
+        .by_pane
+        .remove(&pane_id);
+}
+
+fn discard_pending_resizes_for_session(inner: &Inner, session_id: u64) {
+    inner
+        .pending_resizes
+        .lock()
+        .expect("pending resize mutex poisoned")
+        .by_pane
+        .retain(|_pane_id, request| request.session_id != session_id);
+}
+
+/// Update a pane's daemon-session mapping without allowing a queued resize
+/// for its former session to survive the remap. A same-session reattach keeps
+/// the pending geometry intact so `push_recorded_size` can still replay it.
+fn replace_pane_session(inner: &mut Inner, pane_id: u32, session_id: u64) {
+    if inner
+        .sessions
+        .insert(pane_id, session_id)
+        .is_some_and(|previous| previous != session_id)
+    {
+        discard_pending_resize(inner, pane_id);
+    }
 }
 
 /// Clone of the worker's command channel that only lists sessions. See
@@ -198,13 +286,12 @@ enum Command {
         pane_id: u32,
         bytes: Vec<u8>,
     },
-    Resize {
-        session_id: u64,
-        /// Carried purely so a failed resize is attributable to a pane in
-        /// telemetry; the daemon addresses sessions by `session_id`.
-        pane_id: u32,
-        cols: u16,
-        rows: u16,
+    /// Wake the worker to deliver the newest pending resize for each pane.
+    /// The sender is deliberately carried by the command rather than stored
+    /// by `worker_main`: it permits one follow-up flush without keeping the
+    /// command channel alive after `DaemonPty` drops its sender.
+    FlushResizes {
+        rescheduler: tokio_mpsc::UnboundedSender<Command>,
     },
     Kill {
         session_id: u64,
@@ -268,12 +355,20 @@ impl DaemonPty {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
         let (write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
+        let pending_resizes = Arc::new(Mutex::new(PendingResizes::default()));
+        let pending_resizes_for_worker = Arc::clone(&pending_resizes);
         let socket_path = socket_path.to_path_buf();
 
         let worker = thread::Builder::new()
             .name("daemon-pty-worker".into())
             .spawn(move || {
-                worker_main(socket_path, cmd_rx, ready_tx, write_error_tx);
+                worker_main(
+                    socket_path,
+                    cmd_rx,
+                    ready_tx,
+                    write_error_tx,
+                    pending_resizes_for_worker,
+                );
             })
             .map_err(io::Error::other)?;
 
@@ -281,6 +376,7 @@ impl DaemonPty {
             Ok(Ok(())) => {
                 self.inner = Some(Inner {
                     cmd_tx,
+                    pending_resizes,
                     sessions: HashMap::new(),
                     reattach_cache: HashMap::new(),
                     ambiguous_reattach_keys: HashSet::new(),
@@ -389,7 +485,7 @@ impl DaemonPty {
         };
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
         let spawned = reply_rx.recv().map_err(|_| worker_gone())??;
-        inner.sessions.insert(pane_id, spawned.session_id);
+        replace_pane_session(inner, pane_id, spawned.session_id);
         let session_id = spawned.session_id;
         self.hook_capabilities
             .insert(pane_id, spawned.hook_capability);
@@ -430,7 +526,7 @@ impl DaemonPty {
         };
         inner.cmd_tx.send(cmd).map_err(|_| worker_gone())?;
         let attached = reply_rx.recv().map_err(|_| worker_gone())??;
-        inner.sessions.insert(pane_id, session_id);
+        replace_pane_session(inner, pane_id, session_id);
         self.hook_capabilities
             .insert(pane_id, attached.hook_capability);
         // `Request::AttachSession` carries no dimensions, so the session
@@ -527,7 +623,7 @@ impl DaemonPty {
             })
             .map_err(|_| worker_gone())?;
         let ensured = reply_rx.recv().map_err(|_| worker_gone())??;
-        inner.sessions.insert(pane_id, ensured.session_id);
+        replace_pane_session(inner, pane_id, ensured.session_id);
         let ensured_session_id = ensured.session_id;
         self.hook_capabilities
             .insert(pane_id, ensured.hook_capability);
@@ -684,13 +780,16 @@ impl DaemonPty {
             }
             return;
         };
-        let _ = inner.cmd_tx.send(Command::Resize {
-            session_id,
-            pane_id,
-            cols,
-            rows,
-        });
         if changed {
+            enqueue_latest_resize(
+                inner,
+                ResizeRequest {
+                    session_id,
+                    pane_id,
+                    cols,
+                    rows,
+                },
+            );
             crate::renderer_telemetry::record_pty_resize(
                 pane_id,
                 Some(session_id),
@@ -726,12 +825,15 @@ impl DaemonPty {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let _ = inner.cmd_tx.send(Command::Resize {
-            session_id,
-            pane_id,
-            cols,
-            rows,
-        });
+        enqueue_latest_resize(
+            inner,
+            ResizeRequest {
+                session_id,
+                pane_id,
+                cols,
+                rows,
+            },
+        );
         crate::renderer_telemetry::record_pty_resize(
             pane_id,
             Some(session_id),
@@ -752,6 +854,7 @@ impl DaemonPty {
             log::warn!("DaemonPty::destroy called before connect");
             return;
         };
+        discard_pending_resize(inner, pane_id);
         if let Some(session_id) = inner.sessions.remove(&pane_id) {
             let _ = inner.cmd_tx.send(Command::Kill { session_id });
         }
@@ -771,6 +874,7 @@ impl DaemonPty {
             .filter_map(|(pane_id, sid)| (*sid == session_id).then_some(*pane_id))
             .collect::<Vec<_>>();
         inner.sessions.retain(|_pane, sid| *sid != session_id);
+        discard_pending_resizes_for_session(inner, session_id);
         for pane_id in removed_panes {
             self.hook_capabilities.remove(&pane_id);
             self.reconcile_outcomes.remove(&pane_id);
@@ -804,6 +908,7 @@ impl DaemonPty {
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
         {
             inner.sessions.retain(|_pane, sid| *sid != session_id);
+            discard_pending_resizes_for_session(inner, session_id);
             let removed_panes = self
                 .hook_capabilities
                 .keys()
@@ -839,6 +944,12 @@ impl DaemonPty {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        inner
+            .pending_resizes
+            .lock()
+            .expect("pending resize mutex poisoned")
+            .by_pane
+            .clear();
         let ids: Vec<u64> = inner.sessions.drain().map(|(_pane, sid)| sid).collect();
         for session_id in ids {
             let _ = inner.cmd_tx.send(Command::Kill { session_id });
@@ -940,6 +1051,7 @@ impl DaemonPty {
         let (_write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
         self.inner = Some(Inner {
             cmd_tx,
+            pending_resizes: Arc::new(Mutex::new(PendingResizes::default())),
             sessions,
             reattach_cache: HashMap::new(),
             ambiguous_reattach_keys: HashSet::new(),
@@ -973,6 +1085,7 @@ impl DaemonPty {
         let (write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
         self.inner = Some(Inner {
             cmd_tx,
+            pending_resizes: Arc::new(Mutex::new(PendingResizes::default())),
             sessions,
             reattach_cache: HashMap::new(),
             ambiguous_reattach_keys: HashSet::new(),
@@ -1111,11 +1224,47 @@ impl OutputRoutes {
 
 type SessionSinks = Arc<Mutex<OutputRoutes>>;
 
+async fn deliver_resize(client: &mut Client, request: ResizeRequest) {
+    let ResizeRequest {
+        session_id,
+        pane_id,
+        cols,
+        rows,
+    } = request;
+
+    // A silently discarded resize leaves the daemon's PTY at a geometry the
+    // UI has already stopped rendering, which is invisible until an
+    // application draws off the bottom of the local grid. Name the failure.
+    let failure: Option<String> = match client.resize(session_id, cols, rows).await {
+        Ok(Response::Ack { .. }) => None,
+        Ok(Response::Error { code, .. }) => Some(code),
+        Ok(_) => Some("unexpected_response".to_string()),
+        Err(ProtocolError::Io(error)) => Some(format!("{:?}", error.kind())),
+        Err(_) => Some("protocol_error".to_string()),
+    };
+    if let Some(kind) = failure {
+        log::warn!(
+            "{{\"event\":\"pty.resize\",\"level\":\"warn\",\"outcome\":\"rpc_failed\",\
+             \"pane_id\":{pane_id},\"session_id\":{session_id},\
+             \"cols\":{cols},\"rows\":{rows},\"error_kind\":{kind:?}}}"
+        );
+        crate::renderer_telemetry::record_pty_resize(
+            pane_id,
+            Some(session_id),
+            cols,
+            rows,
+            crate::renderer_telemetry::PtyResizeOutcome::RpcFailed,
+            Some(kind),
+        );
+    }
+}
+
 fn worker_main(
     socket_path: PathBuf,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
     ready: std_mpsc::SyncSender<io::Result<()>>,
     write_error_tx: std_mpsc::Sender<WriteError>,
+    pending_resizes: Arc<Mutex<PendingResizes>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1363,37 +1512,46 @@ fn worker_main(
                         let _ = write_error_tx.send(WriteError { pane_id, error: e });
                     }
                 }
-                Command::Resize {
-                    session_id,
-                    pane_id,
-                    cols,
-                    rows,
-                } => {
-                    // A silently discarded resize leaves the daemon's PTY
-                    // at a geometry the UI has already stopped rendering,
-                    // which is invisible until an application draws off
-                    // the bottom of the local grid. Name the failure.
-                    let failure: Option<String> = match client.resize(session_id, cols, rows).await {
-                        Ok(Response::Ack { .. }) => None,
-                        Ok(Response::Error { code, .. }) => Some(code),
-                        Ok(_) => Some("unexpected_response".to_string()),
-                        Err(ProtocolError::Io(e)) => Some(format!("{:?}", e.kind())),
-                        Err(_) => Some("protocol_error".to_string()),
+                Command::FlushResizes { rescheduler } => {
+                    // Leave `flush_queued` set while the RPC batch runs. A
+                    // resize arriving in that window simply overwrites its
+                    // pane's entry; after the batch, one follow-up command
+                    // carries the newest values. This bounds stale work to
+                    // the in-flight batch rather than the length of a drag.
+                    let batch = {
+                        let mut pending = pending_resizes
+                            .lock()
+                            .expect("pending resize mutex poisoned");
+                        std::mem::take(&mut pending.by_pane)
+                            .into_values()
+                            .collect::<Vec<_>>()
                     };
-                    if let Some(kind) = failure {
-                        log::warn!(
-                            "{{\"event\":\"pty.resize\",\"level\":\"warn\",\"outcome\":\"rpc_failed\",\
-                             \"pane_id\":{pane_id},\"session_id\":{session_id},\
-                             \"cols\":{cols},\"rows\":{rows},\"error_kind\":{kind:?}}}"
-                        );
-                        crate::renderer_telemetry::record_pty_resize(
-                            pane_id,
-                            Some(session_id),
-                            cols,
-                            rows,
-                            crate::renderer_telemetry::PtyResizeOutcome::RpcFailed,
-                            Some(kind),
-                        );
+                    for request in batch {
+                        deliver_resize(&mut client, request).await;
+                    }
+
+                    let needs_follow_up = {
+                        let mut pending = pending_resizes
+                            .lock()
+                            .expect("pending resize mutex poisoned");
+                        if pending.by_pane.is_empty() {
+                            pending.flush_queued = false;
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if needs_follow_up
+                        && rescheduler
+                            .send(Command::FlushResizes {
+                                rescheduler: rescheduler.clone(),
+                            })
+                            .is_err()
+                    {
+                        pending_resizes
+                            .lock()
+                            .expect("pending resize mutex poisoned")
+                            .flush_queued = false;
                     }
                 }
                 Command::Kill { session_id } => {
@@ -1788,6 +1946,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resize_burst_eventually_applies_the_final_geometry() {
+        std::env::set_var("SHELL", TEST_SHELL);
+        let path = unique_socket_path();
+        let daemon = start_daemon(&path).await;
+
+        let shim_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut shim = DaemonPty::new();
+            connect_with_retry(&mut shim, &shim_path);
+            let pane_id = 32u32;
+            let _reader = shim
+                .spawn_in(pane_id, 1, 80, 24, None, None)
+                .expect("spawn_in");
+
+            // A fast drag can cross several terminal cell boundaries before
+            // the worker finishes a single daemon round trip. The latest
+            // request is the only geometry that must survive the burst.
+            shim.resize(pane_id, 90, 26);
+            shim.resize(pane_id, 104, 30);
+            shim.resize(pane_id, 120, 36);
+
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            let mut observed = (0u16, 0u16);
+            while std::time::Instant::now() < deadline {
+                if let Ok(sessions) = shim.list_sessions() {
+                    if let Some(info) = sessions.iter().find(|s| s.pane_id == pane_id) {
+                        observed = (info.cols, info.rows);
+                        if observed == (120, 36) {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                observed,
+                (120, 36),
+                "a resize burst must leave the daemon at the final geometry"
+            );
+            shim.destroy(pane_id);
+        })
+        .await
+        .unwrap();
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_clears_pane_mapping() {
         std::env::set_var("SHELL", TEST_SHELL);
         let path = unique_socket_path();
@@ -2040,6 +2247,7 @@ mod tests {
         let session_id = 91;
         shim.inner = Some(Inner {
             cmd_tx,
+            pending_resizes: Arc::new(Mutex::new(PendingResizes::default())),
             sessions: HashMap::new(),
             reattach_cache: HashMap::from([(key, session_id)]),
             ambiguous_reattach_keys: HashSet::new(),
@@ -2605,6 +2813,60 @@ mod tests {
             per_call < Duration::from_micros(100),
             "fire-and-forget write took {per_call:?} per call (over 100 calls); \
              must be << 100us so it cannot block the render thread"
+        );
+    }
+
+    #[test]
+    fn resize_burst_queues_one_flush_with_latest_geometry_per_pane() {
+        let mut shim = DaemonPty::new();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<Command>();
+        let pending_resizes = Arc::new(Mutex::new(PendingResizes::default()));
+        let (_write_error_tx, write_error_rx) = std_mpsc::channel::<WriteError>();
+        shim.inner = Some(Inner {
+            cmd_tx,
+            pending_resizes: Arc::clone(&pending_resizes),
+            sessions: HashMap::from([(7, 42), (8, 43)]),
+            reattach_cache: HashMap::new(),
+            ambiguous_reattach_keys: HashSet::new(),
+            worker: None,
+            write_error_rx,
+        });
+
+        shim.resize(7, 80, 24);
+        shim.resize(7, 104, 32);
+        shim.resize(8, 60, 20);
+        shim.resize(7, 120, 36);
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(Command::FlushResizes { .. })
+        ));
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a resize burst must not enqueue one command per intermediate size"
+        );
+
+        let pending = pending_resizes
+            .lock()
+            .expect("pending resize mutex poisoned");
+        assert!(pending.flush_queued);
+        assert_eq!(
+            pending.by_pane.get(&7),
+            Some(&ResizeRequest {
+                session_id: 42,
+                pane_id: 7,
+                cols: 120,
+                rows: 36,
+            })
+        );
+        assert_eq!(
+            pending.by_pane.get(&8),
+            Some(&ResizeRequest {
+                session_id: 43,
+                pane_id: 8,
+                cols: 60,
+                rows: 20,
+            })
         );
     }
 

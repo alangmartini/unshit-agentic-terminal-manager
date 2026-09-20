@@ -1520,7 +1520,7 @@ input, select {
   color: var(--azure);
 }
 
-.app.settings .settings-titlebar .brand-term {
+.settings-titlebar .brand-term {
   position: relative;
   left: 6px;
   color: #e4d2a6;
@@ -5044,34 +5044,34 @@ body.dragging-pane {
   grid-row: 1;
 }
 
-.app.settings .settings-titlebar .titlebar-left {
+.settings-titlebar .titlebar-left {
   position: relative;
   top: -1px;
   flex: 1;
   overflow: hidden;
 }
 
-.app.settings .settings-titlebar .tm-traffic {
+.settings-titlebar .tm-traffic {
   padding-right: 4px;
 }
 
-.app.settings .settings-titlebar .tl-dot {
+.settings-titlebar .tl-dot {
   border: none;
 }
 
-.app.settings .settings-titlebar .tl-close {
+.settings-titlebar .tl-close {
   background: #e36363;
 }
 
-.app.settings .settings-titlebar .tl-min {
+.settings-titlebar .tl-min {
   background: #e8b955;
 }
 
-.app.settings .settings-titlebar .tl-zoom {
+.settings-titlebar .tl-zoom {
   background: #8ba85c;
 }
 
-.app.settings .settings-titlebar .brand {
+.settings-titlebar .brand {
   position: relative;
   left: 2px;
   top: -2px;
@@ -5079,7 +5079,7 @@ body.dragging-pane {
   padding-right: 8px;
 }
 
-.app.settings .settings-titlebar .brand-mark {
+.settings-titlebar .brand-mark {
   position: relative;
   top: 3px;
   width: 10px;
@@ -5089,7 +5089,7 @@ body.dragging-pane {
   line-height: 1;
 }
 
-.app.settings .settings-titlebar .brand-name {
+.settings-titlebar .brand-name {
   display: flex;
   flex-direction: row;
   gap: 0;
@@ -5100,12 +5100,12 @@ body.dragging-pane {
   white-space: nowrap;
 }
 
-.app.settings .settings-titlebar .brand-name .dot {
+.settings-titlebar .brand-name .dot {
   position: relative;
   left: 4px;
 }
 
-.app.settings .settings-titlebar .titlebar-right {
+.settings-titlebar .titlebar-right {
   margin-left: auto;
   padding-right: 8px;
 }
@@ -5158,27 +5158,31 @@ body.dragging-pane {
   grid-row: 2;
 }
 
-.app.settings .statusbar {
+.settings-page {
+  flex: 1;
+}
+
+.settings-statusbar {
   grid-column: 1;
   grid-row: 3;
   padding-left: 8px;
 }
 
-.app.settings .settings-statusbar .statusbar-left,
-.app.settings .settings-statusbar .statusbar-right {
+.settings-statusbar .statusbar-left,
+.settings-statusbar .statusbar-right {
   gap: 0;
   height: 100%;
 }
 
-.app.settings .settings-statusbar .sb-cell {
+.settings-statusbar .sb-cell {
   height: 14px;
 }
 
-.app.settings .settings-statusbar .sb-cell.sage {
+.settings-statusbar .sb-cell.sage {
   padding-right: 16px;
 }
 
-.app.settings .settings-statusbar .statusbar-right .sb-cell.amber {
+.settings-statusbar .statusbar-right .sb-cell.amber {
   padding-right: 11px;
   color: #e0a342;
 }

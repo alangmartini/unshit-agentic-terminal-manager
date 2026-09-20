@@ -60,7 +60,7 @@ use crate::ui::settings::build_settings_page;
 use crate::ui::sidebar::{build_ctx_menu_overlay, build_sidebar};
 use crate::ui::statusbar::build_statusbar;
 use crate::ui::tabbar::build_tabbar;
-use crate::ui::terminal_grid::build_terminal_grid;
+use crate::ui::terminal_grid::build_terminal_grid_with_event_sink;
 use crate::ui::titlebar::build_titlebar;
 use crate::ui::toasts::build_toast_overlay;
 
@@ -267,39 +267,8 @@ fn build_tree(
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
     window_events: Option<unshit::app::EventSink>,
 ) -> ElementTree {
-    let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
-        .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
-        .with_style(StyleDeclaration::MinWidth(Dimension::Px(
-            snap.sidebar_width,
-        )));
-
-    let drag_shared = shared.clone();
-    let sidebar_resizer = ElementDef::new(Tag::Div)
-        .with_class("sidebar-resizer")
-        .on_drag(move |ev| match ev.phase {
-            DragPhase::Start => {
-                mutate_with(&drag_shared, |st| {
-                    st.sidebar_drag_start = Some(st.sidebar_width);
-                });
-            }
-            DragPhase::Update => {
-                mutate_with(&drag_shared, |st| {
-                    let start = match st.sidebar_drag_start {
-                        Some(w) => w,
-                        None => return,
-                    };
-                    st.sidebar_width =
-                        (start + ev.total_delta_x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-                });
-            }
-            DragPhase::End => {
-                mutate_with(&drag_shared, |st| {
-                    st.sidebar_drag_start = None;
-                });
-            }
-        });
-
-    let titlebar = with_custom_surface_style(build_titlebar(snap, shared, window_events), snap);
+    let titlebar =
+        with_custom_surface_style(build_titlebar(snap, shared, window_events.clone()), snap);
     // The `.app` root always spans the window. Cursor-anchored overlays
     // (context menus) need that box to know when they would run off screen,
     // and no other element measures it: `last_grid_*` is the terminal
@@ -338,10 +307,39 @@ fn build_tree(
     // alive while avoiding layout and painting of the obscured terminals.
     if snap.settings_open && snap.diff_review.is_none() {
         root = root
-            .with_class("settings")
             .with_child(build_settings_page(snap, shared))
             .with_child(with_custom_surface_style(build_statusbar(snap), snap));
     } else if snap.diff_review.is_none() {
+        let sidebar = with_custom_surface_style(build_sidebar(snap, shared), snap)
+            .with_style(StyleDeclaration::Width(Dimension::Px(snap.sidebar_width)))
+            .with_style(StyleDeclaration::MinWidth(Dimension::Px(
+                snap.sidebar_width,
+            )));
+        let drag_shared = shared.clone();
+        let sidebar_resizer = ElementDef::new(Tag::Div)
+            .with_class("sidebar-resizer")
+            .on_drag(move |ev| match ev.phase {
+                DragPhase::Start => {
+                    mutate_with(&drag_shared, |st| {
+                        st.sidebar_drag_start = Some(st.sidebar_width);
+                    });
+                }
+                DragPhase::Update => {
+                    mutate_with(&drag_shared, |st| {
+                        let start = match st.sidebar_drag_start {
+                            Some(w) => w,
+                            None => return,
+                        };
+                        st.sidebar_width =
+                            (start + ev.total_delta_x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                    });
+                }
+                DragPhase::End => {
+                    mutate_with(&drag_shared, |st| {
+                        st.sidebar_drag_start = None;
+                    });
+                }
+            });
         root = root.with_child(
             ElementDef::new(Tag::Div)
                 .with_class("layout")
@@ -352,7 +350,12 @@ fn build_tree(
                         .with_class("content")
                         .with_class("role-main")
                         .with_child(build_tabbar(snap, shared))
-                        .with_child(build_terminal_grid(snap, shared, grids))
+                        .with_child(build_terminal_grid_with_event_sink(
+                            snap,
+                            shared,
+                            grids,
+                            window_events,
+                        ))
                         .with_child(with_custom_surface_style(build_statusbar(snap), snap)),
                 ),
         );
@@ -383,6 +386,15 @@ fn build_tree(
             .with_child(build_toast_overlay(snap, shared))
             .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
+}
+
+/// Whether this frame's primary content area includes live terminal or editor
+/// grids. Settings and diff review replace that area entirely, so cloning
+/// every pane's grid in those routes only extends the state-lock and build
+/// critical path without contributing pixels.
+#[inline]
+fn terminal_content_visible(snap: &crate::state::UiSnapshot) -> bool {
+    !snap.settings_open && snap.diff_review.is_none()
 }
 
 fn user_shortcut_bindings() -> Vec<(String, String)> {
@@ -1038,10 +1050,6 @@ fn main() {
     // See `pane_restore::attach_background_panes_in_background`, kicked off
     // once the event sink exists.
 
-    if let Some(cfg) = bench_config {
-        crate::bench::start(cfg, shared.clone());
-    }
-
     // Seeded, not persisted: appearance state is session-only today, so
     // this is 100% on every launch. It exists so the framework and the
     // Settings readout start out agreeing on the level.
@@ -1060,6 +1068,7 @@ fn main() {
     let frame_metrics_shared = shared.clone();
     let scroll_metrics_shared = shared.clone();
     let scroll_tuning_shared = shared.clone();
+    let startup_prewarm_shared = shared.clone();
     let window_event_sink: Arc<std::sync::OnceLock<unshit::app::EventSink>> =
         Arc::new(std::sync::OnceLock::new());
     let tree_window_event_sink = window_event_sink.clone();
@@ -1099,6 +1108,21 @@ fn main() {
             show_window_when_painted: true,
             css: STYLES.to_string(),
             fonts: terminal_font_sources(),
+            ui_glyph_prewarm: crate::ui::settings::SETTINGS_GLYPH_PREWARM,
+            startup_prewarm_tree: Some(Arc::new(move || {
+                let guard = startup_prewarm_shared.lock_recover();
+                let mut snap = guard.ui_snapshot_for_render();
+                snap.settings_open = true;
+                snap.settings_section = crate::state::SettingsSection::Appearance;
+                snap.diff_review = None;
+                drop(guard);
+                build_tree(
+                    &snap,
+                    &startup_prewarm_shared,
+                    &std::collections::HashMap::new(),
+                    None,
+                )
+            })),
             user_shortcuts: user_shortcut_bindings(),
             on_command: Some(Arc::new(move |command: &str| -> bool {
                 let mut guard = command_shared.lock_recover();
@@ -1287,21 +1311,43 @@ fn main() {
                 std::collections::HashSet<u32>,
             ) = {
                 let mut guard = tree_shared.lock_recover();
-                let snap = guard.ui_snapshot();
+                let snap = guard.ui_snapshot_for_render();
+                let show_terminal_content = terminal_content_visible(&snap);
                 let active_id = guard.active_pane.0;
-                let handles: Vec<_> = guard
-                    .terminals
-                    .iter()
-                    .map(|(&id, t)| (id, t.clone()))
-                    .collect();
-                let force_terminal_theme_repaint =
-                    crate::state::take_terminal_theme_repaint_request(&mut guard);
+                let handles = if show_terminal_content {
+                    {
+                        guard
+                            .terminals
+                            .iter()
+                            .map(|(&id, t)| (id, t.clone()))
+                            .collect()
+                    }
+                } else {
+                    Vec::new()
+                };
+                // Do not consume deferred terminal paint work while another
+                // route owns the content area. It must still be present when
+                // that route closes and the grids become visible again.
+                let force_terminal_theme_repaint = show_terminal_content
+                    && crate::state::take_terminal_theme_repaint_request(&mut guard);
                 // Snapshot active selections and drain the per-pane
                 // selection-changed set so the highlight below can force a
                 // one-frame repaint of panes whose selection just changed.
-                let selections = guard.terminal_selections.clone();
-                let selection_repaint = std::mem::take(&mut guard.terminal_selection_repaint);
-                let link_hover_repaint = std::mem::take(&mut guard.terminal_link_hover_repaint);
+                let selections = if show_terminal_content {
+                    guard.terminal_selections.clone()
+                } else {
+                    Default::default()
+                };
+                let selection_repaint = if show_terminal_content {
+                    std::mem::take(&mut guard.terminal_selection_repaint)
+                } else {
+                    Default::default()
+                };
+                let link_hover_repaint = if show_terminal_content {
+                    std::mem::take(&mut guard.terminal_link_hover_repaint)
+                } else {
+                    Default::default()
+                };
                 (
                     snap,
                     active_id,
@@ -1360,8 +1406,9 @@ fn main() {
                     .collect();
             // Editor panes publish their live viewport grid the same way
             // terminals publish display grids. Editors are plain state (no
-            // per-pane mutex), so this is a short second state lock.
-            {
+            // per-pane mutex), so this is a short second state lock. Skip it
+            // while Settings or review owns the content area.
+            if terminal_content_visible(&snap) {
                 let guard = tree_shared.lock_recover();
                 for (&id, editor) in guard.editors.iter() {
                     let mut grid = editor.grid.clone();
@@ -1380,6 +1427,9 @@ fn main() {
         },
     );
     let _ = window_event_sink.set(app.event_sink());
+    if let Some(cfg) = bench_config {
+        crate::bench::start(cfg, shared.clone(), window_event_sink.clone());
+    }
     crate::diff_review::start(shared.clone(), app.event_sink());
 
     // Branch names are decoration, so they are resolved after the window is
@@ -1493,6 +1543,20 @@ mod tests {
     use unshit_test::TestHarness;
 
     #[test]
+    fn terminal_content_visibility_skips_routes_that_replace_the_workspace() {
+        let state = seed_state();
+        let mut snap = state.ui_snapshot();
+        assert!(terminal_content_visible(&snap));
+
+        snap.settings_open = true;
+        assert!(!terminal_content_visible(&snap));
+
+        snap.settings_open = false;
+        snap.diff_review = Some(crate::diff_review::Review::new(".".into()));
+        assert!(!terminal_content_visible(&snap));
+    }
+
+    #[test]
     fn user_shortcut_bindings_includes_fps_overlay_toggle() {
         // Phase 0 of the 120fps perf work (refs #135) ships an in-app
         // FPS overlay toggled by the platform's primary+Shift+F. Without this binding the
@@ -1559,6 +1623,25 @@ mod tests {
         );
         harness.set_scale_factor(1.5);
         harness.step();
+
+        assert!(
+            !harness
+                .arena()
+                .get(harness.root())
+                .expect("app root")
+                .classes
+                .iter()
+                .any(|class| class == "settings"),
+            "opening settings must not change the root selector context and invalidate the returning workspace"
+        );
+        assert!(
+            harness.query(".sidebar").is_none(),
+            "settings replaces the workspace and must not build its sidebar subtree"
+        );
+        assert!(
+            harness.query(".terminal-grid").is_none(),
+            "settings replaces the workspace and must not build terminal grids"
+        );
 
         for selector in [
             ".stepper",

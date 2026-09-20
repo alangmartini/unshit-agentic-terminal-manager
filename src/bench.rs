@@ -14,6 +14,12 @@
 //!   single-cell keystroke path.
 //! - `human-typing`: records while an external desktop driver sends real
 //!   keyboard input through the focused window.
+//! - `settings-toggle`: alternates the Settings route through the ordinary
+//!   state command and rebuild event, exercising config open/close work.
+//! - `settings-toggle-4pane`: runs the same transition with four real panes.
+//! - `tab-switch-2x2`: alternates two tabs containing two real panes each.
+//! - `resize-4pane`: repeatedly requests native window resizes with four
+//!   live panes, exercising surface reconfiguration and terminal relayout.
 //!
 //! The probe is off by default; activation is gated on the main thread
 //! setting up the bench. In non-bench runs, `record_frame` is a
@@ -25,7 +31,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -43,6 +49,10 @@ pub enum BenchMode {
     StressCat4Pane,
     TypeBurst,
     HumanTyping,
+    SettingsToggle,
+    SettingsToggle4Pane,
+    TabSwitch2x2,
+    Resize4Pane,
     /// Stress mode for issue #86 (epic #81 item 2): run the dir-loop
     /// workload at the hardware's sustained rate while reporting per
     /// frame counters for the instance buffer pool. Used to verify the
@@ -59,6 +69,10 @@ impl BenchMode {
             "stress-cat-4pane" => Some(Self::StressCat4Pane),
             "type-burst" => Some(Self::TypeBurst),
             "human-typing" => Some(Self::HumanTyping),
+            "settings-toggle" => Some(Self::SettingsToggle),
+            "settings-toggle-4pane" => Some(Self::SettingsToggle4Pane),
+            "tab-switch-2x2" => Some(Self::TabSwitch2x2),
+            "resize-4pane" => Some(Self::Resize4Pane),
             "instance-pool-stress" => Some(Self::InstancePoolStress),
             _ => None,
         }
@@ -72,15 +86,21 @@ impl BenchMode {
             Self::StressCat4Pane => "stress-cat-4pane",
             Self::TypeBurst => "type-burst",
             Self::HumanTyping => "human-typing",
+            Self::SettingsToggle => "settings-toggle",
+            Self::SettingsToggle4Pane => "settings-toggle-4pane",
+            Self::TabSwitch2x2 => "tab-switch-2x2",
+            Self::Resize4Pane => "resize-4pane",
             Self::InstancePoolStress => "instance-pool-stress",
         }
     }
 
-    fn stress_cat_pane_count(self) -> Option<usize> {
+    fn pane_count(self) -> Option<usize> {
         match self {
             Self::StressCat => Some(1),
             Self::StressCat2Pane => Some(2),
             Self::StressCat4Pane => Some(4),
+            Self::SettingsToggle4Pane => Some(4),
+            Self::Resize4Pane => Some(4),
             _ => None,
         }
     }
@@ -694,10 +714,35 @@ fn create_split_stress_panes(shared: &SharedState, target_count: usize) -> Vec<u
     live_pane_ids(shared)
 }
 
+fn create_tab_switch_panes(shared: &SharedState) -> bool {
+    let Ok(mut guard) = shared.lock() else {
+        return false;
+    };
+    let first = guard.active_pane;
+    crate::state::mutate_split_right(&mut guard, first);
+    if !crate::state::dispatch(&mut guard, "tab.new") {
+        return false;
+    }
+    let second = guard.active_pane;
+    crate::state::mutate_split_right(&mut guard, second);
+    if !crate::state::dispatch(&mut guard, "tab.next") {
+        return false;
+    }
+    guard.tabs.len() >= 2
+        && guard
+            .tabs
+            .iter()
+            .all(|tab| tab.panes.len() == 1 && tab.panes[0].len() == 2)
+}
+
 /// Spawn the bench runner thread. Returns immediately; the thread
 /// sleeps for `warmup`, runs the workload for `duration`, writes the
 /// report, then force-exits the process.
-pub fn start(config: BenchConfig, shared: SharedState) {
+pub fn start(
+    config: BenchConfig,
+    shared: SharedState,
+    event_sink: Arc<OnceLock<unshit::app::EventSink>>,
+) {
     #[cfg(feature = "input-latency-histogram")]
     prepare_input_latency_capture();
     std::thread::spawn(move || {
@@ -718,17 +763,47 @@ pub fn start(config: BenchConfig, shared: SharedState) {
             }
         };
 
-        let stress_cat_panes = if let Some(target_count) = config.mode.stress_cat_pane_count() {
+        let bench_panes = if let Some(target_count) = config.mode.pane_count() {
             let panes = create_split_stress_panes(&shared, target_count);
-            log::info!("[bench] prewarming stress-cat on panes {:?}", panes);
-            for pane_id in &panes {
-                start_stress_cat(&shared, *pane_id);
+            if panes.len() != target_count {
+                log::error!(
+                    "[bench] requested {target_count} panes but only {} are live; exiting",
+                    panes.len()
+                );
+                std::process::exit(2);
             }
-            std::thread::sleep(Duration::from_secs(2));
+            if matches!(
+                config.mode,
+                BenchMode::StressCat | BenchMode::StressCat2Pane | BenchMode::StressCat4Pane
+            ) {
+                log::info!("[bench] prewarming stress-cat on panes {:?}", panes);
+                for pane_id in &panes {
+                    start_stress_cat(&shared, *pane_id);
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            // Settings-toggle measures opening and closing configuration on
+            // an already-visible multi-pane workspace. Let the split-pane
+            // setup reconcile and paint before activating the measurement;
+            // otherwise its first layout/atlas population is incorrectly
+            // attributed to the settings interaction.
+            if matches!(
+                config.mode,
+                BenchMode::SettingsToggle | BenchMode::SettingsToggle4Pane
+            ) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
             panes
         } else {
             Vec::new()
         };
+        if matches!(config.mode, BenchMode::TabSwitch2x2) {
+            if !create_tab_switch_panes(&shared) {
+                log::error!("[bench] could not create two tabs with two panes each; exiting");
+                std::process::exit(2);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
         log::info!("[bench] activated; driving pane {}", pane_id);
         activate();
         let t_start = Instant::now();
@@ -740,11 +815,18 @@ pub fn start(config: BenchConfig, shared: SharedState) {
             }
             BenchMode::TypeBurst => run_type_burst(&shared, pane_id, config.duration),
             BenchMode::HumanTyping => run_human_typing(config.duration),
+            BenchMode::SettingsToggle | BenchMode::SettingsToggle4Pane => {
+                run_settings_toggle(&shared, event_sink.as_ref(), config.duration)
+            }
+            BenchMode::TabSwitch2x2 => {
+                run_tab_switch(&shared, event_sink.as_ref(), config.duration)
+            }
+            BenchMode::Resize4Pane => run_resize_4pane(event_sink.as_ref(), config.duration),
             BenchMode::InstancePoolStress => {
                 run_instance_pool_stress(&shared, pane_id, config.duration)
             }
         }
-        drop(stress_cat_panes);
+        drop(bench_panes);
 
         let elapsed = t_start.elapsed();
         deactivate();
@@ -835,6 +917,79 @@ fn run_human_typing(duration: Duration) {
     std::thread::sleep(duration);
 }
 
+/// Exercise config-route transitions without synthesizing input outside the
+/// app. Every toggle uses the same command handler and full-tree rebuild
+/// notification as the Settings shortcut, making allocation, layout, and
+/// paint costs visible in the frame report.
+fn run_settings_toggle(
+    shared: &SharedState,
+    event_sink: &OnceLock<unshit::app::EventSink>,
+    duration: Duration,
+) {
+    let interval = Duration::from_millis(250);
+    let end = Instant::now() + duration;
+    let Some(sink) = event_sink.get() else {
+        log::error!("[bench] settings-toggle has no event sink");
+        return;
+    };
+
+    while Instant::now() < end {
+        let changed = shared
+            .lock()
+            .map(|mut state| crate::state::dispatch(&mut state, "modal.open"))
+            .unwrap_or(false);
+        if changed {
+            let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+fn run_tab_switch(
+    shared: &SharedState,
+    event_sink: &OnceLock<unshit::app::EventSink>,
+    duration: Duration,
+) {
+    let interval = Duration::from_millis(50);
+    let end = Instant::now() + duration;
+    let Some(sink) = event_sink.get() else {
+        log::error!("[bench] tab-switch-2x2 has no event sink");
+        return;
+    };
+
+    while Instant::now() < end {
+        let changed = shared
+            .lock()
+            .map(|mut state| crate::state::dispatch(&mut state, "tab.next"))
+            .unwrap_or(false);
+        if changed {
+            let _ = sink.send(unshit::app::ExternalEvent::RequestRebuild);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Drive the real native surface-resize path instead of approximating it with
+/// a state-only relayout. A modest cadence leaves the window manager room to
+/// deliver each resize while still sustaining live-resize pressure.
+fn run_resize_4pane(event_sink: &OnceLock<unshit::app::EventSink>, duration: Duration) {
+    let interval = Duration::from_millis(40);
+    let sizes = [(1280, 800), (1440, 900)];
+    let end = Instant::now() + duration;
+    let Some(sink) = event_sink.get() else {
+        log::error!("[bench] resize-4pane has no event sink");
+        return;
+    };
+
+    let mut next = 0;
+    while Instant::now() < end {
+        let (width, height) = sizes[next];
+        let _ = sink.request_surface_size(width, height);
+        next = (next + 1) % sizes.len();
+        std::thread::sleep(interval);
+    }
+}
+
 /// Stress mode for the instance buffer pool. Drives the same scroll
 /// heavy workload as `dir-loop` but at a faster write cadence (10ms vs
 /// 80ms) to produce more frames per second. The renderer acquires and
@@ -892,6 +1047,22 @@ mod tests {
         assert!(matches!(
             BenchMode::parse("human-typing"),
             Some(BenchMode::HumanTyping)
+        ));
+        assert!(matches!(
+            BenchMode::parse("settings-toggle"),
+            Some(BenchMode::SettingsToggle)
+        ));
+        assert!(matches!(
+            BenchMode::parse("settings-toggle-4pane"),
+            Some(BenchMode::SettingsToggle4Pane)
+        ));
+        assert!(matches!(
+            BenchMode::parse("tab-switch-2x2"),
+            Some(BenchMode::TabSwitch2x2)
+        ));
+        assert!(matches!(
+            BenchMode::parse("resize-4pane"),
+            Some(BenchMode::Resize4Pane)
         ));
         assert!(matches!(
             BenchMode::parse("instance-pool-stress"),

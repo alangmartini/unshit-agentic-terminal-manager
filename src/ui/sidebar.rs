@@ -1,7 +1,7 @@
 use unshit::core::element::*;
 
 use crate::state::{
-    mutate_add_workspace_with_path, mutate_with, CtxMenu, SharedState, Subtab, SubtabKind,
+    mutate_with, spawn_workspace_folder_picker, CtxMenu, SharedState, Subtab, SubtabKind,
     TerminalEntry, UiSnapshot, Workspace,
 };
 use crate::ui::icons::*;
@@ -31,8 +31,7 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(build_sidebar_footer(state))
 }
 
-fn build_sidebar_head(shared: &SharedState) -> ElementDef {
-    let add_state = shared.clone();
+fn build_sidebar_head(_shared: &SharedState) -> ElementDef {
     ElementDef::new(Tag::Div)
         .with_class("sidebar-head")
         .with_child(
@@ -47,17 +46,7 @@ fn build_sidebar_head(shared: &SharedState) -> ElementDef {
                     ElementDef::new(Tag::Button)
                         .with_class("icon-btn")
                         .with_class("tight")
-                        .on_click(move || {
-                            let picked = rfd::FileDialog::new()
-                                .set_title("Select workspace folder")
-                                .pick_folder();
-                            if let Some(folder) = picked {
-                                mutate_with(&add_state, |st| {
-                                    mutate_add_workspace_with_path(st, Some(folder));
-                                    crate::persist::save_workspaces(st);
-                                });
-                            }
-                        })
+                        .on_click(spawn_workspace_folder_picker)
                         .with_child(svg_icon(icon_plus())),
                 )
                 .with_child(
