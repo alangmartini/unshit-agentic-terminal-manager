@@ -3016,16 +3016,27 @@ fn walk_for_batch(
                     [geom.thumb_w, (geom.thumb_h - THUMB_INSET * 2.0).max(1.0)],
                 ),
             };
-            let (track_pos, track_size) = match geom.axis {
-                scroll::ScrollbarAxis::Vertical => (
-                    [geom.track_x, geom.track_y - geom.button_size],
-                    [geom.track_w, geom.track_h + 2.0 * geom.button_size],
-                ),
-                scroll::ScrollbarAxis::Horizontal => (
-                    [geom.track_x - geom.button_size, geom.track_y],
-                    [geom.track_w + 2.0 * geom.button_size, geom.track_h],
-                ),
+            // Maps (along-axis, cross-axis) offsets to screen [x, y] for this
+            // scrollbar; the vertical scrollbar's "along" is y, the
+            // horizontal one's is x.
+            let axis_point = |along: f32, cross: f32| -> [f32; 2] {
+                match geom.axis {
+                    scroll::ScrollbarAxis::Vertical => [cross, along],
+                    scroll::ScrollbarAxis::Horizontal => [along, cross],
+                }
             };
+            let (track_along_start, track_along_len, track_cross_start, track_cross_len) =
+                match geom.axis {
+                    scroll::ScrollbarAxis::Vertical => {
+                        (geom.track_y, geom.track_h, geom.track_x, geom.track_w)
+                    }
+                    scroll::ScrollbarAxis::Horizontal => {
+                        (geom.track_x, geom.track_w, geom.track_y, geom.track_h)
+                    }
+                };
+
+            let track_pos = axis_point(track_along_start - geom.button_size, track_cross_start);
+            let track_size = axis_point(track_along_len + 2.0 * geom.button_size, track_cross_len);
             push_scrollbar_quad(track_pos, track_size, TRACK_COLOR, 0.0);
             push_scrollbar_quad(thumb_pos, thumb_size, thumb_color, CORNER_RADIUS);
             // Small filled arrows, built from scanlines so they share the
@@ -3033,40 +3044,22 @@ fn walk_for_batch(
             if geom.button_size >= 8.0 {
                 let arrow_color = [0.55, 0.55, 0.55, 0.9];
                 for end in [false, true] {
+                    let center = if end {
+                        track_along_start + track_along_len + geom.button_size / 2.0
+                    } else {
+                        track_along_start - geom.button_size / 2.0
+                    };
+                    let direction = if end { -1.0 } else { 1.0 };
                     for row in 0..4 {
                         let width = 1.0 + row as f32 * 2.0;
-                        let direction = if end { -1.0 } else { 1.0 };
-                        let (pos, size) = match geom.axis {
-                            scroll::ScrollbarAxis::Vertical => {
-                                let center = if end {
-                                    geom.track_y + geom.track_h + geom.button_size / 2.0
-                                } else {
-                                    geom.track_y - geom.button_size / 2.0
-                                };
-                                (
-                                    [
-                                        geom.track_x + (geom.track_w - width) / 2.0,
-                                        center + direction * (row as f32 - 1.5),
-                                    ],
-                                    [width, 1.0],
-                                )
-                            }
-                            scroll::ScrollbarAxis::Horizontal => {
-                                let center = if end {
-                                    geom.track_x + geom.track_w + geom.button_size / 2.0
-                                } else {
-                                    geom.track_x - geom.button_size / 2.0
-                                };
-                                (
-                                    [
-                                        center + direction * (row as f32 - 1.5),
-                                        geom.track_y + (geom.track_h - width) / 2.0,
-                                    ],
-                                    [1.0, width],
-                                )
-                            }
-                        };
-                        push_scrollbar_quad(pos, size, arrow_color, 0.0);
+                        let along = center + direction * (row as f32 - 1.5);
+                        let cross = track_cross_start + (track_cross_len - width) / 2.0;
+                        push_scrollbar_quad(
+                            axis_point(along, cross),
+                            axis_point(1.0, width),
+                            arrow_color,
+                            0.0,
+                        );
                     }
                 }
             }

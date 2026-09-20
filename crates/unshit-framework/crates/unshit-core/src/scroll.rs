@@ -381,6 +381,30 @@ pub fn compute_scrollbar_geometry(
 // Hit testing
 // ---------------------------------------------------------------------------
 
+/// Classify a position along a scrollbar's track into a button, the thumb,
+/// or empty track. `pos` and the bounds are all measured along the same
+/// (vertical or horizontal) axis; the caller has already confirmed `pos` is
+/// within the track band on the perpendicular axis.
+fn classify_track_position(
+    pos: f32,
+    track_start: f32,
+    track_end: f32,
+    thumb_start: f32,
+    thumb_end: f32,
+) -> ScrollbarPart {
+    if pos < track_start {
+        ScrollbarPart::Decrement
+    } else if pos > track_end {
+        ScrollbarPart::Increment
+    } else if pos >= thumb_start && pos <= thumb_end {
+        ScrollbarPart::Thumb
+    } else if pos < thumb_start {
+        ScrollbarPart::TrackBefore
+    } else {
+        ScrollbarPart::TrackAfter
+    }
+}
+
 /// Check if a point falls within a scrollbar's track/thumb region.
 pub fn scrollbar_hit_test(
     geom_v: Option<&ScrollbarGeometry>,
@@ -396,17 +420,13 @@ pub fn scrollbar_hit_test(
             && y >= geom.track_y - geom.button_size
             && y <= geom.track_y + geom.track_h + geom.button_size
         {
-            let part = if y < geom.track_y {
-                ScrollbarPart::Decrement
-            } else if y > geom.track_y + geom.track_h {
-                ScrollbarPart::Increment
-            } else if y >= geom.thumb_y && y <= geom.thumb_y + geom.thumb_h {
-                ScrollbarPart::Thumb
-            } else if y < geom.thumb_y {
-                ScrollbarPart::TrackBefore
-            } else {
-                ScrollbarPart::TrackAfter
-            };
+            let part = classify_track_position(
+                y,
+                geom.track_y,
+                geom.track_y + geom.track_h,
+                geom.thumb_y,
+                geom.thumb_y + geom.thumb_h,
+            );
             return Some(ScrollbarHit {
                 node_id,
                 axis: ScrollbarAxis::Vertical,
@@ -423,17 +443,13 @@ pub fn scrollbar_hit_test(
             && y >= geom.track_y
             && y <= geom.track_y + geom.track_h
         {
-            let part = if x < geom.track_x {
-                ScrollbarPart::Decrement
-            } else if x > geom.track_x + geom.track_w {
-                ScrollbarPart::Increment
-            } else if x >= geom.thumb_x && x <= geom.thumb_x + geom.thumb_w {
-                ScrollbarPart::Thumb
-            } else if x < geom.thumb_x {
-                ScrollbarPart::TrackBefore
-            } else {
-                ScrollbarPart::TrackAfter
-            };
+            let part = classify_track_position(
+                x,
+                geom.track_x,
+                geom.track_x + geom.track_w,
+                geom.thumb_x,
+                geom.thumb_x + geom.thumb_w,
+            );
             return Some(ScrollbarHit {
                 node_id,
                 axis: ScrollbarAxis::Horizontal,
