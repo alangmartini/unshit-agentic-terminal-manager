@@ -91,11 +91,9 @@ fn system_bindings() -> Vec<(String, String)> {
     out.push((primary_combo("V"), "terminal.paste".to_string()));
     out.push(("Ctrl+Shift+V".to_string(), "terminal.paste".to_string()));
     out.push(("Shift+Insert".to_string(), "terminal.paste".to_string()));
+    #[cfg(target_os = "macos")]
     out.push((primary_combo("C"), "terminal.copy".to_string()));
     out.push(("Ctrl+Shift+C".to_string(), "terminal.copy".to_string()));
-
-    #[cfg(not(target_os = "macos"))]
-    out.push(("Ctrl+V".to_string(), "terminal.paste".to_string()));
 
     for i in 0..TAB_SWITCH_COUNT {
         out.push((
@@ -347,13 +345,15 @@ mod tests_copy_paste_bindings {
         // system_bindings() is responsible for these, not the
         // configurable action list.
         let bindings = pairs();
-        let copy_paste_combos = vec![
+        let mut copy_paste_combos = vec![
             primary_combo("V"),
             "Ctrl+Shift+V".to_string(),
             "Shift+Insert".to_string(),
-            primary_combo("C"),
             "Ctrl+Shift+C".to_string(),
         ];
+        if cfg!(target_os = "macos") {
+            copy_paste_combos.push(primary_combo("C"));
+        }
         for combo in copy_paste_combos {
             let found = bindings.iter().any(|(c, _)| c == &combo);
             assert!(found, "copy/paste binding {} must be present", combo);
