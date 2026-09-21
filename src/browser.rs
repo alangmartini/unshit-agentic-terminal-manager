@@ -35,7 +35,15 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     open_validated(url)
 }
 
-#[cfg(windows)]
+// Unit tests exercise updater decisions with synthetic release URLs. Never
+// hand those fixtures to the host browser: an integration assertion must not
+// create an external side effect or steal focus from the developer.
+#[cfg(test)]
+fn open_validated(_url: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(not(test), windows))]
 fn open_validated(url: &str) -> std::io::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -79,7 +87,7 @@ fn open_validated(url: &str) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(test), target_os = "macos"))]
 fn open_validated(url: &str) -> std::io::Result<()> {
     // `open` asks Launch Services to resolve the default browser. The URL is
     // passed as one argv entry, so no shell ever interprets terminal output.
@@ -89,7 +97,7 @@ fn open_validated(url: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
 fn open_validated(url: &str) -> std::io::Result<()> {
     // `xdg-open` asks the desktop environment to resolve the default browser.
     // The URL is passed as one argv entry, so no shell ever interprets terminal
@@ -102,7 +110,12 @@ fn open_validated(url: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
+    use super::{open_url, validate};
+
+    #[test]
+    fn test_build_accepts_valid_urls_without_requiring_a_browser() {
+        assert!(open_url("https://example.invalid/releases/tag/v99.0.0").is_ok());
+    }
 
     #[test]
     fn accepts_http_and_https() {
