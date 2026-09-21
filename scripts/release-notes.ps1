@@ -127,7 +127,9 @@ if ($IntroFile) {
   $chevron = [string][char]0x203A
   $intro = ('Download `terminal-manager-{0}-setup.exe` below and run it (per-user install, no admin prompt). ' +
             'An installed 0.6.0 or newer offers this release itself at startup and under **Settings {1} Updates**; ' +
-            'older installs run the installer over the current copy.') -f $Version, $chevron
+            'older installs run the installer over the current copy. ' +
+            'On an Apple silicon Mac download `terminal-manager-{0}-macos-arm64.zip`, drag **Terminal Manager.app** to Applications ' +
+            'and allow the first launch under **System Settings {1} Privacy & Security** (the bundle is ad-hoc signed, not notarized).') -f $Version, $chevron
 }
 $body = "## Install`n`n$intro`n`n" + ($out -join "`n") + "`n"
 

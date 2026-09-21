@@ -56,5 +56,17 @@ hard line break, so the hard-wrapped `CHANGELOG.md` section must be unwrapped
 first; the script does that and `-Verify` renders the result through GitHub's
 markdown API and fails on any `<br>`.
 
+Attach the macOS bundle from the release commit's own quality-gate run instead
+of building it by hand. The `macOS Checks` job uploads a
+`terminal-manager-macos` artifact holding
+`terminal-manager-<version>-macos-<arch>.zip`, named from the version
+`scripts/package-macos.sh` stamps into the bundle's `Info.plist`. Find the run
+with `gh run list --branch main --json databaseId,headSha` (match the release
+commit's SHA), download it with
+`gh run download <run-id> -n terminal-manager-macos -D dist`, and pass the zip
+to `gh release create` next to the Windows installer. Never re-zip the bundle
+on another platform: the archive `ditto` produced keeps the executable bits
+and the ad-hoc signature.
+
 Use a maintenance branch only when an older released version actually needs
 support while `main` moves forward; platform alone is not a reason for one.
