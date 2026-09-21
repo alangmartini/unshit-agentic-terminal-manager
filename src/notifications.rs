@@ -346,6 +346,24 @@ pub fn forward_external_open_target(
     ))
 }
 
+/// Top-level command names this module's CLI parser owns. `launch_target`'s
+/// raw-positional Finder/Explorer fallback consults this so a path that
+/// happens to collide with a future command name still reaches this parser
+/// instead of being misread as a file to open.
+pub(crate) fn is_top_level_cli_command(name: &str) -> bool {
+    matches!(
+        name,
+        "flow"
+            | "notify"
+            | "--notify"
+            | "activate"
+            | "--activate"
+            | "session-hook"
+            | "agent"
+            | "new-agent"
+    )
+}
+
 pub fn parse_cli_args<I, S, F>(args: I, get_env: F) -> Result<Option<CliCommand>, String>
 where
     I: IntoIterator<Item = S>,

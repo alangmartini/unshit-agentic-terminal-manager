@@ -3416,7 +3416,8 @@ pub fn open_external_target(
 ) -> bool {
     match target {
         crate::launch_target::LaunchTarget::Folder(path) => open_terminal_here(state, path.clone()),
-        crate::launch_target::LaunchTarget::TextFile(path) => {
+        crate::launch_target::LaunchTarget::TextFile(_)
+        | crate::launch_target::LaunchTarget::PatchFile(_) => {
             let Some(root) = target.workspace_root() else {
                 return false;
             };
@@ -3425,30 +3426,30 @@ pub fn open_external_target(
             }
             state.settings_open = false;
             state.palette_open = false;
-            state.diff_review = None;
             state.ctx_menu = None;
-            let opened = dispatch_editor_open_path_buf(state, path);
+            let opened = open_document(state, target);
             if opened {
                 crate::persist::save_workspaces(state);
             }
             opened
+        }
+    }
+}
+
+/// Apply the target-specific effect of opening a text or patch document.
+/// Callers are responsible for selecting its workspace and clearing overlays
+/// first; a `Folder` target never reaches here since neither caller passes
+/// one in.
+fn open_document(state: &mut AppState, target: &crate::launch_target::LaunchTarget) -> bool {
+    match target {
+        crate::launch_target::LaunchTarget::TextFile(path) => {
+            state.diff_review = None;
+            dispatch_editor_open_path_buf(state, path)
         }
         crate::launch_target::LaunchTarget::PatchFile(path) => {
-            let Some(root) = target.workspace_root() else {
-                return false;
-            };
-            if !activate_or_create_workspace_for_path(state, &root) {
-                return false;
-            }
-            state.settings_open = false;
-            state.palette_open = false;
-            state.ctx_menu = None;
-            let opened = crate::diff_review::open_patch_file(state, path.clone());
-            if opened {
-                crate::persist::save_workspaces(state);
-            }
-            opened
+            crate::diff_review::open_patch_file(state, path.clone())
         }
+        crate::launch_target::LaunchTarget::Folder(_) => false,
     }
 }
 
@@ -3462,16 +3463,7 @@ pub fn open_file_with_terminal_manager(state: &mut AppState, path: PathBuf) -> b
     state.settings_open = false;
     state.palette_open = false;
     state.ctx_menu = None;
-    match target {
-        crate::launch_target::LaunchTarget::TextFile(path) => {
-            state.diff_review = None;
-            dispatch_editor_open_path_buf(state, &path)
-        }
-        crate::launch_target::LaunchTarget::PatchFile(path) => {
-            crate::diff_review::open_patch_file(state, path)
-        }
-        crate::launch_target::LaunchTarget::Folder(_) => false,
-    }
+    open_document(state, &target)
 }
 
 /// Allocate a stable, non-zero workspace routing id without overflow.
