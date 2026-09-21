@@ -51,9 +51,10 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+#[cfg(target_os = "macos")]
+use winit::window::ImeRequest;
 use winit::window::{
-    ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, ResizeDirection, Window,
-    WindowId,
+    ImeCapabilities, ImeEnableRequest, ImeRequestData, ResizeDirection, Window, WindowId,
 };
 
 /// Whether the platform's primary application modifier is held.
@@ -6720,6 +6721,7 @@ fn clear_input_selection_on_blur(state: &mut AppState, node: NodeId) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn dead_key_ime_enable_request() -> Option<ImeEnableRequest> {
     ImeEnableRequest::new(ImeCapabilities::new(), ImeRequestData::default())
 }
