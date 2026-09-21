@@ -49,5 +49,12 @@ artifacts. Development CI artifacts are not a signed or notarized
 public macOS release. Publish a new release only after its platform checks and
 packaging checks pass.
 
+Write the GitHub release body with `scripts/release-notes.ps1 -Version X.Y.Z
+-Verify` and pass the generated file to `gh release create --notes-file`.
+GitHub renders release bodies like issue comments, where every newline is a
+hard line break, so the hard-wrapped `CHANGELOG.md` section must be unwrapped
+first; the script does that and `-Verify` renders the result through GitHub's
+markdown API and fails on any `<br>`.
+
 Use a maintenance branch only when an older released version actually needs
 support while `main` moves forward; platform alone is not a reason for one.
