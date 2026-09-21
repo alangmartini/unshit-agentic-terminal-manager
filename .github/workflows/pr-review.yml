@@ -82,7 +82,11 @@ jobs:
       - name: Build application bundle
         run: |
           scripts/package-macos.sh
-          ditto -c -k --sequesterRsrc --keepParent "dist/Terminal Manager.app" dist/terminal-manager-macos.zip
+          # The archive name comes from the version the packaging script stamped
+          # into the bundle, so a wrong stamp shows up in the asset name too.
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "dist/Terminal Manager.app/Contents/Info.plist")"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Terminal Manager.app" "dist/terminal-manager-${version}-macos-$(uname -m).zip"
+          ls -l dist/*.zip
       - uses: actions/upload-artifact@v4
         with:
           name: terminal-manager-macos

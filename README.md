@@ -50,7 +50,7 @@ The UI and the daemon talk over a user-scoped **named pipe on Windows** or **Uni
 
 #### macOS
 
-When a macOS release is available, download its `.app` bundle from the [Releases](https://github.com/alangmartini/unshit-agentic-terminal-manager/releases) page and drag **Terminal Manager.app** to Applications. For local builds, run `scripts/package-macos.sh` and open the resulting bundle from `dist/`. The bundle contains both `terminal-manager` and its sibling `unshit-ptyd` daemon. macOS 11 (Big Sur) or newer is required; Apple silicon is the currently verified target. The renderer uses wgpu with Metal by default (override with `UNSHIT_RENDER_BACKEND=metal` when troubleshooting).
+Download `terminal-manager-<version>-macos-arm64.zip` from the [Releases](https://github.com/alangmartini/unshit-agentic-terminal-manager/releases) page, unzip it and drag **Terminal Manager.app** to Applications. The bundle is ad-hoc signed rather than notarized, so macOS refuses the first launch with a message that it cannot verify the app: open **System Settings › Privacy & Security**, scroll to the security section and choose **Open Anyway**, or clear the quarantine flag beforehand with `xattr -dr com.apple.quarantine "/Applications/Terminal Manager.app"`. The published bundle is an Apple silicon build. For local builds, run `scripts/package-macos.sh` and open the resulting bundle from `dist/`. The bundle contains both `terminal-manager` and its sibling `unshit-ptyd` daemon. macOS 11 (Big Sur) or newer is required; Apple silicon is the currently verified target. The renderer uses wgpu with Metal by default (override with `UNSHIT_RENDER_BACKEND=metal` when troubleshooting).
 
 #### Windows
 
@@ -128,7 +128,7 @@ cargo build --release -p unshit-ptyd --bin unshit-ptyd
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.6.0-setup.exe`.
+The result is `dist\terminal-manager-0.6.1-setup.exe`.
 
 ## Usage
 

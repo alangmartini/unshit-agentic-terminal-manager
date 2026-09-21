@@ -51,7 +51,10 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{ResizeDirection, Window, WindowId};
+use winit::window::{
+    ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, ResizeDirection, Window,
+    WindowId,
+};
 
 /// Whether the platform's primary application modifier is held.
 ///
@@ -3904,6 +3907,19 @@ impl ApplicationHandler for AppHandler {
             self.app.config.decorations,
             !self.app.config.show_window_when_painted,
         ));
+        // Winit disables desktop IME by default. On macOS that also means
+        // AppKit never receives interpretKeyEvents, so simple dead-key input
+        // (´ + a -> á) is never composed and the shell receives the bare base
+        // key. Enable the text-input client without requesting a preedit
+        // popup; commits are routed below just like keyboard text.
+        #[cfg(target_os = "macos")]
+        {
+            let request = dead_key_ime_enable_request()
+                .expect("empty IME capabilities always have matching request data");
+            if let Err(error) = window.request_ime_update(ImeRequest::Enable(request)) {
+                log::warn!("failed to enable macOS dead-key/IME input: {error}");
+            }
+        }
         self.mark_startup("window_created");
 
         let scale_factor = window.scale_factor() as f32;
@@ -5449,6 +5465,8 @@ impl ApplicationHandler for AppHandler {
                                 state.needs_relayout = true;
                                 state.shaped_cache.clear();
                                 state.window.request_redraw();
+                            } else {
+                                dispatch_ime_commit_to_keyboard_capture(state, &text);
                             }
                         }
                     }
@@ -6702,6 +6720,67 @@ fn clear_input_selection_on_blur(state: &mut AppState, node: NodeId) {
     }
 }
 
+fn dead_key_ime_enable_request() -> Option<ImeEnableRequest> {
+    ImeEnableRequest::new(ImeCapabilities::new(), ImeRequestData::default())
+}
+
+fn keyboard_event_for_ime_commit(text: &str) -> Option<KeyboardEvent> {
+    let ch = text.chars().next()?;
+    if ch.is_control() {
+        return None;
+    }
+    Some(KeyboardEvent {
+        kind: KeyEventKind::Pressed,
+        key: Key::Char(ch),
+        modifiers: Modifiers::empty(),
+        text: Some(text.to_string()),
+    })
+}
+
+fn dispatch_ime_commit_to_keyboard_capture(state: &mut AppState, text: &str) -> bool {
+    let focused_id = state.interaction.focused;
+    let Some(event) = keyboard_event_for_ime_commit(text) else {
+        return false;
+    };
+    if !state
+        .arena
+        .get(focused_id)
+        .map(|element| element.captures_keyboard || element.computed_style.keyboard_capture)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let mut reveal_id = None;
+    let mut saw_keyboard_handler = false;
+    let mut capture_requires_rebuild = false;
+    if let Some(element) = state.arena.get(focused_id) {
+        for (event_type, handler) in &element.handlers {
+            if *event_type != EventType::KeyboardCapture {
+                continue;
+            }
+            saw_keyboard_handler = true;
+            let response = handler(&Event::Keyboard(event.clone()));
+            capture_requires_rebuild |= keyboard_capture_requires_rebuild(response.as_deref());
+            if let Some(response) = response {
+                if let Ok(request) =
+                    response.downcast::<unshit_core::event::RequestScrollIntoView>()
+                {
+                    reveal_id = Some(request.0);
+                }
+            }
+        }
+    }
+    if !saw_keyboard_handler || capture_requires_rebuild {
+        state.needs_rebuild = true;
+    }
+    if let Some(id) = reveal_id {
+        reveal_element_by_id(state, &id);
+    }
+    state.window.request_redraw();
+    true
+}
+
 fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bool {
     use unshit_core::element::InputType;
     use winit::keyboard::Key as WinitKey;
@@ -7716,6 +7795,37 @@ mod tests {
             assert!(!primary_modifier_held(&command));
             assert!(!text_edit_modifier_held(&command));
         }
+    }
+
+    #[test]
+    fn empty_ime_capabilities_produce_a_valid_enable_request() {
+        let request =
+            dead_key_ime_enable_request().expect("empty capabilities should form a request");
+
+        assert_eq!(request.capabilities(), &ImeCapabilities::new());
+    }
+
+    #[test]
+    fn ime_commit_maps_composed_text_to_a_keyboard_event() {
+        let event = keyboard_event_for_ime_commit("á").expect("composed text should map");
+
+        assert_eq!(event.key, Key::Char('á'));
+        assert_eq!(event.text.as_deref(), Some("á"));
+        assert_eq!(event.modifiers, Modifiers::empty());
+    }
+
+    #[test]
+    fn ime_commit_preserves_multi_character_text() {
+        let event = keyboard_event_for_ime_commit("café").expect("text commit should map");
+
+        assert_eq!(event.key, Key::Char('c'));
+        assert_eq!(event.text.as_deref(), Some("café"));
+    }
+
+    #[test]
+    fn ime_commit_rejects_empty_and_control_text() {
+        assert!(keyboard_event_for_ime_commit("").is_none());
+        assert!(keyboard_event_for_ime_commit("\u{7}").is_none());
     }
 
     #[test]
