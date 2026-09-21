@@ -79,10 +79,9 @@ pub enum NotificationIpcRequest {
 /// tagged native representation only when necessary. That preserves
 /// Finder/Explorer callback paths when forwarding to a warm UI.
 mod external_open_path {
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
-    #[cfg(unix)]
-    use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     #[cfg(windows)]
