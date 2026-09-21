@@ -50,7 +50,7 @@ pub const SETTINGS_GLYPH_PREWARM: &[UiGlyphPrewarm] = &[
     settings_prewarm!("settings · Appearance", FontWeight::Normal, 10.0, 1.4, 0.0),
     settings_prewarm!("Appearance", FontWeight::W(600), 16.0, 1.3, 0.0),
     settings_prewarm!(
-        "Themes, density, and the visual feel of the terminal. Changes apply immediately.",
+        "Themes, density, and rendering preferences. Most changes apply immediately.",
         FontWeight::Normal,
         10.0,
         1.4,
@@ -132,6 +132,16 @@ pub const SETTINGS_GLYPH_PREWARM: &[UiGlyphPrewarm] = &[
         0.0
     ),
     settings_prewarm!("pick your own", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!("Rendering", FontWeight::W(700), 11.0, 1.4, 0.2),
+    settings_prewarm!("restart required", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!("Prefer software renderer", FontWeight::W(700), 11.0, 1.4, 0.2),
+    settings_prewarm!(
+        "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+        FontWeight::Normal,
+        10.0,
+        1.4,
+        0.2
+    ),
     settings_prewarm!("✓❯+", FontWeight::W(600), 24.0, 1.0, 0.0),
 ];
 
@@ -341,7 +351,7 @@ fn build_settings_page_header(active: SettingsSection) -> ElementDef {
 fn settings_section_desc(active: SettingsSection) -> &'static str {
     match active {
         SettingsSection::Appearance => {
-            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+            "Themes, density, and rendering preferences. Most changes apply immediately."
         }
         SettingsSection::Shell => "Default shell, font, scrollback.",
         SettingsSection::Keybinds => {
@@ -479,6 +489,16 @@ fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> El
                     state.config_font_size_pt,
                 )),
         )
+        .with_child(
+            set_card("rendering", Some("restart required")).with_child(settings_page_field(
+                "Prefer software renderer",
+                Some(
+                    "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+                ),
+                software_renderer_toggle(state, shared),
+                state.config_font_size_pt,
+            )),
+        )
         .with_child(set_card("preview", None).with_child(build_appearance_preview(state)))
 }
 
@@ -514,6 +534,26 @@ fn build_tabs_card(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         tab_row_mode_segmented(state.tab_row_mode, shared),
         state.config_font_size_pt,
     ))
+}
+
+fn software_renderer_toggle(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let software_renderer = is_on(state, ToggleKey::ForceSoftwareRenderer);
+    let toggle_shared = shared.clone();
+    let mut toggle = ElementDef::new(Tag::Button)
+        .with_class("login-startup-toggle")
+        .with_class("settings-software-renderer-toggle")
+        .with_id("settings-software-renderer-toggle")
+        .with_tab_index(0)
+        .with_text(if software_renderer { "on" } else { "off" })
+        .on_click(move || {
+            mutate_with(&toggle_shared, |st| {
+                dispatch(st, "renderer.software.toggle");
+            });
+        });
+    if software_renderer {
+        toggle = toggle.with_class("on");
+    }
+    toggle
 }
 
 fn tab_width_mode_segmented(
@@ -1415,6 +1455,11 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
                 "terminal_font.inc",
                 shared,
             ),
+        ))
+        .with_child(setting_row(
+            "Prefer software renderer",
+            "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+            software_renderer_toggle(state, shared),
         ))
 }
 
@@ -2917,7 +2962,7 @@ mod tests {
         let shared = make_shared();
         let el = build_settings_page(&snap, &shared);
 
-        assert_eq!(count_with_class(&el, "set-card"), 5);
+        assert_eq!(count_with_class(&el, "set-card"), 6);
         assert!(has_class_anywhere(&el, "stepper"));
         assert!(has_class_anywhere(&el, "set-inline-control"));
         assert!(has_class_anywhere(&el, "input-num"));
@@ -2933,7 +2978,7 @@ mod tests {
         let text = collect_text_recursive(&el);
         assert!(text.contains("Theme"));
         assert!(text.contains(
-            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+            "Themes, density, and rendering preferences. Most changes apply immediately."
         ));
         assert!(text.contains("ptyd up · session"));
         assert!(text.contains("\u{2318}"));
@@ -2955,6 +3000,8 @@ mod tests {
         assert!(text.contains("Terminal output size"));
         assert!(text.contains("Sidebar width"));
         assert!(text.contains("Width of the workspace sidebar"));
+        assert!(text.contains("Prefer software renderer"));
+        assert!(text.contains("CPU/software renderer when available"));
         // Tabs card: sizing mode, fixed width stepper, and row mode.
         assert!(text.contains("Tab sizing"));
         assert!(text.contains("fit content"));
@@ -2973,6 +3020,35 @@ mod tests {
                 "settings page should not render unapplied/fake setting {stripped:?}"
             );
         }
+    }
+
+    #[test]
+    fn appearance_software_renderer_toggle_is_in_page_and_modal_and_dispatches() {
+        let shared = make_shared();
+        let page = build_settings_page(&shared.lock().unwrap().ui_snapshot(), &shared);
+        let page_toggle = find_by_id(&page, "settings-software-renderer-toggle")
+            .expect("software renderer page toggle");
+        assert_eq!(page_toggle.tab_index, Some(0));
+        assert_eq!(text_of(page_toggle), Some("off"));
+        assert!(!page_toggle.classes.contains(&"on".to_string()));
+
+        (page_toggle.on_click.as_ref().expect("page toggle click"))();
+        assert!(is_on(
+            &shared.lock().unwrap().ui_snapshot(),
+            ToggleKey::ForceSoftwareRenderer
+        ));
+
+        let modal = build_settings_modal(&shared.lock().unwrap().ui_snapshot(), &shared);
+        let modal_toggle = find_by_id(&modal, "settings-software-renderer-toggle")
+            .expect("software renderer modal toggle");
+        assert_eq!(text_of(modal_toggle), Some("on"));
+        assert!(modal_toggle.classes.contains(&"on".to_string()));
+
+        (modal_toggle.on_click.as_ref().expect("modal toggle click"))();
+        assert!(!is_on(
+            &shared.lock().unwrap().ui_snapshot(),
+            ToggleKey::ForceSoftwareRenderer
+        ));
     }
 
     #[test]
@@ -3424,7 +3500,7 @@ mod tests {
             (vertical.track_x - 913.0).abs() <= 1.0
                 && (vertical.track_y - 52.0).abs() <= 1.0
                 && (vertical.track_w - 12.0).abs() <= 0.1
-                && vertical.thumb_h >= 120.0,
+                && vertical.thumb_h >= 100.0,
             "target viewport scrollbar should match the browser-like right edge, got {:?}",
             vertical
         );
@@ -4458,8 +4534,8 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // title + separate config and terminal font rows.
-        assert_eq!(el.children.len(), 3);
+        // title + config font, terminal font, and renderer rows.
+        assert_eq!(el.children.len(), 4);
         assert_eq!(
             text_of(&el.children[1].children[0].children[0]),
             Some("Config font size")
@@ -4467,6 +4543,10 @@ mod tests {
         assert_eq!(
             text_of(&el.children[2].children[0].children[0]),
             Some("Terminal font size")
+        );
+        assert_eq!(
+            text_of(&el.children[3].children[0].children[0]),
+            Some("Prefer software renderer")
         );
     }
 

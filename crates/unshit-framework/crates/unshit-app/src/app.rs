@@ -41,7 +41,9 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::{GpuContext, PrewarmStatus, RenderOutcome, WindowGpuPreferences};
+use unshit_renderer::gpu::{
+    GpuContext, PrewarmStatus, RenderOutcome, RenderTierPreference, WindowGpuPreferences,
+};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -433,6 +435,7 @@ pub struct GlyphAtlasRecoveryEvent {
 
 pub struct App {
     config: AppConfig,
+    render_tier_preference: RenderTierPreference,
     tree_fn: Box<dyn Fn() -> ElementTree>,
     state: Option<AppState>,
     event_tx: flume::Sender<ExternalEvent>,
@@ -1003,8 +1006,20 @@ fn configured_pacing_mode(
 /// Safe to call unconditionally. It is a no-op off Windows, under a forced
 /// software renderer, and in any process that never opens a window.
 pub fn prewarm_window_gpu() {
+    prewarm_window_gpu_with_render_tier(RenderTierPreference::Auto);
+}
+
+/// Begin GPU bring-up using an explicit startup adapter-tier preference.
+///
+/// The same preference must be supplied through
+/// [`App::set_render_tier_preference`] before [`App::run`] so the real window
+/// context selects the same adapter tier as the prewarm request.
+pub fn prewarm_window_gpu_with_render_tier(render_tier_preference: RenderTierPreference) {
     let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
-    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported));
+    GpuContext::prewarm_with_render_tier(
+        window_gpu_preferences(compositor_clock_supported),
+        render_tier_preference,
+    );
 }
 
 fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
@@ -2665,6 +2680,7 @@ impl App {
         let grid_patches = Arc::new(GridPatchStore::default());
         Self {
             config,
+            render_tier_preference: RenderTierPreference::Auto,
             tree_fn: Box::new(tree_fn),
             state: None,
             // Placeholder interval: the display's refresh rate is not
@@ -2693,6 +2709,15 @@ impl App {
             #[cfg(feature = "async")]
             subscription_manager: None,
         }
+    }
+
+    /// Set the adapter tier used when the first window's renderer starts.
+    ///
+    /// Call this before [`run`](Self::run). It is startup-only: changing the
+    /// preference after a window has been created cannot replace its live
+    /// renderer.
+    pub fn set_render_tier_preference(&mut self, preference: RenderTierPreference) {
+        self.render_tier_preference = preference;
     }
 
     /// Returns an [`EventSink`] that can be moved into other threads to push
@@ -3063,6 +3088,7 @@ struct PendingStartup {
     window: Arc<dyn Window>,
     window_id: WindowId,
     gpu_preferences: WindowGpuPreferences,
+    render_tier_preference: RenderTierPreference,
     compositor_clock_supported: bool,
     scale_factor: f32,
     zoom_factor: f32,
@@ -3306,6 +3332,7 @@ impl AppHandler {
             window,
             window_id,
             gpu_preferences,
+            render_tier_preference,
             compositor_clock_supported,
             scale_factor,
             zoom_factor,
@@ -3333,8 +3360,11 @@ impl AppHandler {
         } = pending;
 
         let swap_started = Instant::now();
-        let mut gpu =
-            pollster::block_on(GpuContext::new_with_preferences(window.clone(), gpu_preferences));
+        let mut gpu = pollster::block_on(GpuContext::new_with_preferences_and_render_tier(
+            window.clone(),
+            gpu_preferences,
+            render_tier_preference,
+        ));
         self.mark_startup("gpu_ready");
 
         // One-shot pacing mode selection: sound because surface
@@ -3918,6 +3948,7 @@ impl ApplicationHandler for AppHandler {
         // `finish_startup`, once there is nothing left to do without it.
         let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
         let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+        let render_tier_preference = self.app.render_tier_preference;
 
         // If a css_path is set, read that file into config.css so it acts as
         // the initial stylesheet (both here and in the hot-reload watcher).
@@ -4079,6 +4110,7 @@ impl ApplicationHandler for AppHandler {
             window_id: window.id(),
             window,
             gpu_preferences,
+            render_tier_preference,
             compositor_clock_supported,
             scale_factor,
             zoom_factor,

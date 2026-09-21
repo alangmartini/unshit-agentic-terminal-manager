@@ -752,6 +752,10 @@ pub enum ToggleKey {
     /// Look for a newer release a few seconds after launch and offer it
     /// once per version (Settings ▸ Updates). Defaults on; persisted.
     CheckUpdatesOnStartup,
+    /// Prefer the renderer's CPU/software adapter on the next app launch.
+    /// This is a compatibility escape hatch for machines with unreliable
+    /// hardware graphics drivers, so it defaults off and is persisted.
+    ForceSoftwareRenderer,
 }
 
 impl ToggleKey {
@@ -764,6 +768,7 @@ impl ToggleKey {
             ToggleKey::StartAtLogin => "start-at-login",
             ToggleKey::StartAtLoginStale => "start-at-login-stale",
             ToggleKey::CheckUpdatesOnStartup => "check-updates-on-startup",
+            ToggleKey::ForceSoftwareRenderer => "force-software-renderer",
         }
     }
 }
@@ -1700,6 +1705,7 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::StartAtLogin, false);
     toggles.insert(ToggleKey::StartAtLoginStale, false);
     toggles.insert(ToggleKey::CheckUpdatesOnStartup, true);
+    toggles.insert(ToggleKey::ForceSoftwareRenderer, false);
 
     AppState {
         workspaces,
@@ -8973,6 +8979,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "update.open_release_page" => crate::updater::open_release_page(state),
         "update.startup_check.toggle" => crate::updater::toggle_startup_check(state),
         "update.show_dialog" => crate::updater::show_prompt(state),
+        "renderer.software.toggle" => {
+            let now_on = !toggle_on(state, ToggleKey::ForceSoftwareRenderer);
+            state
+                .toggles
+                .insert(ToggleKey::ForceSoftwareRenderer, now_on);
+            if !crate::persist::save_workspaces(state) {
+                push_error_toast(
+                    state,
+                    "Software renderer preference could not be saved. Check the config file permissions.",
+                );
+            }
+            true
+        }
         // Open settings on a named section (`settings.section:sessions`).
         // Scriptable through TM_STARTUP_DISPATCH so e2e shots can land on a
         // panel without synthesized clicks.
@@ -13823,6 +13842,18 @@ pub(crate) mod tests {
 
         assert!(dispatch(&mut state, "tabs.worktree_mode.toggle"));
         assert!(!toggle_on(&state, ToggleKey::WorktreeTabs));
+    }
+
+    #[test]
+    fn software_renderer_toggle_is_off_by_default_and_flips() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
     }
 
     #[test]
