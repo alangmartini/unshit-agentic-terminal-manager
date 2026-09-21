@@ -233,6 +233,13 @@ impl SubtabKind {
             _ => None,
         }
     }
+
+    /// Terminal and agent subtabs offer the scoped "New ..." flyout and
+    /// kill action; files intentionally have no session menu, since editor
+    /// close/save semantics need their own dirty-buffer safeguards.
+    pub fn has_ctx_menu(self) -> bool {
+        self != Self::Files
+    }
 }
 
 /// Pending destructive action awaiting user confirmation via the confirm
@@ -9160,7 +9167,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 parts.next().and_then(|v| v.parse::<f32>().ok()),
             ) {
                 (Some(idx), Some(kind), Some(x), Some(y))
-                    if idx < state.workspaces.len() && kind != SubtabKind::Files =>
+                    if idx < state.workspaces.len() && kind.has_ctx_menu() =>
                 {
                     crate::renderer_telemetry::record_ctx_menu_open(
                         "subtab",

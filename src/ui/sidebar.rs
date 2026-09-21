@@ -175,26 +175,41 @@ fn build_workspace(
         // plain shells, `agents` holds agent CLIs, and `files` holds real
         // editor panes opened from the explorer.
         let entries = match SubtabKind::parse(&subtab.label) {
-            Some(SubtabKind::Terminals) if workspace.terminals_expanded => build_terminal_entries(
-                workspace_index,
+            Some(SubtabKind::Terminals) if workspace.terminals_expanded => build_entry_list(
                 &workspace.terminal_entries,
                 "terminal-entries",
-                active_pane,
-                shared,
+                |e, is_last| {
+                    build_terminal_entry(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        shared,
+                    )
+                },
             ),
-            Some(SubtabKind::Agents) if workspace.agents_expanded => build_terminal_entries(
-                workspace_index,
-                &workspace.agent_entries,
-                "agent-entries",
-                active_pane,
-                shared,
-            ),
-            Some(SubtabKind::Files) if workspace.files_expanded => build_file_entries(
-                workspace_index,
-                &workspace.file_entries,
-                active_pane,
-                shared,
-            ),
+            Some(SubtabKind::Agents) if workspace.agents_expanded => {
+                build_entry_list(&workspace.agent_entries, "agent-entries", |e, is_last| {
+                    build_terminal_entry(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        shared,
+                    )
+                })
+            }
+            Some(SubtabKind::Files) if workspace.files_expanded => {
+                build_entry_list(&workspace.file_entries, "file-entries", |e, is_last| {
+                    build_file_entry(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        shared,
+                    )
+                })
+            }
             _ => None,
         };
         if let Some(entries) = entries {
@@ -246,11 +261,9 @@ fn build_subtab(
                 }
             });
         });
-        if !matches!(kind, SubtabKind::Files) {
+        if kind.has_ctx_menu() {
             // Right-click: the scoped menu ("New terminal ›" / "New agent ›"
-            // plus the matching kill action). Files intentionally have no
-            // session menu: editor close/save semantics require their own
-            // dirty-buffer safeguards.
+            // plus the matching kill action).
             let ctx_shared = shared.clone();
             btn = btn.on_context_menu(move |x, y| {
                 mutate_with(&ctx_shared, |st| {
@@ -341,12 +354,13 @@ fn build_subtab(
     btn
 }
 
-fn build_terminal_entries(
-    workspace_index: usize,
-    entries: &[TerminalEntry],
+/// Wraps a non-empty pane list in its `.terminal-entries` container,
+/// building each row via `build_row(entry, is_last)`. Folds to `None` when
+/// `entries` is empty so the caller skips the wrapper entirely.
+fn build_entry_list<T>(
+    entries: &[T],
     list_class: &'static str,
-    active_pane: crate::state::PaneId,
-    shared: &SharedState,
+    build_row: impl Fn(&T, bool) -> ElementDef,
 ) -> Option<ElementDef> {
     if entries.is_empty() {
         return None;
@@ -356,38 +370,7 @@ fn build_terminal_entries(
         .with_class("terminal-entries")
         .with_class(list_class);
     for (index, entry) in entries.iter().enumerate() {
-        list = list.with_child(build_terminal_entry(
-            workspace_index,
-            entry,
-            index == count - 1,
-            entry.pane_id == active_pane,
-            shared,
-        ));
-    }
-    Some(list)
-}
-
-fn build_file_entries(
-    workspace_index: usize,
-    entries: &[FileEntry],
-    active_pane: crate::state::PaneId,
-    shared: &SharedState,
-) -> Option<ElementDef> {
-    if entries.is_empty() {
-        return None;
-    }
-    let count = entries.len();
-    let mut list = ElementDef::new(Tag::Div)
-        .with_class("terminal-entries")
-        .with_class("file-entries");
-    for (index, entry) in entries.iter().enumerate() {
-        list = list.with_child(build_file_entry(
-            workspace_index,
-            entry,
-            index == count - 1,
-            entry.pane_id == active_pane,
-            shared,
-        ));
+        list = list.with_child(build_row(entry, index == count - 1));
     }
     Some(list)
 }
@@ -1078,7 +1061,7 @@ fn build_subtab_ctx_menu(
     installed: &[std::path::PathBuf],
     agents: &[&crate::agents::AgentProfile],
 ) -> ElementDef {
-    if kind == SubtabKind::Files {
+    if !kind.has_ctx_menu() {
         return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden");
     }
     let ws = snap.workspaces.get(ws_idx);
