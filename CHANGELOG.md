@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-21
+
+The 0.6.0 source revision did not compile on macOS. This release fixes that
+and is otherwise identical to 0.6.0 for Windows users. It is also the first
+release delivered through the app's own updater: a 0.6.0 install is offered
+it at startup and under **Settings › Updates**.
+
+### Fixed
+
+- **macOS build and process-based agent detection.** The 0.6.0 revision did
+  not compile on macOS: the resource monitor's new agent detection read
+  process command lines through a Windows-only probe. macOS now reads them
+  with `sysctl(KERN_PROCARGS2)`, so a `codex` or `claude` typed into a plain
+  terminal is filed under `agents` there as well, with the same
+  agent-events telemetry.
+
 ## [0.6.0] - 2026-09-20
 
 The biggest release since the Rust rewrite. **macOS** joins Windows on one
@@ -970,7 +986,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...v0.4.0
