@@ -14,6 +14,17 @@ and is otherwise identical to 0.6.0 for Windows users. It is also the first
 release delivered through the app's own updater: a 0.6.0 install is offered
 it at startup and under **Settings › Updates**.
 
+### Added
+
+- **macOS application bundle on the release page.** Each release now attaches
+  `terminal-manager-<version>-macos-arm64.zip`, the Apple silicon bundle the
+  quality gate builds from the release commit, next to the Windows installer.
+  It is ad-hoc signed and not notarized, so the first launch has to be allowed
+  under **System Settings › Privacy & Security** (or the quarantine flag
+  cleared with `xattr -dr com.apple.quarantine`). The bundle's `Info.plist`
+  now carries the crate version; it used to report 0.5.0 regardless of the
+  release.
+
 ### Fixed
 
 - **macOS build and process-based agent detection.** The 0.6.0 revision did
