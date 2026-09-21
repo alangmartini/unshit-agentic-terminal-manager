@@ -1001,35 +1001,32 @@ fn configured_pacing_mode(
 ///
 /// Resolves the same preferences the real request will, by the same route: a
 /// prewarm that picked different backends would be discarded on arrival, and
-/// the enumeration it paid for is the expensive part.
+/// the enumeration it paid for is the expensive part. The same
+/// `render_tier_preference` must be supplied through
+/// [`App::set_render_tier_preference`] before [`App::run`] so the real window
+/// context selects the same adapter tier as the prewarm request.
 ///
 /// Safe to call unconditionally. It is a no-op off Windows, under a forced
 /// software renderer, and in any process that never opens a window.
-pub fn prewarm_window_gpu() {
-    prewarm_window_gpu_with_render_tier(RenderTierPreference::Auto);
-}
-
-/// Begin GPU bring-up using an explicit startup adapter-tier preference.
-///
-/// The same preference must be supplied through
-/// [`App::set_render_tier_preference`] before [`App::run`] so the real window
-/// context selects the same adapter tier as the prewarm request.
-pub fn prewarm_window_gpu_with_render_tier(render_tier_preference: RenderTierPreference) {
+pub fn prewarm_window_gpu(render_tier_preference: RenderTierPreference) {
     let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
-    GpuContext::prewarm_with_render_tier(
-        window_gpu_preferences(compositor_clock_supported),
-        render_tier_preference,
-    );
+    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported, render_tier_preference));
 }
 
-fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
+fn window_gpu_preferences(
+    compositor_clock_supported: bool,
+    render_tier_preference: RenderTierPreference,
+) -> WindowGpuPreferences {
     #[cfg(target_os = "windows")]
     if compositor_clock_supported {
-        return WindowGpuPreferences::compositor_mailbox();
+        return WindowGpuPreferences {
+            render_tier: render_tier_preference,
+            ..WindowGpuPreferences::compositor_mailbox()
+        };
     }
 
     let _ = compositor_clock_supported;
-    WindowGpuPreferences::default()
+    WindowGpuPreferences { render_tier: render_tier_preference, ..WindowGpuPreferences::default() }
 }
 
 /// Display period to assume when the platform cannot report a refresh
@@ -3088,7 +3085,6 @@ struct PendingStartup {
     window: Arc<dyn Window>,
     window_id: WindowId,
     gpu_preferences: WindowGpuPreferences,
-    render_tier_preference: RenderTierPreference,
     compositor_clock_supported: bool,
     scale_factor: f32,
     zoom_factor: f32,
@@ -3332,7 +3328,6 @@ impl AppHandler {
             window,
             window_id,
             gpu_preferences,
-            render_tier_preference,
             compositor_clock_supported,
             scale_factor,
             zoom_factor,
@@ -3360,11 +3355,8 @@ impl AppHandler {
         } = pending;
 
         let swap_started = Instant::now();
-        let mut gpu = pollster::block_on(GpuContext::new_with_preferences_and_render_tier(
-            window.clone(),
-            gpu_preferences,
-            render_tier_preference,
-        ));
+        let mut gpu =
+            pollster::block_on(GpuContext::new_with_preferences(window.clone(), gpu_preferences));
         self.mark_startup("gpu_ready");
 
         // One-shot pacing mode selection: sound because surface
@@ -3947,8 +3939,8 @@ impl ApplicationHandler for AppHandler {
         // during that wait instead of after it. The GPU is collected in
         // `finish_startup`, once there is nothing left to do without it.
         let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
-        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
-        let render_tier_preference = self.app.render_tier_preference;
+        let gpu_preferences =
+            window_gpu_preferences(compositor_clock_supported, self.app.render_tier_preference);
 
         // If a css_path is set, read that file into config.css so it acts as
         // the initial stylesheet (both here and in the hot-reload watcher).
@@ -4110,7 +4102,6 @@ impl ApplicationHandler for AppHandler {
             window_id: window.id(),
             window,
             gpu_preferences,
-            render_tier_preference,
             compositor_clock_supported,
             scale_factor,
             zoom_factor,

@@ -725,7 +725,7 @@ fn main() {
     //
     // Placed after the notification CLI so `--notify`-style invocations, which
     // exit without ever opening a window, do not spin up a GPU thread.
-    unshit::app::prewarm_window_gpu_with_render_tier(render_tier_preference);
+    unshit::app::prewarm_window_gpu(render_tier_preference);
 
     #[cfg(feature = "profiling")]
     init_profiler();
