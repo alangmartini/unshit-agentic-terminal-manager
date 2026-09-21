@@ -195,6 +195,7 @@ fn row(
                     target: crate::state::CtxMenuTarget::Explorer {
                         path: context_path.clone(),
                         root: root.clone(),
+                        directory,
                     },
                 });
             });

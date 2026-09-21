@@ -23,6 +23,7 @@ pub mod flow_explorer;
 pub mod git;
 pub mod git_watch;
 pub mod keybinds;
+pub mod launch_target;
 pub mod notifications;
 pub mod pane_restore;
 pub mod persist;
@@ -689,12 +690,69 @@ fn attach_parent_console() {
     }
 }
 
+/// Route paths delivered by the native platform (Finder, Explorer, or a
+/// framework open-files callback) through the same validated state mutation
+/// used by a warm CLI/IPC launch. A batch returns one rebuild decision rather
+/// than rebuilding once per selected file.
+fn apply_native_open_paths(shared: &SharedState, paths: &[std::path::PathBuf]) -> bool {
+    let targets: Vec<_> = paths
+        .iter()
+        .filter_map(
+            |path| match crate::launch_target::resolve_absolute_target(path) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    log::warn!(
+                        "native open request rejected for {}: {error}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
+    if targets.is_empty() {
+        return false;
+    }
+    let mut state = shared.lock_recover();
+    let mut changed = false;
+    for target in targets {
+        changed |= crate::state::open_external_target(&mut state, &target);
+    }
+    changed
+}
+
 fn main() {
     // First statement in the process: everything after this point is time the
     // user spends waiting for a window, and the recorder back-dates its epoch
     // to process creation so image load counts too.
     crate::startup_perf::init();
     attach_parent_console();
+
+    let startup_target = match crate::launch_target::parse_process_args(std::env::args_os().skip(1))
+    {
+        crate::launch_target::ParseResult::NotRequested => None,
+        crate::launch_target::ParseResult::Target(target) => Some(target),
+        crate::launch_target::ParseResult::Error(error) => {
+            eprintln!("terminal-manager open error: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(target) = startup_target.as_ref() {
+        // Prefer the running UI when there is one. The target is still kept
+        // locally when its socket is absent or stale, which is the cold-start
+        // path for Finder/Explorer and must not turn into a failed open.
+        match notifications::forward_external_open_target(target) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => {
+                eprintln!(
+                    "terminal-manager open error: running instance could not open {}",
+                    target.path().display()
+                );
+                std::process::exit(1);
+            }
+            Err(_) => {}
+        }
+    }
 
     if let Some(code) = notifications::handle_cli_from_env(std::env::args_os().skip(1)) {
         std::process::exit(code);
@@ -863,6 +921,15 @@ fn main() {
             workspace_id,
             pane_id,
         );
+    }
+    if let Some(target) = startup_target.as_ref() {
+        if let Some(root) = target.workspace_root() {
+            if !crate::state::prepare_external_workspace_for_launch(&mut initial_state, root) {
+                eprintln!("terminal-manager open error: could not prepare the requested folder");
+                std::process::exit(2);
+            }
+            crate::persist::save_workspaces(&initial_state);
+        }
     }
     crate::startup_perf::mark("layout_restored");
     let shared: SharedState = Arc::new(std::sync::Mutex::new(initial_state));
@@ -1092,6 +1159,7 @@ fn main() {
     let scroll_metrics_shared = shared.clone();
     let scroll_tuning_shared = shared.clone();
     let startup_prewarm_shared = shared.clone();
+    let native_open_shared = shared.clone();
     let window_event_sink: Arc<std::sync::OnceLock<unshit::app::EventSink>> =
         Arc::new(std::sync::OnceLock::new());
     let tree_window_event_sink = window_event_sink.clone();
@@ -1242,6 +1310,9 @@ fn main() {
                 let mut guard = file_drop_shared.lock_recover();
                 crate::diff_review::accept_drop(&mut guard, paths)
                     || crate::state::attach_dropped_images(&mut guard, paths)
+            })),
+            on_open_files: Some(Arc::new(move |paths: &[std::path::PathBuf]| {
+                apply_native_open_paths(&native_open_shared, paths)
             })),
             on_cell_metrics: Some(Arc::new(move |cell_w: f32, cell_h: f32| {
                 use unshit::core::cell_grid::CellGrid;
@@ -1452,6 +1523,18 @@ fn main() {
         crate::bench::start(cfg, shared.clone(), window_event_sink.clone());
     }
     crate::diff_review::start(shared.clone(), app.event_sink());
+
+    // Folder targets have already seeded the eager initial terminal above.
+    // Documents wait until the patch-review worker exists, then open through
+    // the same state path as a warm native event.
+    if let Some(
+        target @ (crate::launch_target::LaunchTarget::TextFile(_)
+        | crate::launch_target::LaunchTarget::PatchFile(_)),
+    ) = startup_target.as_ref()
+    {
+        let mut guard = shared.lock_recover();
+        crate::state::open_external_target(&mut guard, target);
+    }
 
     // Branch names are decoration, so they are resolved after the window is
     // on its way up rather than in front of it. Started here, immediately

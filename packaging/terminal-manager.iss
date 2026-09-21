@@ -47,6 +47,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=app.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=..\LICENSE
+ChangesAssociations=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -67,6 +68,39 @@ Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; WorkingD
 [Registry]
 ; Remove the app-created, opt-in startup value without creating it during setup.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#MyStartupValueName}"; Flags: dontcreatekey uninsdeletevalue
+
+; Per-user Explorer integration. Keep these under HKCU\Software\Classes so
+; this lowest-privilege installer never changes another user's associations.
+; The app's `open-folder` and `open-file` commands first route through the
+; running UI's local socket, falling back to a correctly-targeted cold start.
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open in Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-folder ""%1"""
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open Terminal Manager here"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-folder ""%V"""
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open in Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-folder ""%1"""
+
+; Advertise Terminal Manager in Windows' Open With cascade without taking the
+; default handler for these types. The direct per-type verb keeps the action
+; discoverable in the relevant Explorer context menu.
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\DefaultIcon"; ValueType: expandsz; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".txt"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".md"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".markdown"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".patch"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".diff"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.txt\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open with Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.txt\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.md\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open with Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.md\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.markdown\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open with Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.markdown\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.patch\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open with Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.patch\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.diff\shell\TerminalManager"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open with Terminal Manager"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.diff\shell\TerminalManager\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" open-file ""%1"""
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

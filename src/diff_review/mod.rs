@@ -343,21 +343,12 @@ pub fn accept_drop(state: &mut AppState, paths: &[PathBuf]) -> bool {
     {
         return false;
     }
-    dispatch(state, &format!("review.patch:{}", path.display()))
+    open_patch_file(state, path.clone())
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
     if let Some(path) = command.strip_prefix("review.patch:") {
-        if state.diff_review.is_none() {
-            state.diff_review = Some(Review::new(
-                crate::state::active_workspace_cwd(state).unwrap_or_default(),
-            ));
-        }
-        let review = state.diff_review.as_mut().unwrap();
-        review.mode = "patch";
-        review.patch_path = Some(PathBuf::from(path));
-        refresh(review);
-        return true;
+        return open_patch_file(state, PathBuf::from(path));
     }
     if command == "review.open" {
         let root = state
@@ -464,6 +455,21 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             submit(review, Query::File(report, index));
         }
     }
+    true
+}
+
+/// Open a patch using its native [`PathBuf`] rather than a command string.
+/// This is used by platform file associations, whose paths need not be UTF-8.
+pub fn open_patch_file(state: &mut AppState, path: PathBuf) -> bool {
+    if state.diff_review.is_none() {
+        state.diff_review = Some(Review::new(
+            crate::state::active_workspace_cwd(state).unwrap_or_default(),
+        ));
+    }
+    let review = state.diff_review.as_mut().unwrap();
+    review.mode = "patch";
+    review.patch_path = Some(path);
+    refresh(review);
     true
 }
 

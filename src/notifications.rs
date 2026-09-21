@@ -30,6 +30,13 @@ pub const ENV_AGENT_RESTORE_CORRELATION_ID: &str = "TM_AGENT_RESTORE_CORRELATION
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotificationIpcRequest {
+    /// Open a folder terminal, text document, or patch review in the running
+    /// UI. The receiver re-classifies and validates the absolute path before
+    /// touching application state.
+    OpenExternal {
+        #[serde(with = "external_open_path")]
+        path: PathBuf,
+    },
     OpenFlow {
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +71,76 @@ pub enum NotificationIpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<u32>,
     },
+}
+
+/// JSON normally serializes [`PathBuf`] as a UTF-8 string, but native path
+/// names need not be valid UTF-8 on Unix or valid Unicode scalar values on
+/// Windows. Keep the familiar string wire form for ordinary paths and use a
+/// tagged native representation only when necessary. That preserves
+/// Finder/Explorer callback paths when forwarding to a warm UI.
+mod external_open_path {
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(windows)]
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(untagged)]
+    enum WirePath {
+        Utf8(String),
+        #[cfg(unix)]
+        UnixBytes {
+            unix_bytes: Vec<u8>,
+        },
+        #[cfg(windows)]
+        WindowsWide {
+            windows_wide: Vec<u16>,
+        },
+    }
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(unix)]
+        if path.to_str().is_none() {
+            return WirePath::UnixBytes {
+                unix_bytes: path.as_os_str().as_bytes().to_vec(),
+            }
+            .serialize(serializer);
+        }
+
+        #[cfg(windows)]
+        if path.to_str().is_none() {
+            return WirePath::WindowsWide {
+                windows_wide: path.as_os_str().encode_wide().collect(),
+            }
+            .serialize(serializer);
+        }
+
+        WirePath::Utf8(path.to_string_lossy().into_owned()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match WirePath::deserialize(deserializer)? {
+            WirePath::Utf8(path) => Ok(PathBuf::from(path)),
+            #[cfg(unix)]
+            WirePath::UnixBytes { unix_bytes } => Ok(PathBuf::from(OsString::from_vec(unix_bytes))),
+            #[cfg(windows)]
+            WirePath::WindowsWide { windows_wide } => {
+                Ok(PathBuf::from(OsString::from_wide(&windows_wide)))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +323,28 @@ where
             }
         }
     }
+}
+
+/// Deliver a desktop-shell target to a running UI instance.
+///
+/// `Ok(true)` means the UI accepted the target and `Ok(false)` means an
+/// existing UI explicitly rejected it. Both outcomes prove that an existing
+/// instance received the request, so callers must not cold-start a second UI.
+/// An `Err` means transport failed (for example there is no listener), and is
+/// the only outcome that should fall back to the cold-start path.
+pub fn forward_external_open_target(
+    target: &crate::launch_target::LaunchTarget,
+) -> io::Result<bool> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    runtime.block_on(send_cli_request_ack(
+        &notification_socket_path(),
+        &NotificationIpcRequest::OpenExternal {
+            path: target.path().to_path_buf(),
+        },
+    ))
 }
 
 pub fn parse_cli_args<I, S, F>(args: I, get_env: F) -> Result<Option<CliCommand>, String>
@@ -569,6 +668,21 @@ fn send_hook_request_blocking(socket: &Path, request: NotificationIpcRequest) ->
 }
 
 async fn send_cli_request(socket: &Path, request: &NotificationIpcRequest) -> io::Result<()> {
+    if send_cli_request_ack(socket, request).await? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "notification IPC request rejected",
+        ))
+    }
+}
+
+/// Send one request and return the listener's acknowledgement without
+/// conflating an explicit rejection with a transport failure. The distinction
+/// matters for desktop-shell launches: a delivered rejection must not spawn a
+/// duplicate UI process.
+async fn send_cli_request_ack(socket: &Path, request: &NotificationIpcRequest) -> io::Result<bool> {
     let mut conn = unshit_ptyd::transport::connect(socket).await?;
     let bytes = serde_json::to_vec(request).map_err(io::Error::other)?;
     conn.write_all(&bytes).await?;
@@ -577,14 +691,7 @@ async fn send_cli_request(socket: &Path, request: &NotificationIpcRequest) -> io
     tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_exact(&mut ack))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "notification IPC ack timed out"))??;
-    if ack[0] == 1 {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "notification IPC request rejected",
-        ))
-    }
+    Ok(ack[0] == 1)
 }
 
 pub fn default_notification_socket_path() -> PathBuf {
@@ -763,6 +870,24 @@ fn apply_ipc_request(
 ) -> IpcEffect {
     let mut effect = IpcEffect::default();
     match request {
+        NotificationIpcRequest::OpenExternal { path } => {
+            let target = match crate::launch_target::resolve_absolute_target(&path) {
+                Ok(target) => target,
+                Err(error) => {
+                    log::warn!(
+                        "desktop open request rejected for {}: {error}",
+                        path.display()
+                    );
+                    return effect;
+                }
+            };
+            let opened = mutate_with(shared, |state| {
+                crate::state::open_external_target(state, &target)
+            });
+            effect.accepted = opened;
+            effect.rebuild = opened;
+            effect.activate_window = opened;
+        }
         NotificationIpcRequest::OpenFlow { path, workspace_id } => {
             // File parsing runs in the IPC subscription, before the state lock.
             // A relative IPC path would accidentally use the UI process's cwd.
@@ -1406,6 +1531,61 @@ mod tests {
         assert_eq!(back, request);
     }
 
+    #[test]
+    fn desktop_open_ipc_request_round_trips() {
+        let request = NotificationIpcRequest::OpenExternal {
+            path: PathBuf::from("/tmp/notes.md"),
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .expect("json")
+            .contains(r#""kind":"open_external""#));
+        let back: NotificationIpcRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, request);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_open_ipc_preserves_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let request = NotificationIpcRequest::OpenExternal {
+            path: PathBuf::from(OsString::from_vec(b"/tmp/notes-\xff.md".to_vec())),
+        };
+        let bytes = serde_json::to_vec(&request).expect("serialize non-UTF-8 path");
+        assert!(std::str::from_utf8(&bytes)
+            .expect("json")
+            .contains("unix_bytes"));
+        let back: NotificationIpcRequest = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back, request);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_open_ipc_preserves_non_unicode_windows_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let request = NotificationIpcRequest::OpenExternal {
+            path: PathBuf::from(OsString::from_wide(&[
+                b'C' as u16,
+                b':' as u16,
+                b'\\' as u16,
+                0xD800,
+                b'.' as u16,
+                b'm' as u16,
+                b'd' as u16,
+            ])),
+        };
+        let bytes = serde_json::to_vec(&request).expect("serialize non-Unicode path");
+        assert!(std::str::from_utf8(&bytes)
+            .expect("json")
+            .contains("windows_wide"));
+        let back: NotificationIpcRequest = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back, request);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_cli_request_delivers_ipc_payload() {
         let socket = unique_socket_path();
@@ -1428,6 +1608,34 @@ mod tests {
         client.await.unwrap();
 
         assert_eq!(got, request);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_open_ack_distinguishes_rejection_from_transport_failure() {
+        let socket = unique_socket_path();
+        let mut server = bind_notification_server(&socket).await.unwrap();
+        let request = NotificationIpcRequest::OpenExternal {
+            path: PathBuf::from("/tmp/notes.md"),
+        };
+
+        let client_socket = socket.clone();
+        let sent = request.clone();
+        let client = tokio::spawn(async move {
+            send_cli_request_ack(&client_socket, &sent)
+                .await
+                .expect("transport succeeds")
+        });
+
+        let mut conn = server.accept().await.unwrap();
+        let got = read_request_to_end(&mut conn).await.unwrap();
+        conn.write_all(&[0]).await.unwrap();
+        conn.flush().await.unwrap();
+
+        assert!(!client.await.unwrap(), "ack zero is an explicit rejection");
+        assert_eq!(got, request);
+        drop(server);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -191,7 +191,11 @@ pub struct CtxMenu {
 #[derive(Clone, Debug)]
 pub enum CtxMenuTarget {
     /// File/folder menu retains its original workspace root across navigation.
-    Explorer { path: PathBuf, root: PathBuf },
+    Explorer {
+        path: PathBuf,
+        root: PathBuf,
+        directory: bool,
+    },
     /// Menu opened on a workspace row in the sidebar.
     Workspace { idx: usize },
     /// Menu opened on a tab in the tabbar. Carries the active pane id
@@ -3239,6 +3243,13 @@ fn normalized_col_ratios(panes: &[Vec<Pane>], saved: &[Vec<f32>]) -> Vec<Vec<f32
 fn seed_default_tab(state: &mut AppState, max_pane_id: &mut u32) {
     let id_num = max_pane_id.saturating_add(1);
     *max_pane_id = id_num;
+    seed_fresh_terminal_tab(state, id_num);
+}
+
+/// Seed one terminal-shaped tab without starting its PTY. Startup uses this
+/// before the daemon is connected; the normal initial attach path then owns
+/// the eager default-size spawn and later cell-metric correction.
+fn seed_fresh_terminal_tab(state: &mut AppState, id_num: u32) {
     let pane = Pane {
         id: PaneId(id_num),
         title: "shell".to_string(),
@@ -3299,6 +3310,168 @@ pub fn mutate_add_workspace_with_path(state: &mut AppState, path: Option<PathBuf
     state.workspaces.push(new_workspace(num, name, path));
     let new_idx = state.workspaces.len() - 1;
     mutate_switch_workspace(state, new_idx);
+}
+
+/// Create a fresh active workspace for a desktop-shell launch before the
+/// daemon connection and initial PTY attach. A separate workspace and pane
+/// id deliberately prevent an external `Open terminal here` request from
+/// reattaching to the previously active persisted session in a different
+/// directory.
+pub fn prepare_external_workspace_for_launch(state: &mut AppState, path: PathBuf) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let used_workspace_nums = state
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.num)
+        .collect::<std::collections::HashSet<_>>();
+    let Some(num) = allocate_workspace_num(&used_workspace_nums) else {
+        log::error!(r#"{{"event":"workspace_add_failed","reason":"id_space_exhausted"}}"#);
+        return false;
+    };
+
+    save_workspace_state(state);
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .to_string();
+    state.workspaces.push(new_workspace(num, name, Some(path)));
+    state.active_workspace = state.workspaces.len() - 1;
+    state.file_index = None;
+    state.tabs.clear();
+    state.active_tab = 0;
+    state.panes.clear();
+    state.active_pane = PaneId(0);
+    state.row_ratios.clear();
+    state.col_ratios.clear();
+    let pane_id = state.next_id.max(1);
+    state.next_id = pane_id.saturating_add(1);
+    seed_fresh_terminal_tab(state, pane_id);
+    state.ctx_menu = None;
+    sync_explorer(state);
+    true
+}
+
+/// Switch to an existing workspace for `path`, or create one when this is a
+/// directory Terminal Manager has not seen before. This runs on user-driven
+/// open requests after the daemon is ready, so a caller can spawn a terminal
+/// immediately afterwards.
+fn activate_or_create_workspace_for_path(state: &mut AppState, path: &std::path::Path) -> bool {
+    let existing = state.workspaces.iter().position(|workspace| {
+        workspace.path.as_ref().is_some_and(|workspace_path| {
+            workspace_path == path
+                || workspace_path
+                    .canonicalize()
+                    .ok()
+                    .as_deref()
+                    .is_some_and(|canonical| canonical == path)
+        })
+    });
+    if let Some(index) = existing {
+        if index != state.active_workspace {
+            mutate_switch_workspace(state, index);
+        }
+        return true;
+    }
+
+    let count = state.workspaces.len();
+    mutate_add_workspace_with_path(state, Some(path.to_path_buf()));
+    state.workspaces.len() == count + 1
+}
+
+/// Open a new terminal whose working directory is `path`. Used both by the
+/// native desktop integrations and by the built-in Explorer context menu.
+pub fn open_terminal_here(state: &mut AppState, path: PathBuf) -> bool {
+    let path = match path.canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(path) => {
+            push_error_toast(state, format!("{} is not a folder", path.display()));
+            return false;
+        }
+        Err(error) => {
+            push_error_toast(state, format!("Could not open folder: {error}"));
+            return false;
+        }
+    };
+    if !activate_or_create_workspace_for_path(state, &path) {
+        return false;
+    }
+    state.settings_open = false;
+    state.palette_open = false;
+    state.diff_review = None;
+    state.ctx_menu = None;
+    mutate_add_tab(state);
+    sync_explorer(state);
+    crate::persist::save_workspaces(state);
+    true
+}
+
+/// Apply a validated path that arrived through the OS, the local IPC bridge,
+/// or a platform-native open-files event.
+pub fn open_external_target(
+    state: &mut AppState,
+    target: &crate::launch_target::LaunchTarget,
+) -> bool {
+    match target {
+        crate::launch_target::LaunchTarget::Folder(path) => open_terminal_here(state, path.clone()),
+        crate::launch_target::LaunchTarget::TextFile(path) => {
+            let Some(root) = target.workspace_root() else {
+                return false;
+            };
+            if !activate_or_create_workspace_for_path(state, &root) {
+                return false;
+            }
+            state.settings_open = false;
+            state.palette_open = false;
+            state.diff_review = None;
+            state.ctx_menu = None;
+            let opened = dispatch_editor_open_path_buf(state, path);
+            if opened {
+                crate::persist::save_workspaces(state);
+            }
+            opened
+        }
+        crate::launch_target::LaunchTarget::PatchFile(path) => {
+            let Some(root) = target.workspace_root() else {
+                return false;
+            };
+            if !activate_or_create_workspace_for_path(state, &root) {
+                return false;
+            }
+            state.settings_open = false;
+            state.palette_open = false;
+            state.ctx_menu = None;
+            let opened = crate::diff_review::open_patch_file(state, path.clone());
+            if opened {
+                crate::persist::save_workspaces(state);
+            }
+            opened
+        }
+    }
+}
+
+/// Open one supported document from the built-in Explorer without changing
+/// workspaces. Desktop-shell opens deliberately select the document's parent
+/// folder, while Explorer entries already belong to the user's active tree.
+pub fn open_file_with_terminal_manager(state: &mut AppState, path: PathBuf) -> bool {
+    let Some(target) = crate::launch_target::classify_supported_file_path(&path) else {
+        return false;
+    };
+    state.settings_open = false;
+    state.palette_open = false;
+    state.ctx_menu = None;
+    match target {
+        crate::launch_target::LaunchTarget::TextFile(path) => {
+            state.diff_review = None;
+            dispatch_editor_open_path_buf(state, &path)
+        }
+        crate::launch_target::LaunchTarget::PatchFile(path) => {
+            crate::diff_review::open_patch_file(state, path)
+        }
+        crate::launch_target::LaunchTarget::Folder(_) => false,
+    }
 }
 
 /// Allocate a stable, non-zero workspace routing id without overflow.
@@ -6645,6 +6818,13 @@ pub fn dispatch_editor_open_path(state: &mut AppState, raw_path: &str) -> bool {
     dispatch_editor_open_at(state, raw_path, None)
 }
 
+/// Path-preserving counterpart to [`dispatch_editor_open_path`]. Native
+/// shell integrations use this form so valid non-UTF-8 filenames are never
+/// converted through a lossy command string before the editor opens them.
+pub fn dispatch_editor_open_path_buf(state: &mut AppState, path: &std::path::Path) -> bool {
+    dispatch_editor_open_path_buf_at(state, path.to_path_buf(), None)
+}
+
 /// The editor palette for the active theme. Editor grids never pass
 /// through the terminal palette remap, so a pane resolves real colours
 /// once here and again on every theme change.
@@ -6664,14 +6844,21 @@ pub fn dispatch_editor_open_at(
     raw_path: &str,
     line: Option<(usize, Option<usize>)>,
 ) -> bool {
-    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
-
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         push_error_toast(state, "Open file: no path given");
         return true;
     }
-    let path = std::path::PathBuf::from(trimmed);
+    dispatch_editor_open_path_buf_at(state, std::path::PathBuf::from(trimmed), line)
+}
+
+fn dispatch_editor_open_path_buf_at(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    line: Option<(usize, Option<usize>)>,
+) -> bool {
+    use crate::editor::telemetry::{now_unix_ms, record_editor_event, EditorEventRecord};
+
     let path_str = path.to_string_lossy().into_owned();
 
     if let Some(existing) = find_editor_pane_for_path(state, &path) {
@@ -8737,7 +8924,7 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             persist_layout_if(dispatch_tab_reorder(state, other), state)
         }
         "explorer.copy_relative" | "explorer.copy_absolute" => {
-            let Some(CtxMenuTarget::Explorer { path, root }) =
+            let Some(CtxMenuTarget::Explorer { path, root, .. }) =
                 state.ctx_menu.as_ref().map(|menu| &menu.target)
             else {
                 return false;
@@ -14145,6 +14332,7 @@ pub(crate) mod tests {
                 target: CtxMenuTarget::Explorer {
                     path: path.clone(),
                     root: root.clone(),
+                    directory: false,
                 },
             });
             assert!(dispatch(&mut state, command));
@@ -19070,6 +19258,80 @@ pub(crate) mod tests {
         let old_count = state.workspaces.len();
         mutate_add_workspace_with_path(&mut state, Some(PathBuf::from("/tmp/test")));
         assert_eq!(state.active_workspace, old_count);
+    }
+
+    #[test]
+    fn desktop_folder_launch_seeds_an_isolated_unspawned_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "terminal-manager-desktop-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test folder");
+
+        let mut state = seed_state();
+        let pane_id = state.next_id.max(1);
+        let previous_workspace_count = state.workspaces.len();
+        assert!(prepare_external_workspace_for_launch(
+            &mut state,
+            root.clone()
+        ));
+
+        assert_eq!(state.workspaces.len(), previous_workspace_count + 1);
+        assert_eq!(state.active_workspace, previous_workspace_count);
+        assert_eq!(
+            state.workspaces[state.active_workspace].path.as_deref(),
+            Some(root.as_path())
+        );
+        assert_eq!(state.active_pane, PaneId(pane_id));
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].len(), 1);
+        assert!(
+            state.pty_manager.spawn_cwd(pane_id).is_none(),
+            "the normal eager startup path, not preparation, owns the first PTY spawn"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn explorer_open_with_terminal_manager_routes_text_and_patch_files() {
+        let root = std::env::temp_dir().join(format!(
+            "terminal-manager-explorer-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test folder");
+        let text = root.join("notes.md");
+        let patch = root.join("fix.patch");
+        std::fs::write(&text, "# notes\n").expect("write text fixture");
+        std::fs::write(&patch, "diff --git a/a b/a\n").expect("write patch fixture");
+
+        let mut text_state = test_state();
+        assert!(open_file_with_terminal_manager(
+            &mut text_state,
+            text.clone()
+        ));
+        assert_eq!(text_state.editors.len(), 1);
+        assert!(text_state.diff_review.is_none());
+
+        let mut patch_state = test_state();
+        assert!(open_file_with_terminal_manager(
+            &mut patch_state,
+            patch.clone()
+        ));
+        let review = patch_state.diff_review.as_ref().expect("patch review");
+        assert_eq!(review.mode, "patch");
+        assert_eq!(review.patch_path.as_ref(), Some(&patch));
+
+        std::fs::remove_dir_all(root).expect("remove test folder");
     }
 
     #[test]
