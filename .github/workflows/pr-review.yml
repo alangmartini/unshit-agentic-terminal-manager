@@ -301,12 +301,15 @@ jobs:
             cargo install cargo-llvm-cov --locked
           }
 
+      # One test thread, same reason as the rust-checks job: the parallel
+      # teardown STATUS_HEAP_CORRUPTION abort hits the instrumented test
+      # binary too, and it took every coverage run on main down with it.
       - name: Generate coverage report
         shell: powershell
         run: |
           $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
           $env:PATH = "$toolchainBin;$env:CARGO_HOME\bin;$env:PATH"
-          cargo llvm-cov --all-features --lcov --output-path lcov.info
+          cargo llvm-cov --all-features --lcov --output-path lcov.info -- --test-threads=1
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
