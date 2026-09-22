@@ -41,7 +41,9 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::{GpuContext, PrewarmStatus, RenderOutcome, WindowGpuPreferences};
+use unshit_renderer::gpu::{
+    GpuContext, PrewarmStatus, RenderOutcome, RenderTierPreference, WindowGpuPreferences,
+};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -49,9 +51,10 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+#[cfg(target_os = "macos")]
+use winit::window::ImeRequest;
 use winit::window::{
-    ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, ResizeDirection, Window,
-    WindowId,
+    ImeCapabilities, ImeEnableRequest, ImeRequestData, ResizeDirection, Window, WindowId,
 };
 
 /// Whether the platform's primary application modifier is held.
@@ -436,6 +439,7 @@ pub struct GlyphAtlasRecoveryEvent {
 
 pub struct App {
     config: AppConfig,
+    render_tier_preference: RenderTierPreference,
     tree_fn: Box<dyn Fn() -> ElementTree>,
     state: Option<AppState>,
     event_tx: flume::Sender<ExternalEvent>,
@@ -1001,23 +1005,32 @@ fn configured_pacing_mode(
 ///
 /// Resolves the same preferences the real request will, by the same route: a
 /// prewarm that picked different backends would be discarded on arrival, and
-/// the enumeration it paid for is the expensive part.
+/// the enumeration it paid for is the expensive part. The same
+/// `render_tier_preference` must be supplied through
+/// [`App::set_render_tier_preference`] before [`App::run`] so the real window
+/// context selects the same adapter tier as the prewarm request.
 ///
 /// Safe to call unconditionally. It is a no-op off Windows, under a forced
 /// software renderer, and in any process that never opens a window.
-pub fn prewarm_window_gpu() {
+pub fn prewarm_window_gpu(render_tier_preference: RenderTierPreference) {
     let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
-    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported));
+    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported, render_tier_preference));
 }
 
-fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
+fn window_gpu_preferences(
+    compositor_clock_supported: bool,
+    render_tier_preference: RenderTierPreference,
+) -> WindowGpuPreferences {
     #[cfg(target_os = "windows")]
     if compositor_clock_supported {
-        return WindowGpuPreferences::compositor_mailbox();
+        return WindowGpuPreferences {
+            render_tier: render_tier_preference,
+            ..WindowGpuPreferences::compositor_mailbox()
+        };
     }
 
     let _ = compositor_clock_supported;
-    WindowGpuPreferences::default()
+    WindowGpuPreferences { render_tier: render_tier_preference, ..WindowGpuPreferences::default() }
 }
 
 /// Display period to assume when the platform cannot report a refresh
@@ -2668,6 +2681,7 @@ impl App {
         let grid_patches = Arc::new(GridPatchStore::default());
         Self {
             config,
+            render_tier_preference: RenderTierPreference::Auto,
             tree_fn: Box::new(tree_fn),
             state: None,
             // Placeholder interval: the display's refresh rate is not
@@ -2696,6 +2710,15 @@ impl App {
             #[cfg(feature = "async")]
             subscription_manager: None,
         }
+    }
+
+    /// Set the adapter tier used when the first window's renderer starts.
+    ///
+    /// Call this before [`run`](Self::run). It is startup-only: changing the
+    /// preference after a window has been created cannot replace its live
+    /// renderer.
+    pub fn set_render_tier_preference(&mut self, preference: RenderTierPreference) {
+        self.render_tier_preference = preference;
     }
 
     /// Returns an [`EventSink`] that can be moved into other threads to push
@@ -3933,7 +3956,8 @@ impl ApplicationHandler for AppHandler {
         // during that wait instead of after it. The GPU is collected in
         // `finish_startup`, once there is nothing left to do without it.
         let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
-        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+        let gpu_preferences =
+            window_gpu_preferences(compositor_clock_supported, self.app.render_tier_preference);
 
         // If a css_path is set, read that file into config.css so it acts as
         // the initial stylesheet (both here and in the hot-reload watcher).
@@ -6697,6 +6721,7 @@ fn clear_input_selection_on_blur(state: &mut AppState, node: NodeId) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn dead_key_ime_enable_request() -> Option<ImeEnableRequest> {
     ImeEnableRequest::new(ImeCapabilities::new(), ImeRequestData::default())
 }
