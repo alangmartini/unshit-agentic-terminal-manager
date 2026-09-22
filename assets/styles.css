@@ -85,14 +85,9 @@
   --accent-a70:  rgba(232, 185, 85, 0.7);
   --accent-a72:  rgba(232, 185, 85, 0.72);
 
-  /* Command-palette accent tokens. These MUST live in :root: the framework
-   * resolves var() at stylesheet-parse time and only collects custom
-   * properties declared on :root/* (see unshit-core style/parse.rs
-   * extract_custom_properties). Declaring them on .cp-scrim left every
-   * `var(--cp-*)` consumer (active-row background/rail, row padding, prompt
-   * color, keycap accents) unresolved, so those declarations were dropped. */
+  /* Shared command-palette aliases resolve against the active theme. */
   --cp-accent:        var(--amber-300);
-  --cp-accent-soft:   rgba(212, 163, 72, 0.12);
+  --cp-accent-soft:   var(--accent-a12);
   --cp-accent-bright: var(--amber-100);
   --cp-glow:          0.55;
   --cp-row-py:        4px;
@@ -196,6 +191,37 @@
 .app.theme-catppuccin {
   background: #1e1e2e;
   color: #cdd6f4;
+  --bg-void:       #11111b;
+  --bg-base:       #1e1e2e;
+  --bg-subtle:     #181825;
+  --bg-elevated:   #313244;
+  --bg-hover:      #45475a;
+  --bg-selected:   #585b70;
+  --bg-overlay:    rgba(17, 17, 27, 0.72);
+  --border-hair:    #232238;
+  --border-soft:    #313244;
+  --border-default: #45475a;
+  --border-strong:  #585b70;
+  --border-focus:   #cba6f7;
+  --fg-primary:   #cdd6f4;
+  --fg-secondary: #bac2de;
+  --fg-tertiary:  #a6adc8;
+  --fg-muted:     #6c7086;
+  --fg-ghost:     #45475a;
+  --amber-50:  #f5e0dc;
+  --amber-100: #b4befe;
+  --amber-200: #cba6f7;
+  --amber-300: #cba6f7;
+  --amber-400: #b4befe;
+  --amber-500: #6c7086;
+  --amber-600: #45475a;
+  --ember:  #fab387;
+  --sage:   #a6e3a1;
+  --rust:   #f38ba8;
+  --azure:  #89dceb;
+  --violet: #cba6f7;
+  --glow-sage:    0 0 6px rgba(166, 227, 161, 0.45);
+  --glow-rust:    0 0 6px rgba(243, 139, 168, 0.45);
   --glow-amber:   0 0 18px rgba(203, 166, 247, 0.18);
   --glow-amber-s: 0 0 8px rgba(203, 166, 247, 0.25);
   --accent-a015: rgba(203, 166, 247, 0.015);
@@ -256,6 +282,8 @@
   --violet: #bb9af7;
   --glow-amber:   0 0 18px rgba(122, 162, 247, 0.18);
   --glow-amber-s: 0 0 8px rgba(122, 162, 247, 0.25);
+  --glow-sage: 0 0 6px rgba(158, 206, 106, 0.45);
+  --glow-rust: 0 0 6px rgba(247, 118, 142, 0.45);
   --accent-a015: rgba(122, 162, 247, 0.015);
   --accent-a06:  rgba(122, 162, 247, 0.06);
   --accent-a08:  rgba(122, 162, 247, 0.08);
@@ -314,6 +342,8 @@
   --violet: #b48ead;
   --glow-amber:   0 0 18px rgba(136, 192, 208, 0.18);
   --glow-amber-s: 0 0 8px rgba(136, 192, 208, 0.25);
+  --glow-sage: 0 0 6px rgba(163, 190, 140, 0.45);
+  --glow-rust: 0 0 6px rgba(191, 97, 106, 0.45);
   --accent-a015: rgba(136, 192, 208, 0.015);
   --accent-a06:  rgba(136, 192, 208, 0.06);
   --accent-a08:  rgba(136, 192, 208, 0.08);
@@ -372,6 +402,8 @@
   --violet: #bd93f9;
   --glow-amber:   0 0 18px rgba(189, 147, 249, 0.18);
   --glow-amber-s: 0 0 8px rgba(189, 147, 249, 0.25);
+  --glow-sage: 0 0 6px rgba(80, 250, 123, 0.45);
+  --glow-rust: 0 0 6px rgba(255, 85, 85, 0.45);
   --accent-a015: rgba(189, 147, 249, 0.015);
   --accent-a06:  rgba(189, 147, 249, 0.06);
   --accent-a08:  rgba(189, 147, 249, 0.08);
@@ -430,6 +462,8 @@
   --violet: #d699b6;
   --glow-amber:   0 0 18px rgba(167, 192, 128, 0.18);
   --glow-amber-s: 0 0 8px rgba(167, 192, 128, 0.25);
+  --glow-sage: 0 0 6px rgba(167, 192, 128, 0.45);
+  --glow-rust: 0 0 6px rgba(230, 126, 128, 0.45);
   --accent-a015: rgba(167, 192, 128, 0.015);
   --accent-a06:  rgba(167, 192, 128, 0.06);
   --accent-a08:  rgba(167, 192, 128, 0.08);
@@ -488,6 +522,8 @@
   --violet: #c4a7e7;
   --glow-amber:   0 0 18px rgba(196, 167, 231, 0.18);
   --glow-amber-s: 0 0 8px rgba(196, 167, 231, 0.25);
+  --glow-sage: 0 0 6px rgba(156, 207, 216, 0.45);
+  --glow-rust: 0 0 6px rgba(235, 111, 146, 0.45);
   --accent-a015: rgba(196, 167, 231, 0.015);
   --accent-a06:  rgba(196, 167, 231, 0.06);
   --accent-a08:  rgba(196, 167, 231, 0.08);
@@ -546,6 +582,25 @@
   --violet: #d3869b;
   --glow-amber:   0 0 18px rgba(250, 189, 47, 0.18);
   --glow-amber-s: 0 0 8px rgba(250, 189, 47, 0.25);
+  --glow-sage: 0 0 6px rgba(184, 187, 38, 0.45);
+  --glow-rust: 0 0 6px rgba(251, 73, 52, 0.45);
+  --accent-a015: rgba(250, 189, 47, 0.015);
+  --accent-a06: rgba(250, 189, 47, 0.06);
+  --accent-a08: rgba(250, 189, 47, 0.08);
+  --accent-a10: rgba(250, 189, 47, 0.1);
+  --accent-a12: rgba(250, 189, 47, 0.12);
+  --accent-a16: rgba(250, 189, 47, 0.16);
+  --accent-a18: rgba(250, 189, 47, 0.18);
+  --accent-a20: rgba(250, 189, 47, 0.2);
+  --accent-a24: rgba(250, 189, 47, 0.24);
+  --accent-a25: rgba(250, 189, 47, 0.25);
+  --accent-a35: rgba(250, 189, 47, 0.35);
+  --accent-a40: rgba(250, 189, 47, 0.4);
+  --accent-a45: rgba(250, 189, 47, 0.45);
+  --accent-a50: rgba(250, 189, 47, 0.5);
+  --accent-a60: rgba(250, 189, 47, 0.6);
+  --accent-a70: rgba(250, 189, 47, 0.7);
+  --accent-a72: rgba(250, 189, 47, 0.72);
   --theme-chip-accent: #fabd2f;
   --theme-chip-preview-bg: #3c3836;
   --theme-chip-border: #504945;
@@ -587,6 +642,25 @@
   --violet: #957fb8;
   --glow-amber:   0 0 18px rgba(126, 156, 216, 0.18);
   --glow-amber-s: 0 0 8px rgba(126, 156, 216, 0.25);
+  --glow-sage: 0 0 6px rgba(152, 187, 108, 0.45);
+  --glow-rust: 0 0 6px rgba(228, 104, 118, 0.45);
+  --accent-a015: rgba(126, 156, 216, 0.015);
+  --accent-a06: rgba(126, 156, 216, 0.06);
+  --accent-a08: rgba(126, 156, 216, 0.08);
+  --accent-a10: rgba(126, 156, 216, 0.1);
+  --accent-a12: rgba(126, 156, 216, 0.12);
+  --accent-a16: rgba(126, 156, 216, 0.16);
+  --accent-a18: rgba(126, 156, 216, 0.18);
+  --accent-a20: rgba(126, 156, 216, 0.2);
+  --accent-a24: rgba(126, 156, 216, 0.24);
+  --accent-a25: rgba(126, 156, 216, 0.25);
+  --accent-a35: rgba(126, 156, 216, 0.35);
+  --accent-a40: rgba(126, 156, 216, 0.4);
+  --accent-a45: rgba(126, 156, 216, 0.45);
+  --accent-a50: rgba(126, 156, 216, 0.5);
+  --accent-a60: rgba(126, 156, 216, 0.6);
+  --accent-a70: rgba(126, 156, 216, 0.7);
+  --accent-a72: rgba(126, 156, 216, 0.72);
   --theme-chip-accent: #7e9cd8;
   --theme-chip-preview-bg: #363646;
   --theme-chip-border: #54546d;
@@ -628,6 +702,25 @@
   --violet: #957fb8;
   --glow-amber:   0 0 18px rgba(125, 211, 252, 0.18);
   --glow-amber-s: 0 0 8px rgba(125, 211, 252, 0.25);
+  --glow-sage: 0 0 6px rgba(152, 187, 108, 0.45);
+  --glow-rust: 0 0 6px rgba(228, 104, 118, 0.45);
+  --accent-a015: rgba(125, 211, 252, 0.015);
+  --accent-a06: rgba(125, 211, 252, 0.06);
+  --accent-a08: rgba(125, 211, 252, 0.08);
+  --accent-a10: rgba(125, 211, 252, 0.1);
+  --accent-a12: rgba(125, 211, 252, 0.12);
+  --accent-a16: rgba(125, 211, 252, 0.16);
+  --accent-a18: rgba(125, 211, 252, 0.18);
+  --accent-a20: rgba(125, 211, 252, 0.2);
+  --accent-a24: rgba(125, 211, 252, 0.24);
+  --accent-a25: rgba(125, 211, 252, 0.25);
+  --accent-a35: rgba(125, 211, 252, 0.35);
+  --accent-a40: rgba(125, 211, 252, 0.4);
+  --accent-a45: rgba(125, 211, 252, 0.45);
+  --accent-a50: rgba(125, 211, 252, 0.5);
+  --accent-a60: rgba(125, 211, 252, 0.6);
+  --accent-a70: rgba(125, 211, 252, 0.7);
+  --accent-a72: rgba(125, 211, 252, 0.72);
   --theme-chip-accent: #7dd3fc;
   --theme-chip-preview-bg: #16202c;
   --theme-chip-border: #26384b;
