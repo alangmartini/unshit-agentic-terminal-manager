@@ -54,6 +54,7 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let _connection = registry.register_connection().await?;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = read_half;
     let writer = Arc::new(Mutex::new(write_half));
@@ -79,7 +80,12 @@ where
                         let _ = shutdown.send(());
                         break Ok(());
                     }
-                    Err(error) => break Err(error),
+                    Err(error) => {
+                        // A lost acknowledgement must not strand a registry
+                        // that has already stopped admitting sessions.
+                        if registry.is_stopping() { let _ = shutdown.send(()); }
+                        break Err(error);
+                    }
                 }
             }
         }
@@ -115,48 +121,49 @@ where
                     id,
                     server_version: DAEMON_VERSION.to_string(),
                     protocol_version: PROTOCOL_VERSION,
+                    executable: std::env::current_exe()
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned()),
                 },
             )
             .await?;
             Ok(PostRequest::Continue)
         }
         Request::Shutdown { id, force } => {
-            if force {
-                let killed = registry.kill_all().await;
-                if !killed.is_empty() {
-                    log::info!(
-                        "force shutdown: killed {} session(s): {killed:?}",
-                        killed.len()
-                    );
-                }
-            }
-            let alive = registry.len().await;
-            if alive > 0 {
-                // Slice 3 policy: refuse shutdown while this connection
-                // still owns live sessions. Slice 5 reworks this gate
-                // against the global registry instead of per-connection.
-                send_response(
-                    &writer,
-                    Response::ShutdownAck {
-                        id,
-                        ok: false,
-                        reason: Some(format!("{alive} sessions alive")),
-                    },
-                )
-                .await?;
-                Ok(PostRequest::Continue)
+            let result = registry.begin_shutdown(force).await;
+            let ok = result.is_ok();
+            send_response(
+                &writer,
+                Response::ShutdownAck {
+                    id,
+                    ok,
+                    reason: result.err(),
+                },
+            )
+            .await?;
+            Ok(if ok {
+                PostRequest::ShutdownRequested
             } else {
-                send_response(
-                    &writer,
-                    Response::ShutdownAck {
-                        id,
-                        ok: true,
-                        reason: None,
-                    },
-                )
-                .await?;
-                Ok(PostRequest::ShutdownRequested)
-            }
+                PostRequest::Continue
+            })
+        }
+        Request::RetireIfIdle { id } => {
+            let result = registry.begin_retirement().await;
+            let ok = result.is_ok();
+            send_response(
+                &writer,
+                Response::ShutdownAck {
+                    id,
+                    ok,
+                    reason: result.err(),
+                },
+            )
+            .await?;
+            Ok(if ok {
+                PostRequest::ShutdownRequested
+            } else {
+                PostRequest::Continue
+            })
         }
         Request::SpawnSession {
             id,
