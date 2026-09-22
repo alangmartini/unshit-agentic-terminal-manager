@@ -469,6 +469,10 @@ fn retryable_startup_error(error: &io::Error) -> bool {
                 | io::ErrorKind::UnexpectedEof
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::ConnectionReset
+                // macOS reports a Unix socket whose peer closed before any
+                // byte was exchanged as ENOTCONN (57) on the first write or
+                // read, where Linux and Windows report a reset or EOF.
+                | io::ErrorKind::NotConnected
         )
 }
 
