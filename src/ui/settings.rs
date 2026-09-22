@@ -1831,11 +1831,69 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
             });
         });
 
-    section_shell("notifications").with_child(setting_row(
-        "test notification",
-        "sends a notification targeted at the active workspace and terminal",
-        test_notification,
-    ))
+    let install_shared = shared.clone();
+    let install_hooks = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-agent-notification-hooks-install")
+        .with_text("install hooks")
+        .on_click(move || {
+            mutate_with(&install_shared, |st| {
+                dispatch(st, "notifications.hooks.install");
+            });
+        });
+
+    let remove_shared = shared.clone();
+    let remove_hooks = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-agent-notification-hooks-remove")
+        .with_text("remove hooks")
+        .on_click(move || {
+            mutate_with(&remove_shared, |st| {
+                dispatch(st, "notifications.hooks.remove");
+            });
+        });
+
+    let hook_controls = ElementDef::new(Tag::Div)
+        .with_class("agent-notification-controls")
+        .with_child(install_hooks)
+        .with_child(remove_hooks);
+
+    let other_agents = ElementDef::new(Tag::Div)
+        .with_class("notification-provider-note")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-supported")
+                .with_text("supported: Claude Code, Codex"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-manual")
+                .with_text("manual: Gemini, OpenCode, Aider, Copilot, OpenRouter-backed agents"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-command")
+                .with_text("terminal-manager notify --title 'Agent needs attention' --text '...'"),
+        );
+
+    section_shell("notifications")
+        .with_child(setting_row(
+            "test notification",
+            "sends a notification targeted at the active workspace and terminal",
+            test_notification,
+        ))
+        .with_child(setting_row(
+            "agent notification hooks",
+            "Claude Code uses Stop and Notification; Codex uses Stop and PermissionRequest. Removal touches only Terminal Manager-marked entries.",
+            hook_controls,
+        ))
+        .with_child(setting_row(
+            "other agent harnesses",
+            "There is no common OpenRouter/Gemini/OpenCode/Aider/Copilot hook contract. Call the notify command from the harness when it finishes or needs input.",
+            other_agents,
+        ))
 }
 
 /// Settings ▸ Updates: current version + check button, the newer release
@@ -4998,6 +5056,31 @@ mod tests {
                 pane_id: state.active_pane.0,
             })
         );
+    }
+
+    #[test]
+    fn notifications_section_installs_and_removes_agent_hooks() {
+        let shared = make_shared();
+        let el = build_notifications_section(&shared);
+        let install =
+            find_by_id(&el, "settings-agent-notification-hooks-install").expect("install");
+        let remove = find_by_id(&el, "settings-agent-notification-hooks-remove").expect("remove");
+
+        (install.on_click.as_ref().unwrap())();
+        assert!(shared
+            .lock()
+            .unwrap()
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("notification hooks are installed")));
+
+        (remove.on_click.as_ref().unwrap())();
+        assert!(shared
+            .lock()
+            .unwrap()
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("notification hooks were removed")));
     }
 
     // -- build_modal_footer -----------------------------------------------------

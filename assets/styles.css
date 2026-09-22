@@ -2014,6 +2014,11 @@ input, select {
   50% { opacity: 0.4; }
 }
 
+@keyframes agent-attention {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
 .subtab.disabled {
   opacity: 0.35;
   cursor: default;
@@ -2059,6 +2064,33 @@ input, select {
   background: var(--bg-elevated);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300), inset 0 0 12px var(--accent-a06);
+}
+
+.terminal-entry.needs-attention::before,
+.tab.needs-attention::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--amber-300);
+  box-shadow: var(--glow-amber);
+  animation: agent-attention 1.1s ease-in-out infinite;
+}
+
+.terminal-entry.needs-attention .terminal-entry-name {
+  color: var(--amber-100);
+}
+
+.terminal-entry.needs-attention {
+  position: relative;
+}
+
+.tab.needs-attention .tab-status {
+  background: var(--amber-300);
+  box-shadow: var(--glow-amber);
+  animation: agent-attention 1.1s ease-in-out infinite;
 }
 
 /* Two-class selector: must out-rank `.sb-row .sb-label`'s `flex: 1`
@@ -6386,6 +6418,34 @@ body.dragging-pane {
 .login-startup-remove:focus-visible {
   color: var(--rust);
   border-color: var(--rust);
+}
+
+.agent-notification-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.notification-provider-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-1);
+  max-width: 420px;
+  color: var(--fg-muted);
+  font: var(--type-meta);
+  text-align: right;
+}
+
+.notification-provider-note .provider-command {
+  color: var(--fg-secondary);
+  background: var(--bg-void);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-sm);
+  padding: var(--sp-1) var(--sp-2);
+  font-family: var(--font-mono);
+  max-width: 100%;
 }
 
 .preview-tile {
