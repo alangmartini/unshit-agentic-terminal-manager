@@ -44,7 +44,7 @@ artifacts built from that revision. Use the same application version on both
 platforms. The existing `v0.5.0` tag remains the original release; integrating
 macOS support does not move or overwrite it.
 
-Build a macOS bundle with `scripts/package-macos.sh`. Use the Windows build and installer instructions in `README.md` for Windows
+Build a macOS bundle with `scripts/package-macos.sh`, then create the drag-to-Applications DMG with `scripts/create-macos-dmg.sh`. Use the Windows build and installer instructions in `README.md` for Windows
 artifacts. Development CI artifacts are not a signed or notarized
 public macOS release. Publish a new release only after its platform checks and
 packaging checks pass.
