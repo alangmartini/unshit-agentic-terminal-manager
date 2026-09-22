@@ -87,10 +87,9 @@ pub enum NotificationIpcRequest {
 /// tagged native representation only when necessary. That preserves
 /// Finder/Explorer callback paths when forwarding to a warm UI.
 mod external_open_path {
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
-    #[cfg(unix)]
-    use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     #[cfg(windows)]
@@ -396,6 +395,24 @@ pub fn forward_external_open_target(
             path: target.path().to_path_buf(),
         },
     ))
+}
+
+/// Top-level command names this module's CLI parser owns. `launch_target`'s
+/// raw-positional Finder/Explorer fallback consults this so a path that
+/// happens to collide with a future command name still reaches this parser
+/// instead of being misread as a file to open.
+pub(crate) fn is_top_level_cli_command(name: &str) -> bool {
+    matches!(
+        name,
+        "flow"
+            | "notify"
+            | "--notify"
+            | "activate"
+            | "--activate"
+            | "session-hook"
+            | "agent"
+            | "new-agent"
+    )
 }
 
 pub fn parse_cli_args<I, S, F>(args: I, get_env: F) -> Result<Option<CliCommand>, String>

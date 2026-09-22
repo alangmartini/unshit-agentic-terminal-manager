@@ -1,8 +1,8 @@
 use unshit::core::element::*;
 
 use crate::state::{
-    mutate_with, spawn_workspace_folder_picker, CtxMenu, SharedState, Subtab, SubtabKind,
-    TerminalEntry, UiSnapshot, Workspace,
+    mutate_with, spawn_workspace_folder_picker, CtxMenu, FileEntry, SharedState, Subtab,
+    SubtabKind, TerminalEntry, UiSnapshot, Workspace,
 };
 use crate::ui::icons::*;
 
@@ -174,7 +174,10 @@ fn build_workspace_with_attention(
                 .with_class("workspace-meta")
                 .with_class("ws-meta")
                 .with_text(
-                    (workspace.terminal_entries.len() + workspace.agent_entries.len()).to_string(),
+                    (workspace.terminal_entries.len()
+                        + workspace.agent_entries.len()
+                        + workspace.file_entries.len())
+                    .to_string(),
                 ),
         );
 
@@ -189,35 +192,49 @@ fn build_workspace_with_attention(
             shared,
         ));
         // Each pane list unfolds under its own subtab: `terminals` holds
-        // plain shells, `agents` the panes running an agent CLI.
-        let (expanded, list, list_class) = match SubtabKind::parse(&subtab.label) {
-            Some(SubtabKind::Terminals) => (
-                workspace.terminals_expanded,
+        // plain shells, `agents` holds agent CLIs, and `files` holds real
+        // editor panes opened from the explorer.
+        let entries = match SubtabKind::parse(&subtab.label) {
+            Some(SubtabKind::Terminals) if workspace.terminals_expanded => build_entry_list(
                 &workspace.terminal_entries,
                 "terminal-entries",
+                |e, is_last| {
+                    build_terminal_entry_with_attention(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        attention_pane_ids.contains(&e.pane_id.0),
+                        shared,
+                    )
+                },
             ),
-            Some(SubtabKind::Agents) => (
-                workspace.agents_expanded,
-                &workspace.agent_entries,
-                "agent-entries",
-            ),
-            None => continue,
-        };
-        if expanded && !list.is_empty() {
-            let mut entries = ElementDef::new(Tag::Div)
-                .with_class("terminal-entries")
-                .with_class(list_class);
-            let count = list.len();
-            for (t_idx, entry) in list.iter().enumerate() {
-                entries = entries.with_child(build_terminal_entry_with_attention(
-                    workspace_index,
-                    entry,
-                    t_idx == count - 1,
-                    entry.pane_id == active_pane,
-                    attention_pane_ids.contains(&entry.pane_id.0),
-                    shared,
-                ));
+            Some(SubtabKind::Agents) if workspace.agents_expanded => {
+                build_entry_list(&workspace.agent_entries, "agent-entries", |e, is_last| {
+                    build_terminal_entry_with_attention(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        attention_pane_ids.contains(&e.pane_id.0),
+                        shared,
+                    )
+                })
             }
+            Some(SubtabKind::Files) if workspace.files_expanded => {
+                build_entry_list(&workspace.file_entries, "file-entries", |e, is_last| {
+                    build_file_entry(
+                        workspace_index,
+                        e,
+                        is_last,
+                        e.pane_id == active_pane,
+                        shared,
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some(entries) = entries {
             body = body.with_child(entries);
         }
     }
@@ -261,40 +278,42 @@ fn build_subtab(
                             ws.terminals_expanded = !ws.terminals_expanded;
                         }
                         SubtabKind::Agents => ws.agents_expanded = !ws.agents_expanded,
+                        SubtabKind::Files => ws.files_expanded = !ws.files_expanded,
                     }
                 }
             });
         });
-        // Right-click: the scoped menu ("New terminal ›" / "New agent ›"
-        // plus the matching kill action). Toggles closed when the menu
-        // is already open for this very subtab, like the workspace row.
-        let ctx_shared = shared.clone();
-        btn = btn.on_context_menu(move |x, y| {
-            mutate_with(&ctx_shared, |st| {
-                let same = matches!(
-                    st.ctx_menu.as_ref().map(|m| &m.target),
-                    Some(crate::state::CtxMenuTarget::Subtab { idx, kind: k })
-                        if *idx == wi && *k == kind
-                );
-                if same {
-                    st.ctx_menu = None;
-                } else {
-                    let sf = st.scale_factor;
-                    crate::renderer_telemetry::record_ctx_menu_open(
-                        "subtab",
-                        x / sf,
-                        y / sf,
-                        st.window_width / sf,
-                        st.window_height / sf,
+        if kind.has_ctx_menu() {
+            // Right-click: the scoped menu ("New terminal ›" / "New agent ›"
+            // plus the matching kill action).
+            let ctx_shared = shared.clone();
+            btn = btn.on_context_menu(move |x, y| {
+                mutate_with(&ctx_shared, |st| {
+                    let same = matches!(
+                        st.ctx_menu.as_ref().map(|m| &m.target),
+                        Some(crate::state::CtxMenuTarget::Subtab { idx, kind: k })
+                            if *idx == wi && *k == kind
                     );
-                    st.ctx_menu = Some(CtxMenu {
-                        x: x / sf,
-                        y: y / sf,
-                        target: crate::state::CtxMenuTarget::Subtab { idx: wi, kind },
-                    });
-                }
+                    if same {
+                        st.ctx_menu = None;
+                    } else {
+                        let sf = st.scale_factor;
+                        crate::renderer_telemetry::record_ctx_menu_open(
+                            "subtab",
+                            x / sf,
+                            y / sf,
+                            st.window_width / sf,
+                            st.window_height / sf,
+                        );
+                        st.ctx_menu = Some(CtxMenu {
+                            x: x / sf,
+                            y: y / sf,
+                            target: crate::state::CtxMenuTarget::Subtab { idx: wi, kind },
+                        });
+                    }
+                });
             });
-        });
+        }
     } else if !subtab.disabled {
         let s = shared.clone();
         let (wi, si) = (workspace_index, subtab_index);
@@ -314,6 +333,7 @@ fn build_subtab(
         let expanded = match kind {
             SubtabKind::Terminals => workspace.terminals_expanded,
             SubtabKind::Agents => workspace.agents_expanded,
+            SubtabKind::Files => workspace.files_expanded,
         };
         let chevron = if expanded { "\u{25BE}" } else { "\u{25B8}" };
         btn = btn.with_child(
@@ -354,6 +374,75 @@ fn build_subtab(
     }
 
     btn
+}
+
+/// Wraps a non-empty pane list in its `.terminal-entries` container,
+/// building each row via `build_row(entry, is_last)`. Folds to `None` when
+/// `entries` is empty so the caller skips the wrapper entirely.
+fn build_entry_list<T>(
+    entries: &[T],
+    list_class: &'static str,
+    build_row: impl Fn(&T, bool) -> ElementDef,
+) -> Option<ElementDef> {
+    if entries.is_empty() {
+        return None;
+    }
+    let count = entries.len();
+    let mut list = ElementDef::new(Tag::Div)
+        .with_class("terminal-entries")
+        .with_class(list_class);
+    for (index, entry) in entries.iter().enumerate() {
+        list = list.with_child(build_row(entry, index == count - 1));
+    }
+    Some(list)
+}
+
+fn build_file_entry(
+    workspace_index: usize,
+    entry: &FileEntry,
+    is_last: bool,
+    is_active: bool,
+    shared: &SharedState,
+) -> ElementDef {
+    let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
+    let click_shared = shared.clone();
+    let pane_id = entry.pane_id;
+    let mut row = ElementDef::new(Tag::Div)
+        .with_class("terminal-entry")
+        .with_class("file-entry")
+        .with_class("sb-row")
+        .with_tab_index(0)
+        .on_click(move || {
+            mutate_with(&click_shared, |st| {
+                crate::state::dispatch(
+                    st,
+                    &format!("terminal.focus:{workspace_index}:{}", pane_id.0),
+                );
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("tree-glyph")
+                .with_text(glyph),
+        )
+        .with_child(svg_icon(icon_file()).with_class("entry-file-ic"))
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("file-entry-name")
+                .with_class("sb-label")
+                .with_text(entry.name.clone()),
+        );
+    if entry.dirty {
+        row = row.with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("file-entry-dirty")
+                .with_text("●"),
+        );
+    }
+    if is_active {
+        row = row.with_class("active");
+    }
+    row
 }
 
 #[cfg(test)]
@@ -1075,6 +1164,9 @@ fn build_subtab_ctx_menu(
     installed: &[std::path::PathBuf],
     agents: &[&crate::agents::AgentProfile],
 ) -> ElementDef {
+    if !kind.has_ctx_menu() {
+        return ElementDef::new(Tag::Div).with_class("ctx-menu-hidden");
+    }
     let ws = snap.workspaces.get(ws_idx);
     let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
     let current_shell = ws.map(|w| w.shell.clone()).unwrap_or_default();
@@ -1106,6 +1198,7 @@ fn build_subtab_ctx_menu(
                 format!("workspace.request_kill_agents:{ws_idx}"),
             ),
         ),
+        SubtabKind::Files => unreachable!("files subtabs do not have a context menu"),
     };
 
     let header = ElementDef::new(Tag::Div)
@@ -1322,6 +1415,8 @@ mod tests {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: vec![
                 Subtab {
                     label: "terminals".to_string(),
@@ -1339,6 +1434,15 @@ mod tests {
                     active: false,
                     disabled: false,
                     icon: None,
+                    tree_glyph: "\u{251C}",
+                },
+                Subtab {
+                    label: "files".to_string(),
+                    count: Some(0),
+                    pulse: false,
+                    active: false,
+                    disabled: false,
+                    icon: Some(SubtabIcon::Folder),
                     tree_glyph: "\u{2514}",
                 },
             ],
@@ -2059,7 +2163,7 @@ mod tests {
         let ws = make_workspace(2, false);
         let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         let body = find_by_class(&el, "workspace-body").unwrap();
-        assert_eq!(body.children.len(), 2);
+        assert_eq!(body.children.len(), 3);
     }
 
     #[test]
@@ -2908,6 +3012,25 @@ mod agents_tab_tests {
         (Arc::new(Mutex::new(state)), pane)
     }
 
+    fn shared_with_file_pane() -> (SharedState, std::path::PathBuf, u32) {
+        let mut state = seed_state();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tm-sidebar-open-files-{}-{nonce}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "sidebar fixture\n").expect("fixture file");
+        assert!(crate::state::dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane = state.active_pane.0;
+        (Arc::new(Mutex::new(state)), path, pane)
+    }
+
     #[test]
     fn workspace_body_lists_agent_panes_under_the_agents_subtab_only() {
         let (shared, agent_pane) = shared_with_agent_pane();
@@ -2944,6 +3067,51 @@ mod agents_tab_tests {
         let meta = find_by_class(&el, "ws-meta").expect("workspace meta");
         assert_eq!(text_recursive(meta).trim(), "2");
         let _ = agent_pane;
+    }
+
+    #[test]
+    fn workspace_body_lists_open_files_in_their_own_compact_group() {
+        let (shared, path, file_pane) = shared_with_file_pane();
+        {
+            let mut state = shared.lock().unwrap();
+            assert!(crate::state::dispatch(&mut state, "terminal.focus:0:1"));
+            state.editors.get_mut(&file_pane).unwrap().dirty = true;
+        }
+
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&snap, &shared);
+        let files_subtab = find_by_class(&el, "subtab-files").expect("files subtab row");
+        assert!(text_recursive(files_subtab).contains("files"));
+        let count = find_by_class(files_subtab, "subtab-count").expect("files count");
+        assert_eq!(text_recursive(count).trim(), "1");
+
+        let files = find_by_class(&el, "file-entries").expect("file entries list");
+        let mut rows = Vec::new();
+        find_all_by_class(files, "file-entry", &mut rows);
+        assert_eq!(rows.len(), 1);
+        assert!(find_by_class(rows[0], "entry-file-ic").is_some());
+        assert!(find_by_class(rows[0], "file-entry-dirty").is_some());
+        assert!(text_recursive(rows[0]).contains("tm-sidebar-open-files-"));
+
+        (rows[0].on_click.as_ref().expect("file row click"))();
+        assert_eq!(shared.lock().unwrap().active_pane.0, file_pane);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn collapsed_files_group_hides_rows_but_keeps_its_count() {
+        let (shared, path, _) = shared_with_file_pane();
+        shared.lock().unwrap().workspaces[0].files_expanded = false;
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&snap, &shared);
+        assert!(find_by_class(&el, "file-entries").is_none());
+        let files_subtab = find_by_class(&el, "subtab-files").expect("files subtab row");
+        let count = find_by_class(files_subtab, "subtab-count").expect("files count");
+        assert_eq!(text_recursive(count).trim(), "1");
+        let chevron = find_by_class(files_subtab, "subtab-chevron").expect("files chevron");
+        assert_eq!(text_recursive(chevron).trim(), "\u{25B8}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

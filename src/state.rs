@@ -206,16 +206,17 @@ pub enum CtxMenuTarget {
     /// This target carries extra debugging/export actions that should not
     /// appear on sidebar terminal rows.
     TabName { pane_id: u32 },
-    /// Menu opened on a workspace subtab row (`terminals` / `agents`).
-    /// Offers the matching "New ..." flyout and the scoped kill action.
+    /// Menu opened on a workspace subtab row. Terminal and agent subtabs
+    /// offer their matching "New ..." flyout and scoped kill action.
     Subtab { idx: usize, kind: SubtabKind },
 }
 
-/// The two pane lists a workspace shows in the sidebar.
+/// The compact pane lists a workspace shows in the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SubtabKind {
     Terminals,
     Agents,
+    Files,
 }
 
 impl SubtabKind {
@@ -224,6 +225,7 @@ impl SubtabKind {
         match self {
             Self::Terminals => "terminals",
             Self::Agents => "agents",
+            Self::Files => "files",
         }
     }
 
@@ -231,8 +233,16 @@ impl SubtabKind {
         match raw {
             "terminals" => Some(Self::Terminals),
             "agents" => Some(Self::Agents),
+            "files" => Some(Self::Files),
             _ => None,
         }
+    }
+
+    /// Terminal and agent subtabs offer the scoped "New ..." flyout and
+    /// kill action; files intentionally have no session menu, since editor
+    /// close/save semantics need their own dirty-buffer safeguards.
+    pub fn has_ctx_menu(self) -> bool {
+        self != Self::Files
     }
 }
 
@@ -759,6 +769,10 @@ pub enum ToggleKey {
     /// Look for a newer release a few seconds after launch and offer it
     /// once per version (Settings ▸ Updates). Defaults on; persisted.
     CheckUpdatesOnStartup,
+    /// Prefer the renderer's CPU/software adapter on the next app launch.
+    /// This is a compatibility escape hatch for machines with unreliable
+    /// hardware graphics drivers, so it defaults off and is persisted.
+    ForceSoftwareRenderer,
 }
 
 impl ToggleKey {
@@ -771,6 +785,7 @@ impl ToggleKey {
             ToggleKey::StartAtLogin => "start-at-login",
             ToggleKey::StartAtLoginStale => "start-at-login-stale",
             ToggleKey::CheckUpdatesOnStartup => "check-updates-on-startup",
+            ToggleKey::ForceSoftwareRenderer => "force-software-renderer",
         }
     }
 }
@@ -816,6 +831,12 @@ pub struct Workspace {
     pub agents_expanded: bool,
     /// Agent panes (see `crate::agents`), listed under the `agents` subtab.
     pub agent_entries: Vec<TerminalEntry>,
+    /// Whether the compact list of open file editors is unfolded.
+    pub files_expanded: bool,
+    /// Real file editor panes, listed under the `files` subtab. Diff panes
+    /// deliberately stay out of this list because they are not files the
+    /// explorer opened.
+    pub file_entries: Vec<FileEntry>,
     pub subtabs: Vec<Subtab>,
     pub git_branch: GitBranch,
     /// Per-workspace tab list. When this workspace is active, `AppState.tabs`
@@ -870,6 +891,14 @@ pub struct TerminalEntry {
     /// Live usage of the pane's process tree, `None` until the resource
     /// monitor has attributed the pane's shell. Rendered as a chip.
     pub usage: Option<crate::resource_monitor::TreeUsage>,
+}
+
+/// An open file editor represented in the workspace sidebar.
+#[derive(Clone, Debug)]
+pub struct FileEntry {
+    pub name: String,
+    pub pane_id: PaneId,
+    pub dirty: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1265,26 +1294,18 @@ impl AppState {
                         .then(|| self.resource_trees.get(&p.pid).cloned())
                         .flatten(),
                 };
-                let entries: Vec<TerminalEntry> = if idx == active_idx {
+                let panes: Vec<Pane> = if idx == active_idx {
                     // Active workspace: live panes for the active tab, saved
                     // panes for every other tab. Every pane across every tab
-                    // shows up as its own entry.
+                    // shows up in its matching compact list.
                     self.tabs
                         .iter()
                         .enumerate()
                         .flat_map(|(t_idx, tab)| {
                             if t_idx == self.active_tab {
-                                self.panes
-                                    .iter()
-                                    .flatten()
-                                    .map(&entry_from)
-                                    .collect::<Vec<_>>()
+                                self.panes.iter().flatten().cloned().collect::<Vec<_>>()
                             } else {
-                                tab.panes
-                                    .iter()
-                                    .flatten()
-                                    .map(&entry_from)
-                                    .collect::<Vec<_>>()
+                                tab.panes.iter().flatten().cloned().collect::<Vec<_>>()
                             }
                         })
                         .collect()
@@ -1292,15 +1313,36 @@ impl AppState {
                     // Inactive workspace: everything is in saved state.
                     ws.tabs
                         .iter()
-                        .flat_map(|tab| tab.panes.iter().flatten().map(&entry_from))
+                        .flat_map(|tab| tab.panes.iter().flatten().cloned())
                         .collect()
                 };
-                // Split by agent membership: agent panes only ever show under
-                // `agents`, everything else under `terminals`. A subtab is
-                // "active" when it holds the workspace's active pane so the
-                // amber rail follows focus between the two lists.
-                let (agent_entries, terminal_entries): (Vec<TerminalEntry>, Vec<TerminalEntry>) =
-                    entries.into_iter().partition(|e| e.agent.is_some());
+                // Editors get their own compact list. Keep diff panes out of
+                // every sidebar session list: a diff is neither a PTY nor an
+                // explorer-opened file. The remaining panes split by agent
+                // membership into `agents` and `terminals`.
+                let mut terminal_entries = Vec::new();
+                let mut agent_entries = Vec::new();
+                let mut file_entries = Vec::new();
+                for pane in panes {
+                    if let Some(editor) = self.editors.get(&pane.id.0) {
+                        if !editor.is_diff() {
+                            file_entries.push(FileEntry {
+                                name: editor.display_name.clone(),
+                                pane_id: pane.id,
+                                dirty: editor.dirty,
+                            });
+                        }
+                        continue;
+                    }
+                    let entry = entry_from(&pane);
+                    if entry.agent.is_some() {
+                        agent_entries.push(entry);
+                    } else {
+                        terminal_entries.push(entry);
+                    }
+                }
+                // A subtab is "active" when it holds the workspace's active
+                // pane, so the amber rail follows focus between the lists.
                 let active_pane = if idx == active_idx {
                     Some(self.active_pane)
                 } else {
@@ -1318,11 +1360,17 @@ impl AppState {
                             sub.active = active_pane
                                 .is_some_and(|p| agent_entries.iter().any(|e| e.pane_id == p));
                         }
+                        Some(SubtabKind::Files) => {
+                            sub.count = Some(file_entries.len() as u32);
+                            sub.active = active_pane
+                                .is_some_and(|p| file_entries.iter().any(|e| e.pane_id == p));
+                        }
                         None => {}
                     }
                 }
                 ws.terminal_entries = terminal_entries;
                 ws.agent_entries = agent_entries;
+                ws.file_entries = file_entries;
             }
         }
         let agent_pane_ids: BTreeSet<u32> = self
@@ -1633,6 +1681,8 @@ pub fn seed_state() -> AppState {
             terminal_entries: vec![],
             agents_expanded: true,
             agent_entries: vec![],
+            files_expanded: true,
+            file_entries: vec![],
             subtabs: default_subtabs(1, true),
             git_branch: GitBranch::Pending,
             tabs: vec![],
@@ -1648,6 +1698,8 @@ pub fn seed_state() -> AppState {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
@@ -1663,6 +1715,8 @@ pub fn seed_state() -> AppState {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
@@ -1678,6 +1732,8 @@ pub fn seed_state() -> AppState {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: default_subtabs(0, false),
             git_branch: GitBranch::Absent,
             tabs: vec![],
@@ -1715,6 +1771,7 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::StartAtLogin, false);
     toggles.insert(ToggleKey::StartAtLoginStale, false);
     toggles.insert(ToggleKey::CheckUpdatesOnStartup, true);
+    toggles.insert(ToggleKey::ForceSoftwareRenderer, false);
 
     AppState {
         workspaces,
@@ -2143,6 +2200,7 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.next_id += 1;
     let pane_id = PaneId(id_num);
 
+    let is_file = !editor.is_diff();
     let title = editor.display_name.clone();
     // The subtitle is what the tab strip and pane header show under the
     // name; a diff pane is not a file and should not claim to be one.
@@ -2176,6 +2234,11 @@ pub fn mutate_add_editor_tab(state: &mut AppState, editor: crate::editor::Editor
     state.active_pane = pane_id;
     state.row_ratios = vec![1.0];
     state.col_ratios = vec![vec![1.0]];
+    if is_file {
+        if let Some(workspace) = state.workspaces.get_mut(state.active_workspace) {
+            workspace.files_expanded = true;
+        }
+    }
     pane_id
 }
 
@@ -2845,9 +2908,9 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
 
 /// Build a workspace with its branch unresolved.
 ///
-/// The two pane lists every workspace shows: `terminals` first, `agents`
-/// last (it carries the closing tree glyph). `ui_snapshot` recomputes
-/// counts and the active flag on every frame; the values here only
+/// The compact pane lists every workspace shows: `terminals`, `agents`,
+/// then `files` (which carries the closing tree glyph). `ui_snapshot`
+/// recomputes counts and active flags on every frame; the values here only
 /// matter until then.
 pub fn default_subtabs(terminal_count: u32, terminals_active: bool) -> Vec<Subtab> {
     vec![
@@ -2867,6 +2930,15 @@ pub fn default_subtabs(terminal_count: u32, terminals_active: bool) -> Vec<Subta
             active: false,
             disabled: false,
             icon: Some(SubtabIcon::Agent),
+            tree_glyph: "\u{251C}",
+        },
+        Subtab {
+            label: SubtabKind::Files.label().to_string(),
+            count: Some(0),
+            pulse: false,
+            active: false,
+            disabled: false,
+            icon: Some(SubtabIcon::Folder),
             tree_glyph: "\u{2514}",
         },
     ]
@@ -3036,6 +3108,8 @@ pub fn new_workspace(num: u32, name: String, path: Option<PathBuf>) -> Workspace
         terminal_entries: vec![],
         agents_expanded: true,
         agent_entries: vec![],
+        files_expanded: true,
+        file_entries: vec![],
         subtabs: default_subtabs(0, false),
         git_branch: GitBranch::Pending,
         tabs: vec![],
@@ -3433,7 +3507,8 @@ pub fn open_external_target(
 ) -> bool {
     match target {
         crate::launch_target::LaunchTarget::Folder(path) => open_terminal_here(state, path.clone()),
-        crate::launch_target::LaunchTarget::TextFile(path) => {
+        crate::launch_target::LaunchTarget::TextFile(_)
+        | crate::launch_target::LaunchTarget::PatchFile(_) => {
             let Some(root) = target.workspace_root() else {
                 return false;
             };
@@ -3442,30 +3517,30 @@ pub fn open_external_target(
             }
             state.settings_open = false;
             state.palette_open = false;
-            state.diff_review = None;
             state.ctx_menu = None;
-            let opened = dispatch_editor_open_path_buf(state, path);
+            let opened = open_document(state, target);
             if opened {
                 crate::persist::save_workspaces(state);
             }
             opened
+        }
+    }
+}
+
+/// Apply the target-specific effect of opening a text or patch document.
+/// Callers are responsible for selecting its workspace and clearing overlays
+/// first; a `Folder` target never reaches here since neither caller passes
+/// one in.
+fn open_document(state: &mut AppState, target: &crate::launch_target::LaunchTarget) -> bool {
+    match target {
+        crate::launch_target::LaunchTarget::TextFile(path) => {
+            state.diff_review = None;
+            dispatch_editor_open_path_buf(state, path)
         }
         crate::launch_target::LaunchTarget::PatchFile(path) => {
-            let Some(root) = target.workspace_root() else {
-                return false;
-            };
-            if !activate_or_create_workspace_for_path(state, &root) {
-                return false;
-            }
-            state.settings_open = false;
-            state.palette_open = false;
-            state.ctx_menu = None;
-            let opened = crate::diff_review::open_patch_file(state, path.clone());
-            if opened {
-                crate::persist::save_workspaces(state);
-            }
-            opened
+            crate::diff_review::open_patch_file(state, path.clone())
         }
+        crate::launch_target::LaunchTarget::Folder(_) => false,
     }
 }
 
@@ -3479,16 +3554,7 @@ pub fn open_file_with_terminal_manager(state: &mut AppState, path: PathBuf) -> b
     state.settings_open = false;
     state.palette_open = false;
     state.ctx_menu = None;
-    match target {
-        crate::launch_target::LaunchTarget::TextFile(path) => {
-            state.diff_review = None;
-            dispatch_editor_open_path_buf(state, &path)
-        }
-        crate::launch_target::LaunchTarget::PatchFile(path) => {
-            crate::diff_review::open_patch_file(state, path)
-        }
-        crate::launch_target::LaunchTarget::Folder(_) => false,
-    }
+    open_document(state, &target)
 }
 
 /// Allocate a stable, non-zero workspace routing id without overflow.
@@ -9178,6 +9244,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "update.open_release_page" => crate::updater::open_release_page(state),
         "update.startup_check.toggle" => crate::updater::toggle_startup_check(state),
         "update.show_dialog" => crate::updater::show_prompt(state),
+        "renderer.software.toggle" => {
+            let now_on = !toggle_on(state, ToggleKey::ForceSoftwareRenderer);
+            state
+                .toggles
+                .insert(ToggleKey::ForceSoftwareRenderer, now_on);
+            if !crate::persist::save_workspaces(state) {
+                push_error_toast(
+                    state,
+                    "Software renderer preference could not be saved. Check the config file permissions.",
+                );
+            }
+            true
+        }
         // Open settings on a named section (`settings.section:sessions`).
         // Scriptable through TM_STARTUP_DISPATCH so e2e shots can land on a
         // panel without synthesized clicks.
@@ -9303,7 +9382,9 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
                 parts.next().and_then(|v| v.parse::<f32>().ok()),
                 parts.next().and_then(|v| v.parse::<f32>().ok()),
             ) {
-                (Some(idx), Some(kind), Some(x), Some(y)) if idx < state.workspaces.len() => {
+                (Some(idx), Some(kind), Some(x), Some(y))
+                    if idx < state.workspaces.len() && kind.has_ctx_menu() =>
+                {
                     crate::renderer_telemetry::record_ctx_menu_open(
                         "subtab",
                         x,
@@ -14081,6 +14162,18 @@ pub(crate) mod tests {
 
         assert!(dispatch(&mut state, "tabs.worktree_mode.toggle"));
         assert!(!toggle_on(&state, ToggleKey::WorktreeTabs));
+    }
+
+    #[test]
+    fn software_renderer_toggle_is_off_by_default_and_flips() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
     }
 
     #[test]
@@ -19552,6 +19645,8 @@ pub(crate) mod tests {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: vec![],
             git_branch: GitBranch::Absent,
             tabs: vec![tab],
@@ -21739,6 +21834,8 @@ mod flow_pane_tests {
             terminal_entries: vec![],
             agents_expanded: false,
             agent_entries: vec![],
+            files_expanded: false,
+            file_entries: vec![],
             subtabs: vec![],
             git_branch: GitBranch::Pending,
             tabs: vec![],
@@ -21911,16 +22008,22 @@ mod agents_tab_tests {
         entries.iter().map(|e| e.pane_id.0).collect()
     }
 
+    fn file_pane_ids(entries: &[FileEntry]) -> Vec<u32> {
+        entries.iter().map(|e| e.pane_id.0).collect()
+    }
+
     #[test]
-    fn every_workspace_carries_a_terminals_and_an_agents_subtab() {
+    fn every_workspace_carries_terminal_agent_and_files_subtabs() {
         let state = seed_state();
         for ws in &state.workspaces {
             let labels: Vec<&str> = ws.subtabs.iter().map(|s| s.label.as_str()).collect();
-            assert_eq!(labels, vec!["terminals", "agents"], "{}", ws.name);
+            assert_eq!(labels, vec!["terminals", "agents", "files"], "{}", ws.name);
             assert_eq!(ws.subtabs[1].icon, Some(SubtabIcon::Agent));
+            assert_eq!(ws.subtabs[2].icon, Some(SubtabIcon::Folder));
         }
         let fresh = new_workspace(9, "x".into(), None);
         assert!(fresh.subtabs.iter().any(|s| s.label == "agents"));
+        assert!(fresh.subtabs.iter().any(|s| s.label == "files"));
     }
 
     #[test]
@@ -21951,10 +22054,60 @@ mod agents_tab_tests {
             vec![
                 ("terminals".to_string(), Some(1), false),
                 ("agents".to_string(), Some(1), true),
+                ("files".to_string(), Some(0), false),
             ]
         );
         assert!(snap.agent_pane_ids.contains(&agent_pane));
         assert!(!snap.agent_pane_ids.contains(&1));
+    }
+
+    #[test]
+    fn snapshot_lists_open_editor_under_files_instead_of_terminals() {
+        let mut state = seed_state();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tm-open-files-sidebar-{}-{nonce}.rs",
+            std::process::id()
+        ));
+        let file_name = path
+            .file_name()
+            .expect("fixture file name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&path, "fn main() {}\n").expect("fixture file");
+
+        assert!(dispatch(
+            &mut state,
+            &format!("editor.open:{}", path.display())
+        ));
+        let pane_id = state.active_pane.0;
+        assert!(state.workspaces[0].files_expanded);
+
+        let snap = state.ui_snapshot();
+        let ws = &snap.workspaces[snap.active_workspace];
+        assert_eq!(pane_ids(&ws.terminal_entries), vec![1]);
+        assert!(ws.agent_entries.is_empty());
+        assert_eq!(file_pane_ids(&ws.file_entries), vec![pane_id]);
+        assert_eq!(ws.file_entries[0].name, file_name);
+        assert!(!ws.file_entries[0].dirty);
+        assert_eq!(
+            subtab_rows(ws),
+            vec![
+                ("terminals".to_string(), Some(1), false),
+                ("agents".to_string(), Some(0), false),
+                ("files".to_string(), Some(1), true),
+            ]
+        );
+
+        mutate_close_pane(&mut state, PaneId(pane_id));
+        let snap = state.ui_snapshot();
+        assert!(snap.workspaces[snap.active_workspace]
+            .file_entries
+            .is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

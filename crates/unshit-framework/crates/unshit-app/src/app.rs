@@ -41,7 +41,9 @@ use unshit_renderer::batch::{Rasterizer, SubpixelSwashCache};
 use unshit_renderer::canvas::{CanvasRegistry, CustomPainter};
 #[cfg(target_os = "windows")]
 use unshit_renderer::dw_rasterizer::DwRasterizer;
-use unshit_renderer::gpu::{GpuContext, PrewarmStatus, RenderOutcome, WindowGpuPreferences};
+use unshit_renderer::gpu::{
+    GpuContext, PrewarmStatus, RenderOutcome, RenderTierPreference, WindowGpuPreferences,
+};
 use unshit_renderer::pipeline::quad::QuadInstance;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
@@ -49,7 +51,11 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{ResizeDirection, Window, WindowId};
+#[cfg(target_os = "macos")]
+use winit::window::ImeRequest;
+use winit::window::{
+    ImeCapabilities, ImeEnableRequest, ImeRequestData, ResizeDirection, Window, WindowId,
+};
 
 #[cfg(target_os = "macos")]
 #[path = "macos_open_files.rs"]
@@ -444,6 +450,7 @@ pub struct GlyphAtlasRecoveryEvent {
 
 pub struct App {
     config: AppConfig,
+    render_tier_preference: RenderTierPreference,
     tree_fn: Box<dyn Fn() -> ElementTree>,
     state: Option<AppState>,
     event_tx: flume::Sender<ExternalEvent>,
@@ -1009,23 +1016,32 @@ fn configured_pacing_mode(
 ///
 /// Resolves the same preferences the real request will, by the same route: a
 /// prewarm that picked different backends would be discarded on arrival, and
-/// the enumeration it paid for is the expensive part.
+/// the enumeration it paid for is the expensive part. The same
+/// `render_tier_preference` must be supplied through
+/// [`App::set_render_tier_preference`] before [`App::run`] so the real window
+/// context selects the same adapter tier as the prewarm request.
 ///
 /// Safe to call unconditionally. It is a no-op off Windows, under a forced
 /// software renderer, and in any process that never opens a window.
-pub fn prewarm_window_gpu() {
+pub fn prewarm_window_gpu(render_tier_preference: RenderTierPreference) {
     let compositor_clock_supported = crate::compositor_clock::compositor_wait_fn().is_some();
-    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported));
+    GpuContext::prewarm(window_gpu_preferences(compositor_clock_supported, render_tier_preference));
 }
 
-fn window_gpu_preferences(compositor_clock_supported: bool) -> WindowGpuPreferences {
+fn window_gpu_preferences(
+    compositor_clock_supported: bool,
+    render_tier_preference: RenderTierPreference,
+) -> WindowGpuPreferences {
     #[cfg(target_os = "windows")]
     if compositor_clock_supported {
-        return WindowGpuPreferences::compositor_mailbox();
+        return WindowGpuPreferences {
+            render_tier: render_tier_preference,
+            ..WindowGpuPreferences::compositor_mailbox()
+        };
     }
 
     let _ = compositor_clock_supported;
-    WindowGpuPreferences::default()
+    WindowGpuPreferences { render_tier: render_tier_preference, ..WindowGpuPreferences::default() }
 }
 
 /// Display period to assume when the platform cannot report a refresh
@@ -2676,6 +2692,7 @@ impl App {
         let grid_patches = Arc::new(GridPatchStore::default());
         Self {
             config,
+            render_tier_preference: RenderTierPreference::Auto,
             tree_fn: Box::new(tree_fn),
             state: None,
             // Placeholder interval: the display's refresh rate is not
@@ -2704,6 +2721,15 @@ impl App {
             #[cfg(feature = "async")]
             subscription_manager: None,
         }
+    }
+
+    /// Set the adapter tier used when the first window's renderer starts.
+    ///
+    /// Call this before [`run`](Self::run). It is startup-only: changing the
+    /// preference after a window has been created cannot replace its live
+    /// renderer.
+    pub fn set_render_tier_preference(&mut self, preference: RenderTierPreference) {
+        self.render_tier_preference = preference;
     }
 
     /// Returns an [`EventSink`] that can be moved into other threads to push
@@ -3913,6 +3939,19 @@ impl ApplicationHandler for AppHandler {
             self.app.config.decorations,
             !self.app.config.show_window_when_painted,
         ));
+        // Winit disables desktop IME by default. On macOS that also means
+        // AppKit never receives interpretKeyEvents, so simple dead-key input
+        // (´ + a -> á) is never composed and the shell receives the bare base
+        // key. Enable the text-input client without requesting a preedit
+        // popup; commits are routed below just like keyboard text.
+        #[cfg(target_os = "macos")]
+        {
+            let request = dead_key_ime_enable_request()
+                .expect("empty IME capabilities always have matching request data");
+            if let Err(error) = window.request_ime_update(ImeRequest::Enable(request)) {
+                log::warn!("failed to enable macOS dead-key/IME input: {error}");
+            }
+        }
         self.mark_startup("window_created");
 
         let scale_factor = window.scale_factor() as f32;
@@ -3948,7 +3987,8 @@ impl ApplicationHandler for AppHandler {
         // during that wait instead of after it. The GPU is collected in
         // `finish_startup`, once there is nothing left to do without it.
         let compositor_clock_supported = self.app.compositor_clock_waker.is_supported();
-        let gpu_preferences = window_gpu_preferences(compositor_clock_supported);
+        let gpu_preferences =
+            window_gpu_preferences(compositor_clock_supported, self.app.render_tier_preference);
 
         // If a css_path is set, read that file into config.css so it acts as
         // the initial stylesheet (both here and in the hot-reload watcher).
@@ -5457,6 +5497,8 @@ impl ApplicationHandler for AppHandler {
                                 state.needs_relayout = true;
                                 state.shaped_cache.clear();
                                 state.window.request_redraw();
+                            } else {
+                                dispatch_ime_commit_to_keyboard_capture(state, &text);
                             }
                         }
                     }
@@ -6710,6 +6752,68 @@ fn clear_input_selection_on_blur(state: &mut AppState, node: NodeId) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn dead_key_ime_enable_request() -> Option<ImeEnableRequest> {
+    ImeEnableRequest::new(ImeCapabilities::new(), ImeRequestData::default())
+}
+
+fn keyboard_event_for_ime_commit(text: &str) -> Option<KeyboardEvent> {
+    let ch = text.chars().next()?;
+    if ch.is_control() {
+        return None;
+    }
+    Some(KeyboardEvent {
+        kind: KeyEventKind::Pressed,
+        key: Key::Char(ch),
+        modifiers: Modifiers::empty(),
+        text: Some(text.to_string()),
+    })
+}
+
+fn dispatch_ime_commit_to_keyboard_capture(state: &mut AppState, text: &str) -> bool {
+    let focused_id = state.interaction.focused;
+    let Some(event) = keyboard_event_for_ime_commit(text) else {
+        return false;
+    };
+    if !state
+        .arena
+        .get(focused_id)
+        .map(|element| element.captures_keyboard || element.computed_style.keyboard_capture)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let mut reveal_id = None;
+    let mut saw_keyboard_handler = false;
+    let mut capture_requires_rebuild = false;
+    if let Some(element) = state.arena.get(focused_id) {
+        for (event_type, handler) in &element.handlers {
+            if *event_type != EventType::KeyboardCapture {
+                continue;
+            }
+            saw_keyboard_handler = true;
+            let response = handler(&Event::Keyboard(event.clone()));
+            capture_requires_rebuild |= keyboard_capture_requires_rebuild(response.as_deref());
+            if let Some(response) = response {
+                if let Ok(request) =
+                    response.downcast::<unshit_core::event::RequestScrollIntoView>()
+                {
+                    reveal_id = Some(request.0);
+                }
+            }
+        }
+    }
+    if !saw_keyboard_handler || capture_requires_rebuild {
+        state.needs_rebuild = true;
+    }
+    if let Some(id) = reveal_id {
+        reveal_element_by_id(state, &id);
+    }
+    state.window.request_redraw();
+    true
+}
+
 fn handle_text_input(state: &mut AppState, event: &winit::event::KeyEvent) -> bool {
     use unshit_core::element::InputType;
     use winit::keyboard::Key as WinitKey;
@@ -7724,6 +7828,37 @@ mod tests {
             assert!(!primary_modifier_held(&command));
             assert!(!text_edit_modifier_held(&command));
         }
+    }
+
+    #[test]
+    fn empty_ime_capabilities_produce_a_valid_enable_request() {
+        let request =
+            dead_key_ime_enable_request().expect("empty capabilities should form a request");
+
+        assert_eq!(request.capabilities(), &ImeCapabilities::new());
+    }
+
+    #[test]
+    fn ime_commit_maps_composed_text_to_a_keyboard_event() {
+        let event = keyboard_event_for_ime_commit("á").expect("composed text should map");
+
+        assert_eq!(event.key, Key::Char('á'));
+        assert_eq!(event.text.as_deref(), Some("á"));
+        assert_eq!(event.modifiers, Modifiers::empty());
+    }
+
+    #[test]
+    fn ime_commit_preserves_multi_character_text() {
+        let event = keyboard_event_for_ime_commit("café").expect("text commit should map");
+
+        assert_eq!(event.key, Key::Char('c'));
+        assert_eq!(event.text.as_deref(), Some("café"));
+    }
+
+    #[test]
+    fn ime_commit_rejects_empty_and_control_text() {
+        assert!(keyboard_event_for_ime_commit("").is_none());
+        assert!(keyboard_event_for_ime_commit("\u{7}").is_none());
     }
 
     #[test]

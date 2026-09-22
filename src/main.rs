@@ -53,6 +53,7 @@ use unshit::core::style::types::{Background, Dimension};
 use unshit::core::trace::{
     append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
 };
+use unshit::renderer::gpu::RenderTierPreference;
 
 use crate::state::{
     dispatch, mutate_with, record_diagnostic_pty_event, record_diagnostic_renderer_frame,
@@ -721,6 +722,14 @@ fn apply_native_open_paths(shared: &SharedState, paths: &[std::path::PathBuf]) -
     changed
 }
 
+fn renderer_tier_preference(force_software_renderer: bool) -> RenderTierPreference {
+    if force_software_renderer {
+        RenderTierPreference::SoftwareOnly
+    } else {
+        RenderTierPreference::Auto
+    }
+}
+
 fn main() {
     // First statement in the process: everything after this point is time the
     // user spends waiting for a window, and the recorder back-dates its epoch
@@ -758,6 +767,13 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Read the one startup-only renderer preference before prewarming. The
+    // regular workspace load below remains responsible for diagnostics and
+    // restoring all state; this small best-effort read just ensures the
+    // prewarm and window context agree on their adapter tier.
+    let render_tier_preference =
+        renderer_tier_preference(persist::force_software_renderer_from_default_config());
+
     // Start the GPU before anything else needs it. Adapter and device creation
     // are the longest single stretch of startup -- over a second here, most of
     // it D3D12 enumerating adapters this machine will not use -- and they need
@@ -767,7 +783,7 @@ fn main() {
     //
     // Placed after the notification CLI so `--notify`-style invocations, which
     // exit without ever opening a window, do not spin up a GPU thread.
-    unshit::app::prewarm_window_gpu();
+    unshit::app::prewarm_window_gpu(render_tier_preference);
 
     #[cfg(feature = "profiling")]
     init_profiler();
@@ -853,6 +869,10 @@ fn main() {
         initial_state.toggles.insert(
             crate::state::ToggleKey::AutoResumeAgents,
             persisted.auto_resume_agents,
+        );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::ForceSoftwareRenderer,
+            persisted.force_software_renderer,
         );
         // Self-update: the startup check defaults on (an upgrader without
         // the key starts getting offers), and the last version the offer
@@ -1518,6 +1538,7 @@ fn main() {
             )
         },
     );
+    app.set_render_tier_preference(render_tier_preference);
     let _ = window_event_sink.set(app.event_sink());
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone(), window_event_sink.clone());
@@ -1672,6 +1693,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use unshit::core::style::types::{Background, Color};
     use unshit_test::TestHarness;
+
+    #[test]
+    fn renderer_tier_preference_uses_software_only_when_persisted() {
+        assert_eq!(
+            renderer_tier_preference(true),
+            RenderTierPreference::SoftwareOnly
+        );
+        assert_eq!(renderer_tier_preference(false), RenderTierPreference::Auto);
+    }
 
     #[test]
     fn terminal_content_visibility_skips_routes_that_replace_the_workspace() {
