@@ -2881,6 +2881,65 @@ mod tests {
     }
 
     #[test]
+    fn catppuccin_restyles_main_chrome_after_theme_switch() {
+        let shared: SharedState = Arc::new(Mutex::new(seed_state()));
+        let build_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &Default::default(), None)
+            },
+            1280.0,
+            800.0,
+        );
+        for theme in ["catppuccin", "amber", "catppuccin"] {
+            shared.lock().unwrap().theme = theme.to_string();
+            let rebuild_shared = shared.clone();
+            harness.rebuild(move || {
+                let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &rebuild_shared, &Default::default(), None)
+            });
+            let catppuccin = theme == "catppuccin";
+            for (selector, themed, amber) in [
+                (
+                    ".tab.active",
+                    Color::rgb(0x1e, 0x1e, 0x2e),
+                    Color::rgb(0x1c, 0x18, 0x12),
+                ),
+                (
+                    ".tm-search",
+                    Color::rgb(0x1e, 0x1e, 0x2e),
+                    Color::rgb(0x1c, 0x18, 0x12),
+                ),
+                (
+                    ".explorer-action.active",
+                    Color::rgb(0x31, 0x32, 0x44),
+                    Color::rgb(0x29, 0x23, 0x1a),
+                ),
+            ] {
+                let element = harness.query(selector).expect(selector);
+                assert_eq!(
+                    element.computed_style.background,
+                    Background::Color(if catppuccin { themed } else { amber }),
+                    "{theme}: {selector}"
+                );
+            }
+            let crumb = harness
+                .query(".titlebar-breadcrumb .amber")
+                .expect("workspace breadcrumb");
+            assert_eq!(
+                crumb.computed_style.color,
+                if catppuccin {
+                    Color::rgb(0xcb, 0xa6, 0xf7)
+                } else {
+                    Color::rgb(0xe8, 0xb9, 0x55)
+                }
+            );
+        }
+    }
+
+    #[test]
     fn font_settings_restyle_immediately_after_rebuild() {
         let mut state = seed_state();
         let active_pane = state.active_pane.0;

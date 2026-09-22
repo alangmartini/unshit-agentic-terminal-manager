@@ -19,13 +19,15 @@
 //! token scopes (self > active `.app.theme-*` root scope > `:root`). The frozen
 //! blob below reflects the flip: the `.cp` rows for the themes that OVERRIDE the
 //! palette's bg/border tokens — `dracula`, `nord`, `gruvbox`, `tokyo-night` —
-//! now show the THEME color, not amber. The `amber`/`catppuccin`/`no-theme`
+//! now show the THEME color, not amber. The `amber`/`no-theme`
 //! `.cp` rows stay amber on purpose: those themes do not redefine
 //! `--bg-elevated`/`--bg-subtle`/`--border-default`, so the cascade correctly
 //! falls back to `:root`. Every NON-`.cp` row is byte-identical to Stage 0 —
 //! the concrete clone declarations still win by source order, so the safety net
 //! holds: zero visual regression for clone-covered selectors, with the var()
 //! flip landing exactly where authors used `var()` and the theme overrides it.
+//! Catppuccin now defines its full palette too: its command palette and chip
+//! border shadow use Mocha colors instead of inheriting Amber defaults.
 //!
 //! TWO-LEVEL INDIRECTION FIX (post Stage 3): token values that are themselves a
 //! `var()` reference are no longer eagerly concretized at parse time; they are
@@ -253,6 +255,6 @@ catppuccin|titlebar|bg=Color(Color { r: 17, g: 17, b: 27, a: 255 }) | color=Colo
 catppuccin|tabbar|bg=Color(Color { r: 24, g: 24, b: 37, a: 255 }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 0.0, right: 0.0, bottom: 1.0, left: 0.0 } | bc=Color { r: 49, g: 50, b: 68, a: 255 } | shadow=[]
 catppuccin|settings-page|bg=Color(Color { r: 30, g: 30, b: 46, a: 255 }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 } | bc=Color { r: 0, g: 0, b: 0, a: 0 } | shadow=[]
 catppuccin|set-page-header|bg=LinearGradient(LinearGradient { angle_deg: 180.0, stops: [GradientStop { color: Color { r: 24, g: 24, b: 37, a: 153 }, position: Percent(0.0) }, GradientStop { color: Color { r: 30, g: 30, b: 46, a: 0 }, position: Percent(1.0) }], repeating: false }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 0.0, right: 0.0, bottom: 1.0, left: 0.0 } | bc=Color { r: 35, g: 34, b: 56, a: 255 } | shadow=[]
-catppuccin|theme-chip.dracula|bg=Color(Color { r: 33, g: 34, b: 44, a: 255 }) | color=Color { r: 248, g: 248, b: 242, a: 255 } | bw=Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 } | bc=Color { r: 68, g: 71, b: 90, a: 255 } | shadow=[BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 0.0, spread_radius: 1.0, color: Color { r: 52, g: 43, b: 30, a: 255 }, inset: true }]
-catppuccin|cp|bg=LinearGradient(LinearGradient { angle_deg: 180.0, stops: [GradientStop { color: Color { r: 41, g: 35, b: 26, a: 255 }, position: Percent(0.0) }, GradientStop { color: Color { r: 34, g: 29, b: 22, a: 255 }, position: Percent(1.0) }], repeating: false }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 } | bc=Color { r: 74, g: 62, b: 42, a: 255 } | shadow=[BoxShadow { offset_x: 0.0, offset_y: 14.0, blur_radius: 40.0, spread_radius: 0.0, color: Color { r: 0, g: 0, b: 0, a: 165 }, inset: false }, BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 0.0, spread_radius: 1.0, color: Color { r: 0, g: 0, b: 0, a: 76 }, inset: false }, BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 40.0, spread_radius: 0.0, color: Color { r: 212, g: 163, b: 72, a: 13 }, inset: false }]
+catppuccin|theme-chip.dracula|bg=Color(Color { r: 33, g: 34, b: 44, a: 255 }) | color=Color { r: 248, g: 248, b: 242, a: 255 } | bw=Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 } | bc=Color { r: 68, g: 71, b: 90, a: 255 } | shadow=[BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 0.0, spread_radius: 1.0, color: Color { r: 49, g: 50, b: 68, a: 255 }, inset: true }]
+catppuccin|cp|bg=LinearGradient(LinearGradient { angle_deg: 180.0, stops: [GradientStop { color: Color { r: 49, g: 50, b: 68, a: 255 }, position: Percent(0.0) }, GradientStop { color: Color { r: 24, g: 24, b: 37, a: 255 }, position: Percent(1.0) }], repeating: false }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 } | bc=Color { r: 69, g: 71, b: 90, a: 255 } | shadow=[BoxShadow { offset_x: 0.0, offset_y: 14.0, blur_radius: 40.0, spread_radius: 0.0, color: Color { r: 0, g: 0, b: 0, a: 165 }, inset: false }, BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 0.0, spread_radius: 1.0, color: Color { r: 0, g: 0, b: 0, a: 76 }, inset: false }, BoxShadow { offset_x: 0.0, offset_y: 0.0, blur_radius: 40.0, spread_radius: 0.0, color: Color { r: 212, g: 163, b: 72, a: 13 }, inset: false }]
 catppuccin|sb-row|bg=Color(Color { r: 0, g: 0, b: 0, a: 0 }) | color=Color { r: 205, g: 214, b: 244, a: 255 } | bw=Edges { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 } | bc=Color { r: 0, g: 0, b: 0, a: 0 } | shadow=[]";
