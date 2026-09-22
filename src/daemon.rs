@@ -32,7 +32,8 @@ const CARGO_BUILD_OUTPUT_LIMIT: usize = 4096;
 ///
 /// 1. If `UNSHIT_PTYD_BINARY` env var is set and the path exists, use
 ///    it (dev / CI override).
-/// 2. Otherwise, sibling of the current executable
+/// 2. The immutable `daemons/<UI version>/` install, when present.
+/// 3. Otherwise, sibling of the current executable
 ///    (`std::env::current_exe()`'s parent directory with `unshit-ptyd`
 ///    plus the platform exe suffix appended). Returned regardless of
 ///    whether the file exists so tests can distinguish the resolution
@@ -43,7 +44,7 @@ pub fn locate_daemon_binary() -> io::Result<PathBuf> {
             return Ok(path);
         }
     }
-    sibling_of_current_exe()
+    bundled_daemon_binary()
 }
 
 fn ensure_daemon_binary() -> io::Result<PathBuf> {
@@ -60,7 +61,7 @@ fn ensure_daemon_binary() -> io::Result<PathBuf> {
         ));
     }
 
-    let binary = sibling_of_current_exe()?;
+    let binary = bundled_daemon_binary()?;
     if binary.exists() {
         return Ok(binary);
     }
@@ -71,6 +72,25 @@ fn ensure_daemon_binary() -> io::Result<PathBuf> {
 
 fn env_override() -> Option<PathBuf> {
     std::env::var_os(ENV_OVERRIDE).map(PathBuf::from)
+}
+
+fn bundled_daemon_binary() -> io::Result<PathBuf> {
+    let sibling = sibling_of_current_exe()?;
+    Ok(bundled_daemon_at(&sibling, env!("CARGO_PKG_VERSION")))
+}
+
+fn bundled_daemon_at(sibling: &Path, version: &str) -> PathBuf {
+    let versioned = sibling
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("daemons")
+        .join(version)
+        .join(sibling.file_name().unwrap_or_default());
+    if versioned.is_file() {
+        versioned
+    } else {
+        sibling.to_path_buf()
+    }
 }
 
 fn sibling_of_current_exe() -> io::Result<PathBuf> {
@@ -249,7 +269,8 @@ pub enum DaemonStartup {
 
 /// Connect-or-spawn convenience used by `main.rs` on startup.
 ///
-/// 1. Try `unshit_ptyd::client::Client::connect(socket_path).await`.
+/// 1. Connect and check protocol compatibility. For a newer bundled release,
+///    request retirement only when the daemon supports the atomic v3 gate.
 /// 2. If that failed *because the endpoint exists but refused us*, retry
 ///    briefly: that is the Windows named-pipe rebind window (a few ms between
 ///    accepting one client and creating the next pending instance), and
@@ -257,24 +278,25 @@ pub enum DaemonStartup {
 ///    A "no such endpoint" error means no daemon is running and is not retried
 ///    — on the cold-start path every millisecond spent re-probing an endpoint
 ///    that provably does not exist is pure latency.
-/// 3. Otherwise locate the binary, call [`spawn_daemon_detached`], then retry
+/// 3. For an absent or retired daemon, call [`spawn_daemon_detached`], then retry
 ///    connect with exponential backoff up to a bounded deadline (~3 seconds).
 /// 4. On connect success, drop the returned `Client` (the probe is the only
 ///    reason we opened it).
 pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<DaemonStartup> {
-    match try_connect(socket_path).await {
-        Ok(()) => return Ok(DaemonStartup::Attached),
-        Err(e) if endpoint_exists_but_refused(&e) => {
-            for _ in 0..REBIND_RETRY_ATTEMPTS {
+    for attempt in 0..=REBIND_RETRY_ATTEMPTS {
+        match probe_daemon(socket_path, true).await {
+            Ok(true) => return Ok(DaemonStartup::Attached),
+            Ok(false) => break, // Retirement accepted and endpoint released.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) if retryable_startup_error(&e) && attempt < REBIND_RETRY_ATTEMPTS => {
                 tokio::time::sleep(REBIND_RETRY_PAUSE).await;
-                match try_connect(socket_path).await {
-                    Ok(()) => return Ok(DaemonStartup::Attached),
-                    Err(e) if endpoint_exists_but_refused(&e) => continue,
-                    Err(_) => break,
-                }
             }
+            // A crashed Unix daemon may leave its socket on disk. The server
+            // bind path checks that it is stale before replacing it.
+            #[cfg(unix)]
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => break,
+            Err(e) => return Err(e),
         }
-        Err(_) => {}
     }
 
     let binary = ensure_daemon_binary()?;
@@ -284,8 +306,8 @@ pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<DaemonStartup> {
     let mut backoff = CONNECT_INITIAL_BACKOFF;
     let mut last_err: Option<io::Error> = None;
     while Instant::now() < deadline {
-        match try_connect(socket_path).await {
-            Ok(()) => return Ok(DaemonStartup::Spawned),
+        match probe_daemon(socket_path, false).await {
+            Ok(_) => return Ok(DaemonStartup::Spawned),
             Err(e) => last_err = Some(e),
         }
         tokio::time::sleep(backoff).await;
@@ -306,10 +328,187 @@ pub async fn connect_or_spawn(socket_path: &Path) -> io::Result<DaemonStartup> {
     ))
 }
 
-async fn try_connect(socket_path: &Path) -> io::Result<()> {
-    let client = unshit_ptyd::client::Client::connect(socket_path).await?;
-    drop(client);
-    Ok(())
+async fn probe_daemon(socket_path: &Path, allow_upgrade: bool) -> io::Result<bool> {
+    use unshit_ptyd::protocol::{Response, RETIRE_PROTOCOL_VERSION};
+    tokio::time::timeout(CONNECT_TOTAL_DEADLINE, async {
+        let mut client = unshit_ptyd::client::Client::connect(socket_path).await?;
+        let Response::HelloAck {
+            protocol_version,
+            executable,
+            ..
+        } = client
+            .hello(env!("CARGO_PKG_VERSION"))
+            .await
+            .map_err(protocol_io_error)?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected daemon greeting",
+            ));
+        };
+        unshit_ptyd::compatibility::check_protocol(protocol_version)?;
+        if allow_upgrade && protocol_version >= RETIRE_PROTOCOL_VERSION && env_override().is_none()
+        {
+            let bundled = bundled_daemon_binary()?;
+            if executable
+                .as_deref()
+                .is_some_and(|running| upgrade_pending(Path::new(running), &bundled))
+            {
+                match client.retire_if_idle().await.map_err(protocol_io_error)? {
+                    Response::ShutdownAck { ok: true, .. } => {
+                        drop(client);
+                        // Ack precedes listener teardown. Do not mistake the
+                        // retiring listener for the newly installed daemon.
+                        loop {
+                            match unshit_ptyd::client::Client::connect(socket_path).await {
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                                Err(e) if !retryable_startup_error(&e) => return Err(e),
+                                Ok(mut successor) => {
+                                    // Another launcher can publish the new daemon
+                                    // before this probe observes a missing pipe.
+                                    if let Ok(Response::HelloAck {
+                                        protocol_version,
+                                        executable: successor_exe,
+                                        ..
+                                    }) = successor.hello(env!("CARGO_PKG_VERSION")).await
+                                    {
+                                        if successor_exe != executable {
+                                            unshit_ptyd::compatibility::check_protocol(
+                                                protocol_version,
+                                            )?;
+                                            return Ok(true);
+                                        }
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                            tokio::time::sleep(REBIND_RETRY_PAUSE).await;
+                        }
+                    }
+                    Response::ShutdownAck { ok: false, .. } => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected daemon retirement response",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon handshake or retirement timed out",
+        )
+    })?
+}
+
+fn protocol_io_error(error: unshit_ptyd::protocol::ProtocolError) -> io::Error {
+    match error {
+        unshit_ptyd::protocol::ProtocolError::Io(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
+}
+
+/// Bridge startup follows a short-lived launcher probe. Another UI can retire
+/// an idle daemon between those connections, so retry the entire read-only
+/// handshake while the successor takes over. No session request is retried.
+pub async fn connect_ui_client(
+    socket_path: &Path,
+) -> io::Result<(
+    unshit_ptyd::client::Client,
+    tokio::sync::mpsc::Receiver<unshit_ptyd::protocol::ServerEvent>,
+    u32,
+)> {
+    use unshit_ptyd::{client::Client, protocol::Response};
+    tokio::time::timeout(CONNECT_TOTAL_DEADLINE, async {
+        loop {
+            let result = async {
+                let (mut client, events) = Client::connect_with_events(socket_path).await?;
+                match client
+                    .hello(env!("CARGO_PKG_VERSION"))
+                    .await
+                    .map_err(protocol_io_error)?
+                {
+                    Response::HelloAck {
+                        protocol_version, ..
+                    } => {
+                        unshit_ptyd::compatibility::check_protocol(protocol_version)?;
+                        Ok((client, events, protocol_version))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected daemon greeting",
+                    )),
+                }
+            }
+            .await;
+            match result {
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || retryable_startup_error(&error) =>
+                {
+                    tokio::time::sleep(REBIND_RETRY_PAUSE).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon bridge handshake timed out"))?
+}
+
+fn retryable_startup_error(error: &io::Error) -> bool {
+    endpoint_exists_but_refused(error)
+        || matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+        )
+}
+
+/// Only move forward within this installation. Development overrides, other
+/// installs and rollback UIs must never retire a newer daemon.
+fn upgrade_pending(running: &Path, bundled: &Path) -> bool {
+    let (Ok(running), Ok(bundled)) = (running.canonicalize(), bundled.canonicalize()) else {
+        return false;
+    };
+    let Some(release_dir) = bundled.parent() else {
+        return false;
+    };
+    let Some(daemons_dir) = release_dir.parent() else {
+        return false;
+    };
+    if daemons_dir.file_name().is_none_or(|name| name != "daemons") || running == bundled {
+        return false;
+    }
+    if running.parent() == daemons_dir.parent() {
+        return true; // Transition from a legacy sibling installation.
+    }
+    let Some(old_dir) = running.parent() else {
+        return false;
+    };
+    if old_dir.parent() != Some(daemons_dir) {
+        return false;
+    }
+    match (
+        old_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| semver::Version::parse(s).ok()),
+        release_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| semver::Version::parse(s).ok()),
+    ) {
+        (Some(old), Some(new)) => new > old,
+        _ => false,
+    }
 }
 
 /// Whether a failed connect means "a daemon is there, try again in a moment"
@@ -318,8 +517,8 @@ async fn try_connect(socket_path: &Path) -> io::Result<()> {
 /// Windows reports the rebind window as `ERROR_PIPE_BUSY` (231) and a missing
 /// pipe as `ERROR_FILE_NOT_FOUND` (2); Unix reports a missing socket as
 /// `NotFound` and a listening-but-saturated socket as `ConnectionRefused`.
-/// Anything unclassified is treated as "not running", which costs at worst one
-/// redundant daemon spawn — the daemon itself refuses to double-bind.
+/// Other errors are returned to the caller; permission and protocol failures
+/// must not be mistaken for an absent daemon.
 fn endpoint_exists_but_refused(err: &io::Error) -> bool {
     #[cfg(windows)]
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -341,6 +540,61 @@ mod tests {
     // Serializes tests that mutate UNSHIT_PTYD_BINARY so they do not
     // race within a single test process.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_handshake_retries_a_connection_closed_during_retirement() {
+        let path = unique_socket_path();
+        #[cfg(windows)]
+        let mut listener = unshit_ptyd::transport::Server::bind(&path).unwrap();
+        #[cfg(unix)]
+        let mut listener = unshit_ptyd::transport::Server::bind(&path).await.unwrap();
+        let peer = tokio::spawn(async move {
+            // The retiring daemon rejects this connection before its Hello.
+            drop(listener.accept().await.unwrap());
+            let successor = listener.accept().await.unwrap();
+            let (shutdown, _rx) = tokio::sync::broadcast::channel(4);
+            unshit_ptyd::daemon::handler::serve_connection(
+                successor,
+                shutdown,
+                std::sync::Arc::new(unshit_ptyd::session::registry::SessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+        });
+        let (mut client, _events, protocol) = connect_ui_client(&path).await.unwrap();
+        assert_eq!(protocol, unshit_ptyd::protocol::PROTOCOL_VERSION);
+        client.shutdown().await.unwrap();
+        peer.await.unwrap();
+    }
+
+    #[test]
+    fn installed_daemon_selection_and_upgrade_direction() {
+        let root = std::env::temp_dir().join(format!(
+            "tm-daemon-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sibling = root.join("unshit-ptyd.exe");
+        let old = root.join("daemons/0.5.0/unshit-ptyd.exe");
+        let new = root.join("daemons/0.6.1/unshit-ptyd.exe");
+        let other = root.join("other/daemons/0.6.1/unshit-ptyd.exe");
+        for file in [&sibling, &old, &new, &other] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"fixture").unwrap();
+        }
+        assert_eq!(bundled_daemon_at(&sibling, "0.6.1"), new);
+        assert_eq!(bundled_daemon_at(&sibling, "0.4.0"), sibling);
+        assert!(upgrade_pending(&old, &new));
+        assert!(upgrade_pending(&sibling, &new));
+        assert!(!upgrade_pending(&new, &old));
+        assert!(!upgrade_pending(&new, &new));
+        assert!(!upgrade_pending(&old, &other));
+        assert!(!upgrade_pending(&old, &sibling));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct EnvGuard {
         key: &'static str,
