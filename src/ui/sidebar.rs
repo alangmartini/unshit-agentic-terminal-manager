@@ -584,9 +584,34 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
         });
 
     let menu = match &ctx.target {
-        crate::state::CtxMenuTarget::Explorer { .. } => ElementDef::new(Tag::Div)
-            .with_class("ctx-menu")
-            .with_child(ctx_menu_item(
+        crate::state::CtxMenuTarget::Explorer {
+            path, directory, ..
+        } => {
+            let mut menu = ElementDef::new(Tag::Div).with_class("ctx-menu");
+            if !*directory && crate::launch_target::classify_supported_file_path(path).is_some() {
+                menu = menu.with_child(explorer_open_file_item(
+                    "Open with Terminal Manager",
+                    shared,
+                    path.clone(),
+                ));
+            }
+            let terminal_path = if *directory {
+                Some(path.clone())
+            } else {
+                path.parent().map(std::path::Path::to_path_buf)
+            };
+            if let Some(terminal_path) = terminal_path {
+                menu = menu.with_child(explorer_open_terminal_item(
+                    if *directory {
+                        "Open terminal here"
+                    } else {
+                        "Open terminal in containing folder"
+                    },
+                    shared,
+                    terminal_path,
+                ));
+            }
+            menu.with_child(ctx_menu_item(
                 "Copy relative path",
                 shared,
                 "explorer.copy_relative".into(),
@@ -595,7 +620,8 @@ pub fn build_ctx_menu_overlay(snap: &UiSnapshot, shared: &SharedState) -> Elemen
                 "Copy path",
                 shared,
                 "explorer.copy_absolute".into(),
-            )),
+            ))
+        }
         crate::state::CtxMenuTarget::Workspace { idx } => {
             let installed = crate::shell::discover_installed();
             let agents = crate::agents::menu_profiles();
@@ -755,6 +781,46 @@ fn ctx_menu_item(label: &str, shared: &SharedState, command: String) -> ElementD
         .on_click(move || {
             mutate_with(&s, |st| {
                 crate::state::dispatch(st, &command);
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("ctx-menu-item-label")
+                .with_text(label.to_string()),
+        )
+}
+
+fn explorer_open_terminal_item(
+    label: &str,
+    shared: &SharedState,
+    path: std::path::PathBuf,
+) -> ElementDef {
+    let shared = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .on_click(move || {
+            mutate_with(&shared, |state| {
+                crate::state::open_terminal_here(state, path.clone());
+            });
+        })
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("ctx-menu-item-label")
+                .with_text(label.to_string()),
+        )
+}
+
+fn explorer_open_file_item(
+    label: &str,
+    shared: &SharedState,
+    path: std::path::PathBuf,
+) -> ElementDef {
+    let shared = shared.clone();
+    ElementDef::new(Tag::Div)
+        .with_class("ctx-menu-item")
+        .on_click(move || {
+            mutate_with(&shared, |state| {
+                crate::state::open_file_with_terminal_manager(state, path.clone());
             });
         })
         .with_child(
@@ -2300,6 +2366,29 @@ mod tests {
         assert!(
             rule.contains("overflow: auto;"),
             "context menu must scroll when shell list is long, got rule: {rule}"
+        );
+    }
+
+    #[test]
+    fn explorer_supported_file_context_menu_offers_open_with_terminal_manager() {
+        let shared = make_shared();
+        {
+            let mut state = shared.lock().unwrap();
+            state.ctx_menu = Some(crate::state::CtxMenu {
+                x: 0.0,
+                y: 0.0,
+                target: crate::state::CtxMenuTarget::Explorer {
+                    path: std::path::PathBuf::from("/tmp/notes.patch"),
+                    root: std::path::PathBuf::from("/tmp"),
+                    directory: false,
+                },
+            });
+        }
+        let snap = shared.lock().unwrap().ui_snapshot();
+        let menu = build_ctx_menu_overlay(&snap, &shared);
+        assert!(
+            collect_text_recursive(&menu).contains("Open with Terminal Manager"),
+            "supported files must expose the direct document action"
         );
     }
 

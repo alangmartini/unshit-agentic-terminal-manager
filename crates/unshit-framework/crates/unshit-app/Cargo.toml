@@ -40,6 +40,11 @@ winapi = { workspace = true, features = [
     "windef",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSObject", "NSString", "NSURL"] }
+
 [features]
 default = ["clipboard", "hot-reload"]
 clipboard = ["dep:arboard"]

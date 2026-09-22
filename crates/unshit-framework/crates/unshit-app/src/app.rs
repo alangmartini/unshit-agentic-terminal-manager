@@ -57,6 +57,10 @@ use winit::window::{
     ImeCapabilities, ImeEnableRequest, ImeRequestData, ResizeDirection, Window, WindowId,
 };
 
+#[cfg(target_os = "macos")]
+#[path = "macos_open_files.rs"]
+mod macos_open_files;
+
 /// Whether the platform's primary application modifier is held.
 ///
 /// Cocoa applications use Command where Windows and Linux applications use
@@ -343,6 +347,12 @@ pub struct AppConfig {
     /// When unset, file drops are ignored.
     #[allow(clippy::type_complexity)]
     pub on_file_drop: Option<Arc<dyn Fn(&[std::path::PathBuf]) -> bool + Send + Sync>>,
+    /// Callback invoked when the operating system asks a bundled app to open
+    /// files (for example Finder's Open With action on macOS). This is
+    /// distinct from [`Self::on_file_drop`], which handles paths dragged onto
+    /// the application's own window. Returning `true` requests a rebuild.
+    #[allow(clippy::type_complexity)]
+    pub on_open_files: Option<Arc<dyn Fn(&[std::path::PathBuf]) -> bool + Send + Sync>>,
     /// One-shot callback invoked once the renderer publishes valid cell
     /// metrics (cell width and height in pixels). Fires after the first
     /// render pass that produces non-zero values, giving the application a
@@ -414,6 +424,7 @@ impl Default for AppConfig {
             on_window_maximized: None,
             on_close: None,
             on_file_drop: None,
+            on_open_files: None,
             on_cell_metrics: None,
             on_startup_stage: None,
             on_scroll_telemetry: None,
@@ -2874,6 +2885,16 @@ impl App {
         // Ignore the Err (only fails if already set, which cannot happen).
         let _ = self.proxy_cell.set(proxy);
 
+        // Winit deliberately leaves NSApplication delegation to callers.
+        // Retain this bridge for the whole event loop so Finder document
+        // opens reach the application's ordinary state callback.
+        #[cfg(target_os = "macos")]
+        let _macos_open_files_delegate = self
+            .config
+            .on_open_files
+            .clone()
+            .map(|callback| macos_open_files::install(callback, self.event_sink()));
+
         let handler = AppHandler { event_rx: self.event_rx.clone(), app: self, pending: None };
         event_loop.run_app(handler).unwrap();
     }
@@ -3605,6 +3626,16 @@ impl AppHandler {
             last_refresh_probe: Instant::now(),
             frame_arena: FrameArena::default(),
         });
+
+        // An AppKit open-file event can arrive while the startup splash owns
+        // the window. Its EventSink queues the rebuild, but the earlier wake
+        // has nothing to drain until AppState exists; schedule one more wake
+        // now so that request cannot remain stranded in the channel.
+        if !self.event_rx.is_empty() {
+            if let Some(proxy) = self.app.proxy_cell.get() {
+                proxy.wake_up();
+            }
+        }
 
         // Run the initial subscription reconcile so streams start immediately.
         #[cfg(feature = "async")]
