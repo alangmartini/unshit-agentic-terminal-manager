@@ -7,15 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-09-21
+## [0.7.0] - 2026-09-22
 
-The 0.6.0 source revision did not compile on macOS. This release fixes that
-and is otherwise identical to 0.6.0 for Windows users. It is also the first
-release delivered through the app's own updater: a 0.6.0 install is offered
-it at startup and under **Settings › Updates**.
+Three headline features land together: folders and files open straight from
+Explorer and Finder, agents that finish a turn or wait for permission raise
+attention in the tab strip and on the desktop, and updating the app no
+longer stops the terminal sessions it manages. It is also the first release
+published since 0.6.0: the 0.6.1 version bump in source was never tagged, so
+its macOS build fix and the macOS bundle ship here. A 0.6.0 install is
+offered this release at startup and under **Settings › Updates**.
 
 ### Added
 
+- **Open folders and files from the desktop.** Windows Explorer and macOS
+  Finder can open a folder as a Terminal Manager terminal, and open text,
+  Markdown and patch files in the built-in editor or the patch review. The
+  same targets work as command-line arguments, and a running instance takes
+  them over instead of starting a second copy. The workspace explorer's
+  context menu gained matching "Open with Terminal Manager" entries.
+- **Agent attention notifications.** Settings can now install and remove
+  Terminal Manager's Claude Code and Codex lifecycle hooks. Finished turns and
+  permission requests produce targeted in-app and macOS/Windows desktop
+  notifications, while both the horizontal tab strip and the vertical workspace
+  row blink until the originating pane is focused. Harnesses without a common
+  hook contract (including OpenRouter-backed agents) can use the existing
+  `terminal-manager notify` command shown in the same settings section.
+- **Files group in the sidebar.** Each workspace lists its open file editors
+  in a compact **Files** group beside **Terminals** and **Agents**, marking
+  the active editor and unsaved buffers. Focus and close behaviour follow the
+  existing editor lifecycle.
+- **Software renderer preference.** **Settings › Appearance** gained a
+  persisted option to prefer the CPU renderer after the next restart. When no
+  software adapter is available the default renderer is used, so the
+  preference cannot block startup.
 - **macOS application bundle on the release page.** Each release now attaches
   `terminal-manager-<version>-macos-arm64.zip`, the Apple silicon bundle the
   quality gate builds from the release commit, next to the Windows installer.
@@ -25,8 +49,30 @@ it at startup and under **Settings › Updates**.
   now carries the crate version; it used to report 0.5.0 regardless of the
   release.
 
+### Changed
+
+- **Updates keep terminal sessions running.** Installing a new version no
+  longer stops the session daemon or the commands running inside it. The
+  Windows installers place each daemon release in its own
+  `daemons\<version>` folder, check that the running daemon is compatible
+  before replacing the UI, and relaunch the UI so it reattaches to its
+  existing sessions. A newer bundled daemon takes over on a later launch
+  once the running one has no children and no other clients; older daemons
+  keep running until they are stopped normally. Upgrading from a release
+  before this one still stops the daemon once, because the old UI's updater
+  does; to keep sessions across that first upgrade, close only the old UI
+  and run the new installer manually.
+
 ### Fixed
 
+- **Terminal italics on macOS.** ANSI italics no longer render as hollow
+  boxes when the monospace family has no slanted face: the renderer uses an
+  available slanted face from the requested family, or synthesizes italics
+  from the regular face.
+- **macOS dead-key input.** Dead-key composition (`´` then `a` gives `á`)
+  now works: the window enables its text-input client so AppKit composes the
+  key, and the composed text reaches the focused terminal like any other
+  keystroke.
 - **macOS build and process-based agent detection.** The 0.6.0 revision did
   not compile on macOS: the resource monitor's new agent detection read
   process command lines through a Windows-only probe. macOS now reads them
@@ -997,8 +1043,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...v0.6.1
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.3.3...v0.4.0
