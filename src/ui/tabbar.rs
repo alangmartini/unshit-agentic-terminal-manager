@@ -50,12 +50,14 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         }
         let is_dragging = dragging_source_id.as_deref() == Some(tab.id.as_str());
         let is_agent = agent_pane_ids_in_tab(state, index, tab);
-        tabs = tabs.with_child(build_tab(
+        let needs_attention = tab_needs_attention(state, index, tab);
+        tabs = tabs.with_child(build_tab_with_attention(
             index,
             tab,
             index == state.active_tab,
             is_dragging,
             is_agent,
+            needs_attention,
             sizing,
             shared,
         ));
@@ -178,12 +180,50 @@ fn agent_pane_ids_in_tab(state: &UiSnapshot, index: usize, tab: &TerminalTab) ->
         .any(|p| state.agent_pane_ids.contains(&p.id.0))
 }
 
+fn tab_needs_attention(state: &UiSnapshot, index: usize, tab: &TerminalTab) -> bool {
+    if state.attention_pane_ids.is_empty() {
+        return false;
+    }
+    let panes = if index == state.active_tab {
+        &state.panes
+    } else {
+        &tab.panes
+    };
+    panes
+        .iter()
+        .flatten()
+        .any(|pane| state.attention_pane_ids.contains(&pane.id.0))
+}
+
+#[cfg(test)]
 fn build_tab(
     index: usize,
     tab: &TerminalTab,
     is_active: bool,
     is_dragging_source: bool,
     is_agent: bool,
+    sizing: TabSizing,
+    shared: &SharedState,
+) -> ElementDef {
+    build_tab_with_attention(
+        index,
+        tab,
+        is_active,
+        is_dragging_source,
+        is_agent,
+        false,
+        sizing,
+        shared,
+    )
+}
+
+fn build_tab_with_attention(
+    index: usize,
+    tab: &TerminalTab,
+    is_active: bool,
+    is_dragging_source: bool,
+    is_agent: bool,
+    needs_attention: bool,
     sizing: TabSizing,
     shared: &SharedState,
 ) -> ElementDef {
@@ -218,6 +258,9 @@ fn build_tab(
 
     if is_agent {
         btn = btn.with_class("agent");
+    }
+    if needs_attention {
+        btn = btn.with_class("needs-attention");
     }
     let activate_state = shared.clone();
     btn = btn.on_click(move || {
@@ -354,6 +397,18 @@ mod tests {
         None
     }
 
+    fn find_by_key<'a>(el: &'a ElementDef, key: &str) -> Option<&'a ElementDef> {
+        if el.key.as_deref() == Some(key) {
+            return Some(el);
+        }
+        for child in &el.children {
+            if let Some(found) = find_by_key(child, key) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn make_shared() -> SharedState {
         Arc::new(Mutex::new(seed_state()))
     }
@@ -482,6 +537,24 @@ mod tests {
         let tabs = &el.children[0];
         // 3 tabs + add button
         assert_eq!(tabs.children.len(), 4);
+    }
+
+    #[test]
+    fn inactive_tab_with_attention_gets_blink_class() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.tabs = vec![
+                make_tab("claude", TabStatus::Running),
+                make_tab("shell", TabStatus::Running),
+            ];
+            guard.active_tab = 1;
+            guard.attention_pane_ids.insert(1);
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&state, &shared);
+        let tab = find_by_key(&el, "tab:t-claude").expect("attention tab");
+        assert!(has_class(tab, "needs-attention"));
     }
 
     // -- build_tab --

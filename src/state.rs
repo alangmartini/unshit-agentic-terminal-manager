@@ -586,6 +586,9 @@ pub fn push_notification_toast(
     pane_id: u32,
 ) -> unshit::core::toast::ToastId {
     let id = state.toasts.push(message);
+    if pane_id != state.active_pane.0 {
+        state.attention_pane_ids.insert(pane_id);
+    }
     state.toast_meta.insert(
         id,
         NotificationToastMeta {
@@ -1075,6 +1078,9 @@ pub struct AppState {
     /// guest title stops matching. `agent_restarts` takes precedence when
     /// both know a pane.
     pub pane_agents: std::collections::HashMap<u32, crate::agents::AgentTag>,
+    /// Panes with an unacknowledged agent notification. Cleared when the
+    /// user focuses the pane; intentionally never persisted.
+    pub attention_pane_ids: std::collections::HashSet<u32>,
     /// Panes whose title was set by the user (rename dialog). A pane in
     /// this set keeps its manual name; titles reported by the guest
     /// program via OSC 0/2 are ignored until the rename is cleared.
@@ -1325,6 +1331,7 @@ impl AppState {
             .chain(self.agent_restarts.keys())
             .copied()
             .collect();
+        let attention_pane_ids = self.attention_pane_ids.clone();
         let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
             self.terminals
                 .get(&self.active_pane.0)
@@ -1375,6 +1382,7 @@ impl AppState {
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
             agent_pane_ids,
+            attention_pane_ids,
             keybinds: self.keybinds.clone(),
             drag: self.drag.clone(),
             tabbar_rect: self.tabbar_rect,
@@ -1531,6 +1539,9 @@ pub struct UiSnapshot {
     /// Every pane currently classified as an agent pane, across all
     /// workspaces. The tab strip marks tabs whose panes appear here.
     pub agent_pane_ids: BTreeSet<u32>,
+    /// Panes with pending notifications. Both tab surfaces render an
+    /// attention indicator from this set.
+    pub attention_pane_ids: std::collections::HashSet<u32>,
     pub keybinds: crate::keybinds::KeybindsState,
     pub drag: crate::drag::DragState,
     pub tabbar_rect: crate::drag::Rect,
@@ -1757,6 +1768,7 @@ pub fn seed_state() -> AppState {
         agent_resume_preflights: std::collections::HashMap::new(),
         restore_correlation_id: crate::agent_restore::generate_session_id(),
         pane_agents: std::collections::HashMap::new(),
+        attention_pane_ids: std::collections::HashSet::new(),
         custom_titled_panes: std::collections::HashSet::new(),
         scale_factor: 1.0,
         cell_width_ratio: 0.6,
@@ -1905,6 +1917,10 @@ pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+    let pane_ids: Vec<u32> = state.panes.iter().flatten().map(|pane| pane.id.0).collect();
+    state
+        .attention_pane_ids
+        .retain(|pane_id| !pane_ids.contains(pane_id));
     // A mixed split may have last focused the other group.
     if is_agent_pane(state, state.active_pane.0) != agents {
         if let Some(pane) = state
@@ -1997,6 +2013,7 @@ fn focus_workspace_pane_by_index(state: &mut AppState, workspace_idx: usize, pan
     if let Some(tab) = state.tabs.get_mut(state.active_tab) {
         tab.active_pane = target;
     }
+    state.attention_pane_ids.remove(&target.0);
     true
 }
 
@@ -5500,6 +5517,7 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
 fn forget_agent_restore(state: &mut AppState, pane_id: u32) {
     forget_flow_launch(state, pane_id);
     state.pane_agents.remove(&pane_id);
+    state.attention_pane_ids.remove(&pane_id);
     state.agent_restarts.remove(&pane_id);
     state.pending_agent_resumes.remove(&pane_id);
     state.agent_resume_attempts.remove(&pane_id);
@@ -9333,6 +9351,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        "notifications.hooks.install" => dispatch_agent_notification_hooks_install(state),
+        "notifications.hooks.remove" => dispatch_agent_notification_hooks_remove(state),
         other if other.starts_with("session.kill:") => {
             if let Ok(sid) = other["session.kill:".len()..].parse::<u64>() {
                 mutate_kill_session_id(state, sid);
@@ -10611,6 +10631,36 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
     true
 }
 
+fn dispatch_agent_notification_hooks_install(state: &mut AppState) -> bool {
+    if install_agent_notification_hooks(state) {
+        push_error_toast(
+            state,
+            "Agent notification hooks are installed. Codex may ask you to trust them from /hooks.",
+        );
+    } else {
+        push_error_toast(
+            state,
+            "One or more agent notification hooks could not be installed. Any hook installed successfully remains active; no unmarked hook entries were changed.",
+        );
+    }
+    true
+}
+
+fn dispatch_agent_notification_hooks_remove(state: &mut AppState) -> bool {
+    if remove_agent_notification_hooks(state) {
+        push_error_toast(
+            state,
+            "Terminal Manager agent notification hooks were removed. Recovery hooks and unmarked provider hooks were not changed.",
+        );
+    } else {
+        push_error_toast(
+            state,
+            "One or more agent notification hooks could not be removed. No unmarked hook entries were changed.",
+        );
+    }
+    true
+}
+
 /// Refresh only on settings navigation/actions; rendering reads the snapshot.
 fn refresh_flow_skills(state: &mut AppState) {
     use crate::flow_explorer::skills::{
@@ -10912,6 +10962,16 @@ fn install_agent_recovery_hooks(state: &mut AppState) -> bool {
     }
 }
 
+#[cfg(test)]
+fn install_agent_notification_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn install_agent_notification_hooks(_state: &mut AppState) -> bool {
+    crate::agent_restore::hooks::install_agent_notification_hooks().all_succeeded()
+}
+
 fn dispatch_agent_recovery_hooks_remove(state: &mut AppState) -> bool {
     if !persist_auto_resume_preference(state, false) {
         push_error_toast(
@@ -10960,6 +11020,16 @@ fn remove_agent_recovery_hooks(state: &mut AppState) -> bool {
         crate::agent_restore::telemetry::record(&event);
     }
     report.all_succeeded()
+}
+
+#[cfg(test)]
+fn remove_agent_notification_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn remove_agent_notification_hooks(_state: &mut AppState) -> bool {
+    crate::agent_restore::hooks::uninstall_agent_notification_hooks().all_succeeded()
 }
 
 fn record_manual_resume_winner(
@@ -11745,6 +11815,7 @@ pub(crate) mod tests {
             agent_resume_preflights: std::collections::HashMap::new(),
             restore_correlation_id: crate::agent_restore::generate_session_id(),
             pane_agents: std::collections::HashMap::new(),
+            attention_pane_ids: std::collections::HashSet::new(),
             custom_titled_panes: std::collections::HashSet::new(),
             scale_factor: 1.0,
             cell_width_ratio: 0.6,
@@ -15930,6 +16001,30 @@ pub(crate) mod tests {
                 pane_id
             })
         );
+    }
+
+    #[test]
+    fn pane_notification_marks_attention_until_focus() {
+        let mut state = test_state();
+        let workspace_id = active_workspace_num(&state);
+        let attended_pane = state.tabs[0].panes[0][0].id.0;
+        mutate_add_tab(&mut state);
+
+        push_notification_toast(
+            &mut state,
+            "Claude Code finished",
+            "The agent finished its turn.",
+            workspace_id,
+            attended_pane,
+        );
+
+        assert!(state.attention_pane_ids.contains(&attended_pane));
+        let workspace_index = state.active_workspace;
+        assert!(dispatch(
+            &mut state,
+            &format!("terminal.focus:{workspace_index}:{attended_pane}")
+        ));
+        assert!(!state.attention_pane_ids.contains(&attended_pane));
     }
 
     #[test]
