@@ -106,6 +106,11 @@ pub struct PersistedState {
     /// False for legacy files and first runs.
     #[serde(default)]
     pub auto_resume_agents: bool,
+    /// Prefer the renderer's CPU/software adapter on the next launch. False
+    /// for legacy files and first runs so existing installs keep their current
+    /// hardware-first behavior.
+    #[serde(default)]
+    pub force_software_renderer: bool,
     /// App wide default shell. Empty for upgraders predating the
     /// feature so the daemon's own `default_shell()` keeps the floor;
     /// inference only runs in `seed_state` for true first runs.
@@ -393,6 +398,11 @@ impl PersistedState {
                 .get(&crate::state::ToggleKey::AutoResumeAgents)
                 .copied()
                 .unwrap_or(false),
+            force_software_renderer: state
+                .toggles
+                .get(&crate::state::ToggleKey::ForceSoftwareRenderer)
+                .copied()
+                .unwrap_or(false),
             default_shell: state.default_shell.clone(),
             check_updates_on_startup: Some(
                 state
@@ -597,6 +607,20 @@ pub fn default_config_path() -> Option<PathBuf> {
     crate::profile::config_dir().map(|d| d.join("workspaces.json"))
 }
 
+/// Read the startup-only software renderer preference before the regular
+/// workspace store is installed and logging is initialized. A missing or
+/// malformed config deliberately falls back to the normal hardware-first
+/// renderer; the ordinary load path reports that error later in startup.
+pub fn force_software_renderer_from_default_config() -> bool {
+    default_config_path().is_some_and(|path| force_software_renderer_from_path(&path))
+}
+
+fn force_software_renderer_from_path(path: &Path) -> bool {
+    PersistedState::read_from(path)
+        .map(|state| state.force_software_renderer)
+        .unwrap_or(false)
+}
+
 /// Install the config path used by `save_workspaces` / `load_workspaces`.
 /// Main installs the real path at startup. Tests that exercise persistence
 /// install a temp path. Tests that do not install get a no-op save/load.
@@ -760,6 +784,7 @@ mod tests {
             kill_all_on_close: false,
             worktree_tabs: false,
             auto_resume_agents: false,
+            force_software_renderer: false,
             default_shell: ShellSpec::default(),
             check_updates_on_startup: None,
             update_prompted_version: None,
@@ -830,11 +855,14 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_update_settings_and_legacy_defaults_to_on() {
+    fn round_trip_preserves_update_and_renderer_settings() {
         let mut state = seed_state();
         state
             .toggles
             .insert(crate::state::ToggleKey::CheckUpdatesOnStartup, false);
+        state
+            .toggles
+            .insert(crate::state::ToggleKey::ForceSoftwareRenderer, true);
         state.update.prompted_version = Some("0.9.0".to_string());
         let persisted = PersistedState::from_state(&state);
         let path = unique_temp_path("update-settings-round-trip");
@@ -842,12 +870,15 @@ mod tests {
         let loaded = PersistedState::read_from(&path).unwrap();
         assert_eq!(loaded.check_updates_on_startup, Some(false));
         assert_eq!(loaded.update_prompted_version.as_deref(), Some("0.9.0"));
+        assert!(loaded.force_software_renderer);
+        assert!(force_software_renderer_from_path(&path));
 
         // Before any prompt the version key is omitted entirely.
         let fresh = PersistedState::from_state(&seed_state());
         let json = serde_json::to_string(&fresh).unwrap();
         assert!(!json.contains("update_prompted_version"));
         assert!(json.contains("\"check_updates_on_startup\":true"));
+        assert!(json.contains("\"force_software_renderer\":false"));
 
         // A config predating the feature reads as "default", i.e. on.
         let legacy = r#"{
@@ -858,6 +889,7 @@ mod tests {
         assert_eq!(legacy.check_updates_on_startup, None);
         assert!(legacy.check_updates_on_startup.unwrap_or(true));
         assert_eq!(legacy.update_prompted_version, None);
+        assert!(!legacy.force_software_renderer);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -2064,7 +2064,9 @@ input, select {
 /* Two-class selector: must out-rank `.sb-row .sb-label`'s `flex: 1`
    above, whose basis-0 expansion would zero the name out. */
 .sb-row .terminal-entry-name,
-.terminal-entry-name {
+.terminal-entry-name,
+.sb-row .file-entry-name,
+.file-entry-name {
   /* Basis `auto` (not 0) so the name starts from the text's own width
      and OSC/guest titles longer than "shell" stay readable when the
      row overflows... */
@@ -2097,6 +2099,31 @@ input, select {
 
 .tab.active .tab-agent-ic,
 .terminal-entry.active .entry-agent-ic {
+  color: var(--amber-200);
+}
+
+/* File rows reuse the compact terminal-row geometry, but retain the file
+   glyph and unsaved marker so editor tabs are recognisable at a glance. */
+.terminal-entry .entry-file-ic {
+  display: inline-flex;
+  align-items: center;
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--azure);
+}
+
+.terminal-entry.active .entry-file-ic {
+  color: var(--amber-200);
+}
+
+.file-entry-dirty {
+  flex-shrink: 0;
+  color: var(--amber-300);
+  font-size: var(--t-xs);
+  line-height: 1;
+}
+
+.file-entry.active .file-entry-dirty {
   color: var(--amber-200);
 }
 

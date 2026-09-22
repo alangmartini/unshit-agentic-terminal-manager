@@ -3971,12 +3971,30 @@ fn terminal_shape_style(attrs: CellAttrs) -> u64 {
 }
 
 fn terminal_text_attrs<'a>(
+    font_system: &FontSystem,
     family: cosmic_text::Family<'a>,
     attrs: CellAttrs,
 ) -> cosmic_text::Attrs<'a> {
     let mut text_attrs = cosmic_text::Attrs::new().family(family);
     if attrs.contains(CellAttrs::ITALIC) {
-        text_attrs = text_attrs.style(cosmic_text::Style::Oblique);
+        // Choose a slanted face within the requested terminal family before
+        // shaping. Passing `Oblique` through directly can make fontdb leave
+        // the monospace family on macOS, where the fallback face turns plain
+        // ASCII into .notdef boxes.
+        let style = font_system
+            .db()
+            .query(&cosmic_text::fontdb::Query {
+                families: &[family],
+                weight: cosmic_text::Weight::NORMAL,
+                stretch: cosmic_text::Stretch::Normal,
+                style: cosmic_text::Style::Italic,
+            })
+            .and_then(|id| font_system.db().face(id))
+            .map_or(cosmic_text::Style::Normal, |face| face.style);
+        text_attrs = text_attrs.style(style);
+        if style == cosmic_text::Style::Normal {
+            text_attrs.cache_key_flags.insert(cosmic_text::CacheKeyFlags::FAKE_ITALIC);
+        }
     }
     text_attrs
 }
@@ -5635,7 +5653,7 @@ fn emit_grid_cell_glyph(
         let family = cosmic_text::Family::Monospace;
         // Silence unused on non-windows.
         let _ = family_name;
-        let attrs = terminal_text_attrs(family, cell.attrs);
+        let attrs = terminal_text_attrs(font_system, family, cell.attrs);
         // Miss path only (the ShapeCache keeps the result): a symbol the
         // terminal font lacks that resolved to the color-emoji face is
         // re-shaped onto the monochrome symbol face, matching the UI path.
@@ -8987,15 +9005,52 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn terminal_text_attrs_maps_sgr_italic_to_oblique_without_bold_face() {
+    fn terminal_text_attrs_requests_italic_without_bold_face() {
         let attrs = terminal_text_attrs(
+            &FontSystem::new(),
             cosmic_text::Family::Name("Consolas"),
             CellAttrs::BOLD | CellAttrs::ITALIC,
         );
 
         assert_eq!(attrs.weight, cosmic_text::Weight::NORMAL);
-        assert_eq!(attrs.style, cosmic_text::Style::Oblique);
+        assert_eq!(attrs.style, cosmic_text::Style::Italic);
+        assert!(!attrs.cache_key_flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC));
+    }
+
+    #[test]
+    fn terminal_missing_italic_face_keeps_ascii_out_of_notdef_and_slants_ink() {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../../unshit-app/tests/fixtures/FiraMono-Medium.ttf").to_vec(),
+        );
+        let mut fs = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let mut buffer = cosmic_text::Buffer::new(&mut fs, Metrics::new(24.0, 30.0));
+        buffer.set_size(&mut fs, Some(100.0), None);
+        let attrs =
+            terminal_text_attrs(&fs, cosmic_text::Family::Name("Fira Mono"), CellAttrs::ITALIC);
+        assert!(attrs.cache_key_flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC));
+        buffer.set_text(&mut fs, "New", attrs, cosmic_text::Shaping::Advanced);
+        buffer.shape_until_scroll(&mut fs, false);
+        let mut glyphs: Vec<_> =
+            buffer.layout_runs().flat_map(|run| run.glyphs.iter().cloned()).collect();
+        assert_eq!(glyphs.len(), 3, "the tip's italic New shapes one glyph per ASCII letter");
+        assert!(glyphs.iter().all(|glyph| glyph.glyph_id != 0));
+        assert!(glyphs.iter().all(|glyph| {
+            fs.db().face(glyph.font_id).unwrap().style == cosmic_text::Style::Normal
+                && glyph.cache_key_flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC)
+        }));
+
+        let mut glyph = glyphs.remove(0);
+        let mut swash = SwashCache::new();
+        let italic =
+            swash.get_image_uncached(&mut fs, glyph.physical((0.0, 0.0), 1.0).cache_key).unwrap();
+        glyph.cache_key_flags.remove(cosmic_text::CacheKeyFlags::FAKE_ITALIC);
+        let upright =
+            swash.get_image_uncached(&mut fs, glyph.physical((0.0, 0.0), 1.0).cache_key).unwrap();
+        assert_ne!(upright.data, italic.data, "SGR italic must change the rasterized ink");
+        assert!(italic.placement.width > upright.placement.width, "slanted N extends horizontally");
     }
 
     #[test]

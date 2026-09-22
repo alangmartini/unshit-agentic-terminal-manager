@@ -105,14 +105,18 @@ pub enum AdapterTier {
     Software,
 }
 
-/// Env-driven override for which adapter tier `GpuContext::new` may select.
-/// `auto` (the default) runs the full escalation ladder (hardware, then
-/// broadened backends, then software). `hardware` disables the software
-/// fallback (mirrors the pre-fallback panic-on-no-GPU behavior). `software`
-/// skips straight to the software adapter so the path can be exercised on a
-/// GPU machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderTierPref {
+/// Startup preference for which adapter tier [`GpuContext`] may select.
+///
+/// `Auto` (the default) runs the full escalation ladder (hardware, then
+/// broadened backends, then software). `HardwareOnly` disables the software
+/// fallback, while `SoftwareOnly` tries the software adapter first. If a
+/// platform has no usable software adapter, it makes one hardware attempt so
+/// an explicit recovery preference cannot prevent the app from launching.
+/// Renderer environment overrides remain authoritative so operators can still
+/// recover a launch without changing application config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderTierPreference {
+    #[default]
     Auto,
     HardwareOnly,
     SoftwareOnly,
@@ -121,19 +125,28 @@ enum RenderTierPref {
 const FORCE_SOFTWARE_ENV: &str = "TM_FORCE_SOFTWARE_RENDERER";
 const RENDER_TIER_ENV: &str = "UNSHIT_RENDER_TIER";
 
-/// Read the env-driven tier preference. `TM_FORCE_SOFTWARE_RENDERER=1|true` is
-/// a convenience alias for `UNSHIT_RENDER_TIER=software`.
-fn render_tier_pref() -> RenderTierPref {
-    if matches!(std::env::var(FORCE_SOFTWARE_ENV).as_deref(), Ok("1" | "true")) {
-        return RenderTierPref::SoftwareOnly;
+/// Resolve the startup preference after applying environment overrides.
+/// `TM_FORCE_SOFTWARE_RENDERER=1|true` is a convenience alias for
+/// `UNSHIT_RENDER_TIER=software`.
+fn render_tier_pref(preferred: RenderTierPreference) -> RenderTierPreference {
+    let force_software = std::env::var(FORCE_SOFTWARE_ENV).ok();
+    let render_tier = std::env::var(RENDER_TIER_ENV).ok();
+    render_tier_pref_from_values(force_software.as_deref(), render_tier.as_deref(), preferred)
+}
+
+fn render_tier_pref_from_values(
+    force_software: Option<&str>,
+    render_tier: Option<&str>,
+    preferred: RenderTierPreference,
+) -> RenderTierPreference {
+    if matches!(force_software, Some("1" | "true")) {
+        return RenderTierPreference::SoftwareOnly;
     }
-    // Bind the lowered value so the `&str` handed to `match` outlives the
-    // temporary `String` (chaining `as_deref` after `map` would dangle).
-    let lower = std::env::var(RENDER_TIER_ENV).ok().map(|v| v.to_ascii_lowercase());
+    let lower = render_tier.map(str::to_ascii_lowercase);
     match lower.as_deref() {
-        Some("software") | Some("cpu") => RenderTierPref::SoftwareOnly,
-        Some("hardware") | Some("gpu") => RenderTierPref::HardwareOnly,
-        _ => RenderTierPref::Auto,
+        Some("software") | Some("cpu") => RenderTierPreference::SoftwareOnly,
+        Some("hardware") | Some("gpu") => RenderTierPreference::HardwareOnly,
+        _ => preferred,
     }
 }
 
@@ -636,6 +649,7 @@ pub enum RenderTarget {
 pub struct WindowGpuPreferences {
     pub backends: Option<wgpu::Backends>,
     pub present_mode: Option<wgpu::PresentMode>,
+    pub render_tier: RenderTierPreference,
 }
 
 impl WindowGpuPreferences {
@@ -647,6 +661,7 @@ impl WindowGpuPreferences {
         Self {
             backends: Some(wgpu::Backends::DX12),
             present_mode: Some(wgpu::PresentMode::Mailbox),
+            render_tier: RenderTierPreference::Auto,
         }
     }
 }
@@ -842,29 +857,31 @@ impl GpuContext {
     ///
     /// `TM_FORCE_SOFTWARE_RENDERER=1` / `UNSHIT_RENDER_TIER=software` skips
     /// straight to step 3 so the software path can be exercised on a GPU
-    /// machine; `UNSHIT_RENDER_TIER=hardware` disables the fallback. The two
-    /// `Instance`s exist because a wgpu surface is bound to the instance's
-    /// backends, so reaching WARP needs a fresh all-backends instance when the
-    /// preferred-backend instance yielded nothing.
+    /// machine. If that adapter is unavailable, one hardware recovery attempt
+    /// keeps the app launchable. `UNSHIT_RENDER_TIER=hardware` disables the
+    /// software fallback. The two `Instance`s exist because a wgpu surface is
+    /// bound to the instance's backends, so reaching WARP needs a fresh
+    /// all-backends instance when the preferred-backend instance yielded
+    /// nothing.
     pub async fn new(window: Arc<dyn winit::window::Window>) -> Self {
         Self::new_with_preferences(window, WindowGpuPreferences::default()).await
     }
 
-    /// Create a windowed context with startup-only backend and presentation
-    /// preferences from the app's platform scheduler. Environment overrides
-    /// remain authoritative for diagnostics and recovery.
+    /// Create a windowed context with startup-only backend, presentation, and
+    /// adapter-tier preferences from the app's platform scheduler. Environment
+    /// overrides remain authoritative for diagnostics and recovery.
     pub async fn new_with_preferences(
         window: Arc<dyn winit::window::Window>,
         preferences: WindowGpuPreferences,
     ) -> Self {
         let size = window.surface_size();
-        let pref = render_tier_pref();
+        let pref = render_tier_pref(preferences.render_tier);
         let init_started = std::time::Instant::now();
 
         // Step 1 — preferred backends, hardware only; skipped only when
         // software is forced.
         #[cfg(windows)]
-        if pref != RenderTierPref::SoftwareOnly {
+        if pref != RenderTierPreference::SoftwareOnly {
             if let Some((instance, adapter, device, queue, tier)) = Self::take_prewarmed() {
                 // The adapter came from an instance that never saw this
                 // window, so its ability to present here is an assumption
@@ -899,7 +916,7 @@ impl GpuContext {
             }
         }
 
-        if pref != RenderTierPref::SoftwareOnly {
+        if pref != RenderTierPreference::SoftwareOnly {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: renderer_backends(preferences.backends),
                 ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
@@ -940,8 +957,16 @@ impl GpuContext {
             }
         }
 
-        // Steps 2 & 3 share a fresh all-backends instance + surface so a
-        // software adapter (WARP/lavapipe) becomes reachable.
+        // Steps 2 & 3, plus a `SoftwareOnly` recovery rung, share a fresh
+        // all-backends instance + surface so a software adapter
+        // (WARP/lavapipe) becomes reachable. Which rungs run, and in what
+        // order, is fully determined by `pref`: Auto tries hardware then
+        // software, HardwareOnly stops after hardware, and SoftwareOnly
+        // tries software first and falls back to one hardware attempt if it
+        // fails. A few platforms (notably a standard Metal installation)
+        // expose no CPU adapter at all, and SoftwareOnly is a recovery
+        // preference, so that last rung keeps it from turning into a launch
+        // failure.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
@@ -950,20 +975,55 @@ impl GpuContext {
             .create_surface(window.clone())
             .unwrap_or_else(|e| panic!("failed to create a render surface for the window: {e:?}"));
 
-        // Step 2 — a real GPU on a backend the preferred set excluded.
-        if pref != RenderTierPref::SoftwareOnly {
-            if let Some((adapter, device, queue, tier)) = Self::request_window_adapter_device(
-                &instance,
-                &surface,
-                wgpu::PowerPreference::HighPerformance,
-                false,
-            )
-            .await
+        type Rung = (wgpu::PowerPreference, bool, &'static str, Option<(log::Level, &'static str)>);
+        let hardware: Rung =
+            (wgpu::PowerPreference::HighPerformance, false, "broadened backends", None);
+        let software: Rung = (wgpu::PowerPreference::LowPower, true, "software fallback", None);
+        let rungs: &[Rung] = match pref {
+            RenderTierPreference::Auto => &[
+                hardware,
+                (
+                    software.0,
+                    software.1,
+                    software.2,
+                    Some((
+                        log::Level::Warn,
+                        "no hardware GPU adapter available; falling back to a software/CPU renderer",
+                    )),
+                ),
+            ],
+            RenderTierPreference::HardwareOnly => &[hardware],
+            RenderTierPreference::SoftwareOnly => &[
+                (
+                    software.0,
+                    software.1,
+                    software.2,
+                    Some((
+                        log::Level::Info,
+                        "software renderer requested; skipping the initial hardware adapter",
+                    )),
+                ),
+                (
+                    hardware.0,
+                    hardware.1,
+                    "hardware recovery after unavailable software",
+                    Some((
+                        log::Level::Warn,
+                        "software renderer was requested but unavailable; retrying the default hardware adapter",
+                    )),
+                ),
+            ],
+        };
+
+        for &(power, force_fallback, label, before) in rungs {
+            if let Some((level, msg)) = before {
+                log::log!(level, "{msg}");
+            }
+            if let Some((adapter, device, queue, tier)) =
+                Self::request_window_adapter_device(&instance, &surface, power, force_fallback)
+                    .await
             {
-                log::info!(
-                    "renderer adapter selected (broadened backends): {:?}",
-                    adapter.get_info()
-                );
+                log::info!("renderer adapter selected ({label}): {:?}", adapter.get_info());
                 return Self::build_window_context(
                     window,
                     size,
@@ -975,44 +1035,19 @@ impl GpuContext {
                     preferences,
                 );
             }
-            log::warn!(
-                "no hardware GPU adapter available; falling back to a software/CPU renderer"
-            );
-        } else {
-            log::info!("software renderer forced by env override; skipping hardware adapter");
         }
 
-        // Step 3 — software/CPU adapter (WARP / lavapipe).
-        match Self::request_window_adapter_device(
-            &instance,
-            &surface,
-            wgpu::PowerPreference::LowPower,
-            true,
-        )
-        .await
-        {
-            Some((adapter, device, queue, tier)) => {
-                log::info!(
-                    "renderer adapter selected (software fallback): {:?}",
-                    adapter.get_info()
-                );
-                Self::build_window_context(
-                    window,
-                    size,
-                    surface,
-                    adapter,
-                    device,
-                    queue,
-                    tier,
-                    preferences,
-                )
-            }
-            None => panic!(
-                "GPU initialization failed: no graphics adapter (hardware or software) is \
-                 available. Update your graphics drivers or set UNSHIT_RENDER_BACKEND. A software \
-                 rasterizer (WARP/lavapipe) was also unavailable."
-            ),
+        if pref == RenderTierPreference::HardwareOnly {
+            panic!(
+                "GPU initialization failed: no hardware graphics adapter is available. Update \
+                 your graphics drivers or allow the software fallback."
+            );
         }
+        panic!(
+            "GPU initialization failed: no graphics adapter is available. Update your graphics \
+             drivers or set UNSHIT_RENDER_BACKEND. A software rasterizer (WARP/lavapipe) was \
+             also unavailable."
+        )
     }
 
     /// One attempt at the window adapter+device for a given instance/surface and
@@ -1071,9 +1106,9 @@ impl GpuContext {
     pub fn prewarm(preferences: WindowGpuPreferences) {
         #[cfg(windows)]
         {
-            // A forced software renderer wants WARP specifically, which this
-            // hardware-preferring request would not produce.
-            if render_tier_pref() == RenderTierPref::SoftwareOnly {
+            // A requested software renderer wants WARP specifically, which
+            // this hardware-preferring request would not produce.
+            if render_tier_pref(preferences.render_tier) == RenderTierPreference::SoftwareOnly {
                 return;
             }
             // Resolved through the same helper the real request uses, env
@@ -3205,6 +3240,42 @@ fn apply_object_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_render_tier_is_used_without_environment_override() {
+        assert_eq!(
+            render_tier_pref_from_values(None, None, RenderTierPreference::SoftwareOnly),
+            RenderTierPreference::SoftwareOnly
+        );
+        assert_eq!(
+            render_tier_pref_from_values(None, None, RenderTierPreference::HardwareOnly),
+            RenderTierPreference::HardwareOnly
+        );
+    }
+
+    #[test]
+    fn renderer_environment_overrides_explicit_render_tier() {
+        assert_eq!(
+            render_tier_pref_from_values(
+                Some("1"),
+                Some("hardware"),
+                RenderTierPreference::HardwareOnly
+            ),
+            RenderTierPreference::SoftwareOnly
+        );
+        assert_eq!(
+            render_tier_pref_from_values(
+                None,
+                Some("software"),
+                RenderTierPreference::HardwareOnly
+            ),
+            RenderTierPreference::SoftwareOnly
+        );
+        assert_eq!(
+            render_tier_pref_from_values(None, Some("GPU"), RenderTierPreference::SoftwareOnly),
+            RenderTierPreference::HardwareOnly
+        );
+    }
 
     /// Regression: clicking the window close button raised
     /// `Texture with '<Surface Texture>' label do not contain required usage
