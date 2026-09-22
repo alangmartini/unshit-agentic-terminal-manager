@@ -39,10 +39,7 @@ cleanup() {
 	if [[ "$mounted" == 1 ]]; then
 		/usr/bin/hdiutil detach "$mountpoint" -quiet || true
 	fi
-	# `work` is always a directory made by mktemp with our fixed prefix.
-	if [[ "$work" == */terminal-manager-dmg.* && -d "$work" ]]; then
-		rm -rf -- "$work"
-	fi
+	rm -rf -- "$work"
 }
 trap cleanup EXIT INT TERM
 
