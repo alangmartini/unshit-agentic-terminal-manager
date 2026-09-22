@@ -61,6 +61,14 @@ pub enum NotificationIpcRequest {
         pane_id: u32,
         capability: String,
     },
+    AgentNotify {
+        agent: crate::agent_restore::AgentKind,
+        title: String,
+        text: String,
+        workspace_id: u32,
+        pane_id: u32,
+        capability: String,
+    },
     /// `terminal-manager agent [<profile>] [--workspace-id N]`: open a
     /// new agent tab. `profile` is a `crate::agents` id (default agent
     /// when absent); `workspace_id` is the daemon routing id (active
@@ -172,6 +180,12 @@ pub enum CliCommand {
         target: Option<NotificationTarget>,
         capability: Option<String>,
     },
+    AgentNotify {
+        socket: PathBuf,
+        agent: crate::agent_restore::AgentKind,
+        target: Option<NotificationTarget>,
+        capability: Option<String>,
+    },
     NewAgent {
         socket: PathBuf,
         profile: Option<String>,
@@ -185,6 +199,7 @@ enum CliMode {
     Notify,
     Activate,
     SessionHook(crate::agent_restore::AgentKind),
+    AgentNotify(crate::agent_restore::AgentKind),
     NewAgent,
 }
 
@@ -209,11 +224,15 @@ where
         .first()
         .is_some_and(|arg| arg.to_string_lossy() == "session-hook");
     let hook_agent = session_hook_agent_from_args(&args);
+    let is_agent_notify = args
+        .first()
+        .is_some_and(|arg| arg.to_string_lossy() == "agent-notify");
+    let is_managed_hook = is_session_hook || is_agent_notify;
     let command = match parse_cli_args(args, |key| std::env::var(key).ok()) {
         Ok(Some(command)) => command,
         Ok(None) => return None,
         Err(e) => {
-            if is_session_hook {
+            if is_managed_hook {
                 record_hook_cli_failure(hook_agent, "cli_parse", "invalid_arguments");
                 return Some(0);
             }
@@ -294,6 +313,38 @@ where
                 },
             )
         }
+        CliCommand::AgentNotify {
+            socket,
+            agent,
+            target,
+            capability,
+        } => {
+            let (Some(target), Some(capability)) = (target, capability) else {
+                return Some(0);
+            };
+            if !trusted_hook_socket(&socket) {
+                record_hook_cli_failure(Some(agent), "hook_transport", "untrusted_endpoint");
+                return Some(0);
+            }
+            let notification = match read_agent_notification_input(agent, std::io::stdin().lock()) {
+                Ok(notification) => notification,
+                Err(_) => {
+                    record_hook_cli_failure(Some(agent), "hook_payload", "invalid_payload");
+                    return Some(0);
+                }
+            };
+            send_hook_request_blocking(
+                &socket,
+                NotificationIpcRequest::AgentNotify {
+                    agent,
+                    title: notification.title,
+                    text: notification.text,
+                    workspace_id: target.workspace_id,
+                    pane_id: target.pane_id,
+                    capability,
+                },
+            )
+        }
         CliCommand::NewAgent {
             socket,
             profile,
@@ -310,7 +361,7 @@ where
     match result {
         Ok(()) => Some(0),
         Err(e) => {
-            if is_session_hook {
+            if is_managed_hook {
                 record_hook_cli_failure(
                     hook_agent,
                     "hook_transport",
@@ -373,12 +424,15 @@ where
             let provider = args
                 .next()
                 .ok_or_else(|| "session-hook requires a provider".to_string())?;
-            let agent = match provider.as_str() {
-                "claude" => crate::agent_restore::AgentKind::Claude,
-                "codex" => crate::agent_restore::AgentKind::Codex,
-                _ => return Err("session-hook provider must be claude or codex".to_string()),
-            };
+            let agent = parse_hook_agent("session-hook", &provider)?;
             CliMode::SessionHook(agent)
+        }
+        "agent-notify" => {
+            let provider = args
+                .next()
+                .ok_or_else(|| "agent-notify requires a provider".to_string())?;
+            let agent = parse_hook_agent("agent-notify", &provider)?;
+            CliMode::AgentNotify(agent)
         }
         "agent" | "new-agent" => CliMode::NewAgent,
         _ => return Ok(None),
@@ -389,27 +443,31 @@ where
         match arg.as_str() {
             "--help" | "-h" => return Err(notification_usage().to_string()),
             "--title" => {
-                if matches!(mode, CliMode::SessionHook(_)) {
-                    return Err("session-hook does not accept notification content".into());
+                if is_hook_mode(&mode) {
+                    return Err(
+                        "hooks do not accept notification content on the command line".into(),
+                    );
                 }
                 fields.title = Some(take_value(&mut args, "--title")?);
             }
             "--text" | "--body" | "--message" => {
-                if matches!(mode, CliMode::SessionHook(_)) {
-                    return Err("session-hook does not accept notification content".into());
+                if is_hook_mode(&mode) {
+                    return Err(
+                        "hooks do not accept notification content on the command line".into(),
+                    );
                 }
                 fields.text = Some(take_value(&mut args, arg.as_str())?)
             }
             "--socket" => fields.socket = Some(PathBuf::from(take_value(&mut args, "--socket")?)),
             "--workspace-id" | "--workspace" => {
-                if matches!(mode, CliMode::SessionHook(_)) {
-                    return Err("session-hook target comes only from terminal environment".into());
+                if is_hook_mode(&mode) {
+                    return Err("hook targets come only from terminal environment".into());
                 }
                 fields.workspace_id = Some(parse_u32_flag(&mut args, arg.as_str())?)
             }
             "--pane-id" | "--pane" => {
-                if matches!(mode, CliMode::SessionHook(_)) {
-                    return Err("session-hook target comes only from terminal environment".into());
+                if is_hook_mode(&mode) {
+                    return Err("hook targets come only from terminal environment".into());
                 }
                 fields.pane_id = Some(parse_u32_flag(&mut args, arg.as_str())?)
             }
@@ -437,7 +495,7 @@ where
                     }
                     fields.profile = Some(positional.to_string());
                 }
-                CliMode::SessionHook(_) => {
+                CliMode::SessionHook(_) | CliMode::AgentNotify(_) => {
                     return Err(format!("unexpected positional argument {positional:?}"));
                 }
                 _ => return Err(format!("unexpected positional argument {positional:?}")),
@@ -513,6 +571,13 @@ where
             capability: get_env(ENV_AGENT_HOOK_CAPABILITY)
                 .filter(|value| is_valid_hook_capability(value)),
         })),
+        CliMode::AgentNotify(agent) => Ok(Some(CliCommand::AgentNotify {
+            socket,
+            agent,
+            target: env_target(),
+            capability: get_env(ENV_AGENT_HOOK_CAPABILITY)
+                .filter(|value| is_valid_hook_capability(value)),
+        })),
         CliMode::NewAgent => {
             if fields.title.is_some() || fields.text.is_some() {
                 return Err("agent does not accept notification content".into());
@@ -528,6 +593,21 @@ where
             }))
         }
     }
+}
+
+fn parse_hook_agent(
+    command: &str,
+    provider: &str,
+) -> Result<crate::agent_restore::AgentKind, String> {
+    match provider {
+        "claude" => Ok(crate::agent_restore::AgentKind::Claude),
+        "codex" => Ok(crate::agent_restore::AgentKind::Codex),
+        _ => Err(format!("{command} provider must be claude or codex")),
+    }
+}
+
+fn is_hook_mode(mode: &CliMode) -> bool {
+    matches!(mode, CliMode::SessionHook(_) | CliMode::AgentNotify(_))
 }
 
 fn take_value<I>(args: &mut I, flag: &str) -> Result<String, String>
@@ -563,7 +643,7 @@ fn require_non_empty(value: Option<String>, field: &str) -> Result<String, Strin
 }
 
 fn notification_usage() -> &'static str {
-    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>"
+    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>\n       terminal-manager agent-notify <claude|codex>"
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -579,6 +659,23 @@ struct AgentSessionObservation {
     session_id: String,
     cwd: PathBuf,
     source: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct AgentNotificationInput {
+    hook_event_name: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    notification_type: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AgentNotification {
+    title: String,
+    text: String,
 }
 
 fn read_session_hook_input<R: Read>(reader: R) -> Result<AgentSessionObservation, String> {
@@ -613,6 +710,61 @@ fn read_session_hook_input<R: Read>(reader: R) -> Result<AgentSessionObservation
         cwd: input.cwd,
         source: input.source,
     })
+}
+
+fn read_agent_notification_input<R: Read>(
+    agent: crate::agent_restore::AgentKind,
+    reader: R,
+) -> Result<AgentNotification, String> {
+    const MAX_HOOK_STDIN_BYTES: u64 = 64 * 1024;
+    const MAX_TITLE_CHARS: usize = 120;
+    const MAX_TEXT_CHARS: usize = 480;
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_HOOK_STDIN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "could not read hook input".to_string())?;
+    if bytes.len() as u64 > MAX_HOOK_STDIN_BYTES {
+        return Err("hook input exceeds size limit".into());
+    }
+    let input: AgentNotificationInput =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid hook JSON".to_string())?;
+    let label = crate::agents::profile_for_restore_kind(agent)
+        .map(|profile| profile.label)
+        .unwrap_or("Agent");
+    let finished = match input.hook_event_name.as_str() {
+        "Stop" => true,
+        "PermissionRequest" | "Notification" => false,
+        _ => return Err("unsupported notification event".into()),
+    };
+    let title = input
+        .title
+        .and_then(|value| normalize_notification_text(value, MAX_TITLE_CHARS))
+        .unwrap_or_else(|| {
+            if finished {
+                format!("{label} finished")
+            } else {
+                format!("{label} needs attention")
+            }
+        });
+    let text = input
+        .message
+        .and_then(|value| normalize_notification_text(value, MAX_TEXT_CHARS))
+        .unwrap_or_else(|| {
+            if finished {
+                "The agent finished its turn.".to_string()
+            } else if input.notification_type.as_deref() == Some("agent_completed") {
+                "The background agent completed.".to_string()
+            } else {
+                "The agent is waiting for your attention.".to_string()
+            }
+        });
+    Ok(AgentNotification { title, text })
+}
+
+fn normalize_notification_text(value: String, max_chars: usize) -> Option<String> {
+    let normalized = value.trim().chars().take(max_chars).collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn send_cli_request_blocking(socket: &Path, request: NotificationIpcRequest) -> io::Result<()> {
@@ -941,6 +1093,50 @@ fn apply_ipc_request(
             effect.rebuild = true;
             effect.accepted = true;
         }
+        NotificationIpcRequest::AgentNotify {
+            agent,
+            title,
+            text,
+            workspace_id,
+            pane_id,
+            capability,
+        } => {
+            let desktop_title = title.clone();
+            let desktop_text = text.clone();
+            let valid = mutate_with(shared, |state| {
+                let target_valid = pane_belongs_to_workspace(state, workspace_id, pane_id)
+                    && is_valid_hook_capability(&capability)
+                    && state.pty_manager.hook_capability(pane_id) == Some(capability.as_str());
+                if target_valid {
+                    push_notification_toast(
+                        state,
+                        title.clone(),
+                        text.clone(),
+                        workspace_id,
+                        pane_id,
+                    );
+                }
+                target_valid
+            });
+            if valid {
+                let desktop = DesktopNotification {
+                    title: desktop_title,
+                    text: desktop_text,
+                    workspace_id,
+                    pane_id,
+                    socket: socket.to_path_buf(),
+                };
+                if let Err(e) = spawn_desktop_notification(&desktop) {
+                    log::warn!("desktop agent notification failed: {e}");
+                }
+                effect.rebuild = true;
+                effect.accepted = true;
+            } else {
+                log::warn!(
+                    "agent notification rejected: agent={agent:?} workspace_id={workspace_id} pane_id={pane_id}"
+                );
+            }
+        }
         NotificationIpcRequest::Activate {
             workspace_id,
             pane_id,
@@ -1135,7 +1331,10 @@ fn normalized_hook_source(source: &str) -> Option<&'static str> {
 }
 
 fn session_hook_agent_from_args(args: &[OsString]) -> Option<crate::agent_restore::AgentKind> {
-    if args.first()?.to_string_lossy() != "session-hook" {
+    if !matches!(
+        args.first()?.to_string_lossy().as_ref(),
+        "session-hook" | "agent-notify"
+    ) {
         return None;
     }
     match args.get(1)?.to_string_lossy().as_ref() {
@@ -1414,6 +1613,34 @@ mod tests {
                     workspace_id: 4,
                     pane_id: 9,
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_notification_uses_terminal_target_and_capability() {
+        let parsed = parse_cli_args(
+            ["agent-notify", "codex"],
+            env_map(&[
+                (ENV_NOTIFY_SOCKET, "hook.sock"),
+                (ENV_WORKSPACE_ID, "4"),
+                (ENV_PANE_ID, "9"),
+                (ENV_AGENT_HOOK_CAPABILITY, CAPABILITY),
+            ]),
+        )
+        .expect("parse")
+        .expect("command");
+
+        assert_eq!(
+            parsed,
+            CliCommand::AgentNotify {
+                socket: PathBuf::from("hook.sock"),
+                agent: crate::agent_restore::AgentKind::Codex,
+                target: Some(NotificationTarget {
+                    workspace_id: 4,
+                    pane_id: 9,
+                }),
+                capability: Some(CAPABILITY.to_string()),
             }
         );
     }
@@ -1778,6 +2005,41 @@ mod tests {
             session_hook_agent_from_args(&["session-hook".into(), "codex".into()]),
             Some(crate::agent_restore::AgentKind::Codex)
         );
+    }
+
+    #[test]
+    fn agent_notification_input_uses_only_allowlisted_content() {
+        let input = br#"{
+            "session_id": "not-used",
+            "cwd": "/private/transcript",
+            "hook_event_name": "Notification",
+            "message": "Claude needs permission",
+            "title": "Permission needed",
+            "notification_type": "permission_prompt",
+            "last_assistant_message": "ignored"
+        }"#;
+        let notification =
+            read_agent_notification_input(crate::agent_restore::AgentKind::Claude, &input[..])
+                .expect("notification");
+
+        assert_eq!(notification.title, "Permission needed");
+        assert_eq!(notification.text, "Claude needs permission");
+    }
+
+    #[test]
+    fn agent_notification_input_rejects_unknown_events_and_oversize_payloads() {
+        assert!(read_agent_notification_input(
+            crate::agent_restore::AgentKind::Claude,
+            br#"{"hook_event_name":"SessionStart"}"#.as_slice(),
+        )
+        .is_err());
+        let mut oversize = br#"{"hook_event_name":"Stop"}"#.to_vec();
+        oversize.resize(64 * 1024 + 1, b' ');
+        assert!(read_agent_notification_input(
+            crate::agent_restore::AgentKind::Claude,
+            oversize.as_slice(),
+        )
+        .is_err());
     }
 
     #[test]

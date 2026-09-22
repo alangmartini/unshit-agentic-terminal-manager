@@ -24,10 +24,11 @@ pub fn build_sidebar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
     }
     let mut scroll = ElementDef::new(Tag::Div).with_class("sidebar-scroll");
     for (w_idx, workspace) in state.workspaces.iter().enumerate() {
-        scroll = scroll.with_child(build_workspace(
+        scroll = scroll.with_child(build_workspace_with_attention(
             w_idx,
             w_idx == state.active_workspace,
             state.active_pane,
+            &state.attention_pane_ids,
             workspace,
             shared,
         ));
@@ -70,10 +71,29 @@ fn build_sidebar_head(_shared: &SharedState) -> ElementDef {
         )
 }
 
+#[cfg(test)]
 fn build_workspace(
     workspace_index: usize,
     is_active: bool,
     active_pane: crate::state::PaneId,
+    workspace: &Workspace,
+    shared: &SharedState,
+) -> ElementDef {
+    build_workspace_with_attention(
+        workspace_index,
+        is_active,
+        active_pane,
+        &std::collections::HashSet::new(),
+        workspace,
+        shared,
+    )
+}
+
+fn build_workspace_with_attention(
+    workspace_index: usize,
+    is_active: bool,
+    active_pane: crate::state::PaneId,
+    attention_pane_ids: &std::collections::HashSet<u32>,
     workspace: &Workspace,
     shared: &SharedState,
 ) -> ElementDef {
@@ -189,11 +209,12 @@ fn build_workspace(
                 .with_class(list_class);
             let count = list.len();
             for (t_idx, entry) in list.iter().enumerate() {
-                entries = entries.with_child(build_terminal_entry(
+                entries = entries.with_child(build_terminal_entry_with_attention(
                     workspace_index,
                     entry,
                     t_idx == count - 1,
                     entry.pane_id == active_pane,
+                    attention_pane_ids.contains(&entry.pane_id.0),
                     shared,
                 ));
             }
@@ -335,11 +356,23 @@ fn build_subtab(
     btn
 }
 
+#[cfg(test)]
 fn build_terminal_entry(
     workspace_index: usize,
     entry: &TerminalEntry,
     is_last: bool,
     is_active: bool,
+    shared: &SharedState,
+) -> ElementDef {
+    build_terminal_entry_with_attention(workspace_index, entry, is_last, is_active, false, shared)
+}
+
+fn build_terminal_entry_with_attention(
+    workspace_index: usize,
+    entry: &TerminalEntry,
+    is_last: bool,
+    is_active: bool,
+    needs_attention: bool,
     shared: &SharedState,
 ) -> ElementDef {
     let glyph = if is_last { "\u{2514}" } else { "\u{251C}" };
@@ -393,6 +426,9 @@ fn build_terminal_entry(
         row = row
             .with_class("agent")
             .with_child(svg_icon(icon_agent()).with_class("entry-agent-ic"));
+    }
+    if needs_attention {
+        row = row.with_class("needs-attention");
     }
     row = row.with_child(
         ElementDef::new(Tag::Span)
@@ -2024,6 +2060,20 @@ mod tests {
         let el = build_workspace(0, false, crate::state::PaneId(1), &ws, &shared);
         let body = find_by_class(&el, "workspace-body").unwrap();
         assert_eq!(body.children.len(), 2);
+    }
+
+    #[test]
+    fn sidebar_row_with_attention_gets_blink_class() {
+        let shared = make_shared();
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.workspaces[0].terminals_expanded = true;
+            guard.attention_pane_ids.insert(1);
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_sidebar(&state, &shared);
+        let row = find_by_class(&el, "terminal-entry").expect("terminal row");
+        assert!(has_class(row, "needs-attention"));
     }
 
     // -- build_subtab --
