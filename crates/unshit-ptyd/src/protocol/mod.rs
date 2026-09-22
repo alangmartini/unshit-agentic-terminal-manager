@@ -23,10 +23,13 @@ pub use message::{
 /// Wire protocol version advertised in `HelloAck`. Bump whenever a client
 /// must feature-detect a request or response before using it, including new
 /// variants that an older peer cannot safely ignore (see SPEC.md section 10).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// First protocol version whose daemon understands the atomic
 /// `EnsureSession` request. New clients can still reattach to sessions on a
 /// v1 daemon, but must not send the unknown variant or assume a cache miss is
 /// proof that no live session exists.
 pub const ENSURE_SESSION_PROTOCOL_VERSION: u32 = 2;
+
+/// Atomic retirement rejects new sessions and refuses while other clients exist.
+pub const RETIRE_PROTOCOL_VERSION: u32 = 3;

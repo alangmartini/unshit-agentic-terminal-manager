@@ -3,7 +3,7 @@
 Status: built 2026-09-07 on `worktree-soft-petting-wave`. The in-app half
 (check, prompt, settings, download, verify, hand-off) is exercised end to end
 against a fake feed by `scripts/update-shot.ps1`, and the installer half (wait
-for the parent and for both executables, install silently, relaunch) by
+for compatibility and UI exit, install side by side, relaunch) by
 `scripts/update-rehearsal.ps1`, which installs and updates a separately
 identified "TM Rehearsal" copy built from the real `.iss` and binaries. The
 manual check was also run against the live GitHub feed. The first update of a
@@ -16,7 +16,7 @@ Installing a new build no longer means opening the Releases page, downloading
 the setup and running it by hand. The app checks GitHub Releases shortly after
 startup, prompts once per new version, and can download and install the
 release installer in place from a button in Settings. The update restarts the
-app (daemon included) and brings the workspace layout back with fresh shells.
+UI and reattaches the workspace layout to the existing daemon-owned sessions.
 
 ## User stories
 
@@ -26,7 +26,7 @@ app (daemon included) and brings the workspace layout back with fresh shells.
 - As a user, I want **Settings › Updates** to show my version, let me check on
   demand, install when something newer exists, and switch the startup check off.
 - As a user with a dozen agent panes open, I want the update to tell me it will
-  close every terminal session before it does so, and never to install on its
+  restart the UI while keeping terminal sessions alive, and never to install on its
   own.
 - As a user who built the app from source, I want the check to still work but
   the install button to send me to the release page instead of trying to
@@ -71,7 +71,7 @@ app (daemon included) and brings the workspace layout back with fresh shells.
   open (`dialog_open`); the manual check in Settings ignores the once-per-version
   rule.
 - The dialog says which version is ready, which one is running, and that
-  installing closes every terminal session and restarts the app. Buttons:
+  installing restarts the UI while terminal sessions keep running. Buttons:
   **Later** (`update.later`, records `update.prompt_dismissed`), **What's new**
   (opens `html_url` in the browser), **Install and restart** (`update.install`).
   While a download is running the dialog shows the progress bar and a single
@@ -120,8 +120,8 @@ app (daemon included) and brings the workspace layout back with fresh shells.
 5. `finish_install` (on the UI thread, phase `Installing`): persist the layout
    (`update.layout_persisted`; failure aborts with `workspace_write`), launch
    the installer detached with `installer_args`, record
-   `update.install_launched` with the child pid and scope, force-stop the daemon
-   (`update.daemon_shutdown`; a failure is logged and does not abort), record
+   `update.install_launched` with the child pid and scope, record
+   `update.daemon_preserved` without sending any shutdown request, record
    `update.exiting`, and exit the process. If the launch fails the app stays up
    in `Failed` with the error and nothing was stopped.
 
@@ -133,18 +133,23 @@ Installer arguments:
 /SELFUPDATE=1
 /PARENTPID=<app pid>
 /RELAUNCH=<path of the running terminal-manager.exe>
+/DAEMONSOCKET=<the UI profile's exact daemon endpoint>
 /LOG=<installer path>.log
 ```
 
 Installer side (`packaging/terminal-manager.iss`, `-non-gpu.iss`, `[Code]`):
 
-- `PrepareToInstall` waits up to 60 s for `/PARENTPID` to exit
-  (`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`), then up to 30 s for
-  `unshit-ptyd.exe` and `terminal-manager.exe` to open for exclusive write
-  (`CreateFileW(GENERIC_WRITE, share 0)`), and aborts with a message if either
-  does not happen. The daemon acknowledges `Shutdown` *before* its process is
-  gone, so the file check, not the pid, is what proves the daemon binary can
-  be replaced; a silent install would otherwise hit "file in use" and abort.
+- `PrepareToInstall` extracts the bundled daemon to a temporary helper and runs
+  `--check-compatible --socket <endpoint>`. The helper only sends Hello and
+  checks the same explicit protocol range the UI uses. A missing daemon is
+  allowed; incompatible, inaccessible or unresponsive daemons defer installation
+  before any files are replaced. The request has a five-second timeout.
+- Then it waits up to 60 seconds for `/PARENTPID` and up to 30 seconds for the UI
+  executable to become writable. It never waits for or replaces a running daemon.
+- Both installer flavours place the daemon in `daemons/<UI release>/` with
+  `onlyifdoesntexist`; release directories are immutable, including on reinstall.
+  Existing sibling installations remain untouched. Restart Manager termination
+  and relaunch are disabled. Uninstall retains its explicit daemon shutdown.
 - `DeinitializeSetup` relaunches `/RELAUNCH` (or `{app}\terminal-manager.exe`)
   as the original user with `ewNoWait` whenever `/SELFUPDATE=1` and the parent
   is gone, on success and on failure alike, so a failed update still brings the
@@ -187,7 +192,7 @@ relevant, `source` (`startup|manual|install`), `latest_version`, `outcome`,
 | `update.download_started` / `update.download_completed` / `update.download_failed` | completed carries `outcome` = `digest_verified` (`size_only` is reachable only through the transport's unit tests; installs without a digest are refused before the download), `bytes`, `elapsed_ms` |
 | `update.stale_downloads_removed` | startup sweep of old `.partial`/installer files (the relaunched app deletes the installer it was just updated by); `bytes` = bytes freed, `total_bytes` = number of files |
 | `update.layout_persisted` / `update.install_launched` / `update.install_failed` | the hand-off; launched carries the installer `pid` and `scope` |
-| `update.daemon_shutdown` / `update.exiting` | last two lines before the process exits |
+| `update.daemon_preserved` / `update.exiting` | last two lines before the process exits |
 | `update.worker_spawn_failed` | a check or download thread could not start |
 
 Error text is never used as a label; URLs and paths are not logged.
@@ -224,8 +229,7 @@ Error text is never used as a label; URLs and paths are not logged.
   list, detached launch.
 - `src/updater/telemetry.rs`, `src/updater/version.rs`.
 - `src/profile.rs`: `cache_dir()` (local, non-roaming) for downloads.
-- `src/pty.rs`: `DaemonPty::shutdown_daemon_blocking` over the existing
-  `ShutdownDaemon` command.
+- `src/daemon.rs`: versioned binary discovery and deferred retirement.
 - `src/state.rs`: `ConfirmDialog::UpdateAvailable`, `SettingsSection::Updates`,
   `ToggleKey::CheckUpdatesOnStartup`, dispatch arms.
 - `src/persist.rs`: the two new optional fields.
@@ -243,7 +247,7 @@ Error text is never used as a label; URLs and paths are not logged.
   `download_installer` (size and digest mismatch, size-only), `file://`
   opt-in, installer arguments, scope detection against fake registry values,
   and the state machine (once-per-version prompt, `dialog_open`, skip reasons,
-  install chaining, hand-off order with injected launch/shutdown closures,
+  install chaining, hand-off with an injected installer launch,
   failure leaves the app running).
 - `src/ui/settings.rs` and `src/ui/confirm_dialog.rs` tests cover every phase's
   buttons and ids, toggle persistence, click dispatch and harness layout.
@@ -252,10 +256,9 @@ Error text is never used as a label; URLs and paths are not logged.
   `v99.0.0` whose asset is a copy of `hostname.exe`: the first two modes
   capture PrintWindow screenshots; `install` asserts the app exits by itself,
   the telemetry chain (`check_completed → download_completed →
-  layout_persisted → install_launched → daemon_shutdown ok → exiting`), that
+  layout_persisted → install_launched → daemon_preserved running → exiting`), that
   `workspaces.json` kept its tabs and that the installer landed under the
-  profile's `updates` dir. The isolated daemon is confirmed gone by the pipe
-  no longer existing.
+  profile's `updates` dir. The isolated daemon is cleaned up only after the assertions.
 - `pwsh scripts/update-shot.ps1 -Mode settings -FeedUrl <url>` runs the manual
   check against a real HTTPS feed (the GitHub URL) from a dev build; expect
   `check_completed` with `up_to_date` or `available`. This is what caught the
@@ -263,16 +266,13 @@ Error text is never used as a label; URLs and paths are not logged.
 - `pwsh scripts/update-rehearsal.ps1` exercises the installer half: it derives
   two installers from `packaging/terminal-manager.iss` under a different AppId,
   name and output name (and a harmless `[UninstallRun]` taskkill), installs the
-  first into `%LOCALAPPDATA%\tm-rehearsal`, updates it through the app against
+  first into `%LOCALAPPDATA%\tm-rehearsal-<pid>`, updates it through the app against
   a `file://` feed advertising the second, and asserts the installer log
-  (parent wait, both executables free, success, relaunch), the relaunched
+  (compatibility check, parent wait, UI executable free, success, relaunch), the relaunched
   process, `DisplayVersion 99.0.0`, and the telemetry chain from both the old
   and the relaunched app; then it uninstalls and removes every trace. It also
-  keeps `unshit-ptyd.exe` open for a few seconds after the app exits
-  (`-HoldDaemonExeSeconds`, default 3) and asserts the installer log shows a
-  non-zero wait, so the free-file retry loop is proven to run, not just to
-  compile. Run it after touching `src/updater`, the daemon shutdown or the
-  `.iss` `[Code]`.
+  runs a counter command and asserts that its shell PID, daemon PID and
+  execution survive the update. Run after changing the updater or installer.
 - `cargo test -p terminal-manager live_release_installer_downloads_and_verifies -- --ignored --nocapture`
   downloads the latest published installer over HTTPS (feed, redirect to the
   asset host, digest) into a temp dir and deletes it again. Nothing is
@@ -283,8 +283,7 @@ Error text is never used as a label; URLs and paths are not logged.
 
 ## Boundaries
 
-- Restart-everything: shells and agents die with the daemon. The prompt says so
-  and nothing installs without a click.
+- Updates restart the UI and preserve running sessions. Nothing installs without a click.
 - No delta updates, no rollback, no code signing check beyond the size and the
   GitHub-published SHA-256 over TLS.
 - Release notes open in the browser; nothing is rendered in-app.
@@ -292,8 +291,6 @@ Error text is never used as a label; URLs and paths are not logged.
 
 ## Open questions
 
-- Whether the daemon can be left running across an update so sessions survive
-  (BACKLOG: session-preserving update).
 - Whether a copy installed from the non-GPU package should select the
   `non-gpu` asset; the installer does not record the flavour today.
 
@@ -302,12 +299,49 @@ Error text is never used as a label; URLs and paths are not logged.
 - Silent installer + relaunch from the installer, not from a helper process:
   Inno already has the process-wait and run-as-original-user primitives, so no
   extra binary is shipped and the app can exit immediately after the launch.
-- The daemon is force-stopped by the app before exit rather than by the
-  installer, so the shutdown is recorded with the rest of the chain and the
-  installer never has to kill anything.
+- The daemon is installed side by side and never force-stopped by an update.
 - Startup failures are telemetry-only; a broken network must not toast every
   launch. Manual checks show the error inline in Settings.
 - `file://` is gated on `TM_UPDATE_FEED_URL` so e2e runs stay hermetic while the
   production feed cannot be pointed at local files.
 - Downloads go to the local (non-roaming) cache dir, not the roaming data dir,
   so a 30 MB installer is never synced by a roaming profile.
+
+
+## Session-preserving updates
+
+On UI startup, connect to the existing daemon first. Protocols 1 and 2 keep
+working through existing feature fallbacks; unknown protocol versions are
+rejected before session operations. Protocol 3 adds an optional executable path
+to HelloAck and the `RetireIfIdle` request. This permits switching forward to a
+newer bundled daemon within the same installation. Other installations,
+development overrides, equal versions and downgrades never trigger retirement.
+
+Retirement checks live sessions and other connected clients under the same
+registry lock used by Spawn, Ensure and connection registration. Once accepted,
+new connections and session creation are refused. This closes the empty-check
+versus spawn race and keeps another open UI from losing its connection. Ordinary
+Shutdown now uses the same atomic admission gate. Failed acknowledgement writes
+still signal shutdown so an admitted retirement cannot leave a stuck daemon.
+
+Activation is deferred to a subsequent UI launch after all terminal sessions
+and other UI connections have ended. It is deliberately not a mid-session
+process migration. Protocol 1/2 daemons lack atomic retirement and must be
+stopped normally after their sessions finish; the updater never sends them a
+racy shutdown. Old executable directories remain until uninstall.
+
+Migration boundary: a UI installed before this change still contains its old
+force-stop updater. Its first self-update cannot be made session-preserving by
+the new installer. Installing this release manually after closing only the old
+UI preserves the daemon; subsequent self-updates use the new flow.
+
+Verification: the updater handoff regression first failed on the old forced
+shutdown. IPC tests cover preserved shell PID and continued command execution,
+protocol preflight (v1/v2/v3 accepted, unknown rejected), and other-client refusal.
+Registry tests cover both Spawn and Ensure admission after shutdown. The Windows
+rehearsal verifies real installer success and UI relaunch while the same daemon
+PID, shell PID and continuously incrementing command survive the update.
+
+Inno Setup references: [file flags](https://jrsoftware.org/ishelp/topic_filessection.htm),
+[temporary extraction](https://jrsoftware.org/ishelp/topic_isxfunc_extracttemporaryfile.htm),
+[Restart Manager controls](https://jrsoftware.org/ishelp/topic_setup_closeapplications.htm).

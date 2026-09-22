@@ -1919,7 +1919,7 @@ fn build_updates_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
                 install = install.with_class("busy");
             }
             (
-                "Downloads the installer, closes every terminal session, installs the new version and reopens Terminal Manager. Workspaces and tabs come back with fresh shells.",
+                "Downloads the installer and restarts Terminal Manager. Your terminal sessions keep running and reconnect when the app reopens.",
                 install,
             )
         } else {
@@ -5707,7 +5707,7 @@ mod tests {
         let text = collect_text_recursive(&section);
         assert!(text.contains("99.0.0"));
         assert!(text.contains("ninety-nine"));
-        assert!(text.contains("closes every terminal session"));
+        assert!(text.contains("terminal sessions keep running"));
         assert!(has_class_anywhere(&section, "update-phase-available"));
         // Text stacks above the two wide buttons instead of sharing a grid row.
         let release = find_by_id(&section, "settings-update-release").expect("release row");

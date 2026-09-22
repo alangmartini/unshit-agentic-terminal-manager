@@ -41,6 +41,9 @@ OutputDir=..\dist
 OutputBaseFilename=terminal-manager-{#MyAppVersion}-setup
 Compression=lzma2
 SolidCompression=yes
+; Never let Restart Manager terminate daemon-owned terminal sessions.
+CloseApplications=no
+RestartApplications=no
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -56,9 +59,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-; BOTH executables land in the SAME {app} dir so the UI finds the daemon as a sibling.
+; Daemon releases are immutable; a running older daemon is left in place.
 Source: "{#ReleaseDir}\{#MyAppExeName}";   DestDir: "{app}"; Flags: ignoreversion
-Source: "{#ReleaseDir}\{#MyDaemonExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#ReleaseDir}\{#MyDaemonExeName}"; DestDir: "{app}\daemons\{#MyAppVersion}"; Flags: onlyifdoesntexist
+Source: "{#ReleaseDir}\{#MyDaemonExeName}"; DestName: "update-daemon-check.exe"; Flags: dontcopy
 Source: "..\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -114,9 +118,9 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyDaemonExeName}"; Flags: 
 ; Self-update hand-off (src/updater/install.rs launches this installer with
 ; /VERYSILENT ... /SELFUPDATE=1 /PARENTPID=<ui pid> /RELAUNCH=<ui exe>).
 ;
-; The UI persists its layout, starts this installer, shuts the session daemon
-; down and exits. Both executables must be free before [Files] runs, so
-; PrepareToInstall waits for the parent pid (it runs before the in-use check).
+; The UI persists its layout, starts this installer and exits. The daemon
+; and its sessions survive. PrepareToInstall checks protocol compatibility
+; before replacing the UI; the new daemon is installed alongside the old one.
 ; DeinitializeSetup then relaunches the app whether Setup succeeded (new exe)
 ; or aborted (the old exe comes back and reattaches to surviving sessions), so
 ; a failed silent update never leaves the user with nothing running.
@@ -178,10 +182,8 @@ begin
   Result := WaitResult <> WAIT_TIMEOUT;
 end;
 
-{ True once the file can be opened for exclusive write access, i.e. no process
-  has it mapped as a running image any more (or it does not exist). The daemon
-  acknowledges its shutdown before its process is gone, so this check, not the
-  parent pid, is what proves unshit-ptyd.exe can be replaced. }
+{ Wait for every UI process mapping the executable to release it. The daemon
+  executable is deliberately never checked or replaced. }
 function WaitForFileWritable(const Path: String; TimeoutMs: Integer): Boolean;
 var
   Handle: Integer;
@@ -207,21 +209,32 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Pid: Integer;
-  Exe: String;
+  Exe, Socket, Arguments: String;
+  ResultCode: Integer;
 begin
   Result := '';
+  ExtractTemporaryFile('update-daemon-check.exe');
+  Socket := ExpandConstant('{param:DAEMONSOCKET}');
+  Arguments := '--check-compatible';
+  if Socket <> '' then Arguments := Arguments + ' --socket "' + Socket + '"';
+  if not Exec(ExpandConstant('{tmp}\update-daemon-check.exe'), Arguments, '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'Could not check terminal session compatibility. The update was deferred; your sessions have been left running.';
+    Exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Result := 'The running session daemon is incompatible with this update or could not be reached. Finish your terminal sessions and stop the daemon before retrying. No sessions were closed.';
+    Exit;
+  end;
+  Log('Self-update: daemon compatibility check passed; preserving sessions');
   if not IsSelfUpdate() then Exit;
   Pid := SelfUpdateParentPid();
   Log(Format('Self-update: waiting for parent pid %d to exit', [Pid]));
   if not WaitForProcessExit(Pid, PARENT_EXIT_TIMEOUT_MS) then
   begin
     Result := Format('Terminal Manager (pid %d) did not exit within %d seconds. Close it and run the installer again.', [Pid, PARENT_EXIT_TIMEOUT_MS div 1000]);
-    Exit;
-  end;
-  Exe := ExpandConstant('{app}\{#MyDaemonExeName}');
-  if not WaitForFileWritable(Exe, FILE_FREE_TIMEOUT_MS) then
-  begin
-    Result := Format('The session daemon (%s) is still running after %d seconds. Close it and run the installer again.', [Exe, FILE_FREE_TIMEOUT_MS div 1000]);
     Exit;
   end;
   Exe := ExpandConstant('{app}\{#MyAppExeName}');

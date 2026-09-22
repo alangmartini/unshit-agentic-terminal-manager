@@ -5,8 +5,7 @@
 //! the client can correlate responses without relying on stream order.
 //!
 //! Only hello / shutdown are modelled in slice 2. Later slices add the
-//! session-lifecycle variants; adding new `kind` values is additive and
-//! does not bump `PROTOCOL_VERSION`.
+//! session-lifecycle variants. New requests require a protocol version gate.
 
 use serde::{Deserialize, Serialize};
 use unshit_terminal_core::Snapshot;
@@ -50,6 +49,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         force: bool,
     },
+    /// v3: retire only when no live sessions or other clients remain.
+    RetireIfIdle { id: u64 },
     /// Spawn a new session running `shell` (or the platform default).
     SpawnSession {
         id: u64,
@@ -149,6 +150,7 @@ impl Request {
         match self {
             Request::Hello { id, .. } => *id,
             Request::Shutdown { id, .. } => *id,
+            Request::RetireIfIdle { id } => *id,
             Request::SpawnSession { id, .. } => *id,
             Request::EnsureSession { id, .. } => *id,
             Request::Write { id, .. } => *id,
@@ -198,6 +200,8 @@ pub enum Response {
         id: u64,
         server_version: String,
         protocol_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        executable: Option<String>,
     },
     ShutdownAck {
         id: u64,
@@ -250,11 +254,13 @@ impl std::fmt::Debug for Response {
                 id,
                 server_version,
                 protocol_version,
+                executable,
             } => formatter
                 .debug_struct("HelloAck")
                 .field("id", id)
                 .field("server_version", server_version)
                 .field("protocol_version", protocol_version)
+                .field("executable", executable)
                 .finish(),
             Response::ShutdownAck { id, ok, reason } => formatter
                 .debug_struct("ShutdownAck")
@@ -541,6 +547,7 @@ mod tests {
             id: 1,
             server_version: "0.2.0".into(),
             protocol_version: 1,
+            executable: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&bytes).unwrap();
@@ -635,6 +642,7 @@ mod tests {
                 id: 21,
                 server_version: "v".into(),
                 protocol_version: 1,
+                executable: None,
             }
             .id(),
             21
@@ -682,6 +690,7 @@ mod tests {
             id: 1,
             server_version: "0.1.0".into(),
             protocol_version: 1,
+            executable: None,
         };
         let sent = resp.clone();
         let writer = tokio::spawn(async move {

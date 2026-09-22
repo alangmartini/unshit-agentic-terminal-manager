@@ -984,7 +984,7 @@ fn build_update_card(update: &crate::updater::UpdateState, shared: &SharedState)
         ),
         _ => (
             format!("Terminal Manager {version_text} is ready to install. You're running v{current}."),
-            "Installing closes every terminal session and restarts the app. Your workspaces and tabs come back with fresh shells."
+            "Installing restarts the app. Your terminal sessions keep running and reconnect when the app reopens."
                 .to_string(),
         ),
     };
@@ -2030,7 +2030,7 @@ mod tests {
         assert!(text.contains("Update available"));
         assert!(text.contains("v99.0.0"));
         assert!(text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("closes every terminal session"));
+        assert!(text.contains("terminal sessions keep running"));
         assert!(find_by_id(&overlay, "update-dialog-later").is_some());
         assert!(find_by_id(&overlay, "update-dialog-notes").is_some());
         let install = find_by_id(&overlay, "update-dialog-install").expect("install button");
