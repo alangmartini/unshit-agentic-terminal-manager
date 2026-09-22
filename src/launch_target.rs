@@ -307,6 +307,7 @@ mod tests {
             "activate",
             "--activate",
             "session-hook",
+            "agent-notify",
         ] {
             assert_eq!(
                 parse_args_from_dir([command], &root),

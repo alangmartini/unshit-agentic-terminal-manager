@@ -410,6 +410,7 @@ pub(crate) fn is_top_level_cli_command(name: &str) -> bool {
             | "activate"
             | "--activate"
             | "session-hook"
+            | "agent-notify"
             | "agent"
             | "new-agent"
     )
