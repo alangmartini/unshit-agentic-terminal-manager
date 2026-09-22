@@ -86,11 +86,14 @@ jobs:
           # into the bundle, so a wrong stamp shows up in the asset name too.
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "dist/Terminal Manager.app/Contents/Info.plist")"
           ditto -c -k --sequesterRsrc --keepParent "dist/Terminal Manager.app" "dist/terminal-manager-${version}-macos-$(uname -m).zip"
-          ls -l dist/*.zip
+          scripts/create-macos-dmg.sh
+          ls -l dist/*.zip dist/*.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: terminal-manager-macos
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.dmg
           if-no-files-found: error
 
   repair-failing-checks:
