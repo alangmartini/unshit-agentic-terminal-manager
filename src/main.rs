@@ -3085,6 +3085,8 @@ mod tests {
             let row = harness
                 .query(".cp-item.active")
                 .expect("active palette result exists");
+            assert_eq!(row.computed_style.padding.top, 4.0);
+            assert_eq!(row.computed_style.padding.bottom, 4.0);
             assert_eq!(
                 row.computed_style.background,
                 Background::Color(Color::rgba(accent.r, accent.g, accent.b, 30))

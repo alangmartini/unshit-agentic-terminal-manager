@@ -88,8 +88,6 @@
   /* Shared command-palette aliases resolve against the active theme. */
   --cp-accent:        var(--amber-300);
   --cp-accent-soft:   var(--accent-a12);
-  --cp-accent-bright: var(--amber-100);
-  --cp-glow:          0.55;
   --cp-row-py:        4px;
 
 
@@ -3560,11 +3558,6 @@ body.dragging-pane {
 }
 
 .cp-scrim {
-  --cp-accent: var(--amber-300);
-  --cp-accent-soft: var(--accent-a12);
-  --cp-accent-bright: var(--amber-100);
-  --cp-glow: 0.55;
-  --cp-row-py: 7px;
   position: fixed;
   inset: 0;
   z-index: 340;
@@ -3594,10 +3587,6 @@ body.dragging-pane {
     var(--shadow-lg),
     0 0 0 1px rgba(0, 0, 0, 0.30),
     0 0 40px var(--accent-a06);
-}
-
-.cp.compact {
-  --cp-row-py: 4px;
 }
 
 .cp-input {
