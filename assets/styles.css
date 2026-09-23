@@ -1540,12 +1540,12 @@ input, select {
 }
 
 .win-btn:hover {
-  background: rgba(235, 220, 182, 0.08);
+  background: var(--accent-a08);
   color: var(--fg-primary);
 }
 
 .win-btn:active {
-  background: rgba(235, 220, 182, 0.04);
+  background: var(--accent-a06);
 }
 
 .win-close:hover {
@@ -1568,8 +1568,8 @@ input, select {
   width: 11px;
   height: 11px;
   border-radius: 999px;
-  background: #2a241a;
-  border: 1px solid #1a1610;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hair);
 }
 
 .tl-close {
@@ -1616,7 +1616,7 @@ input, select {
 .settings-titlebar .brand-term {
   position: relative;
   left: 6px;
-  color: #e4d2a6;
+  color: var(--fg-primary);
 }
 
 .titlebar-breadcrumb {
@@ -3187,11 +3187,11 @@ body.dragging-pane {
   min-width: 180px;
   max-height: 92vh;
   overflow: auto;
-  background: linear-gradient(180deg, #2b251b, #221d15);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
   border: 1px solid var(--border-default);
   border-radius: var(--r-md);
   padding: 5px;
-  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
+  box-shadow: var(--shadow-lg), 0 0 28px var(--accent-a06);
   z-index: 201;
 }
 
@@ -3321,7 +3321,7 @@ body.dragging-pane {
   flex-shrink: 0;
 }
 .m-row.active {
-  background: rgba(212, 163, 72, 0.12);
+  background: var(--accent-a12);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300);
 }
@@ -3365,7 +3365,7 @@ body.dragging-pane {
    amber active treatment, matching the design. Scoped to the dedicated
    trigger class so the shell rows inside the flyout are unaffected. */
 .m-sub-anchor:hover .m-sub-trigger {
-  background: rgba(212, 163, 72, 0.12);
+  background: var(--accent-a12);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300);
 }
@@ -3382,10 +3382,10 @@ body.dragging-pane {
   width: 198px;
   display: none;
   flex-direction: column;
-  background: linear-gradient(180deg, #2b251b, #221d15);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
   border: 1px solid var(--border-default);
   border-radius: var(--r-md);
-  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
+  box-shadow: var(--shadow-lg), 0 0 28px var(--accent-a06);
   padding: 5px;
   z-index: 5;
 }
@@ -3561,7 +3561,7 @@ body.dragging-pane {
 
 .cp-scrim {
   --cp-accent: var(--amber-300);
-  --cp-accent-soft: rgba(212, 163, 72, 0.12);
+  --cp-accent-soft: var(--accent-a12);
   --cp-accent-bright: var(--amber-100);
   --cp-glow: 0.55;
   --cp-row-py: 7px;
@@ -3572,7 +3572,7 @@ body.dragging-pane {
   align-items: flex-start;
   justify-content: center;
   padding-top: 12vh;
-  background: rgba(10, 8, 6, 0.62);
+  background: var(--bg-overlay);
   backdrop-filter: blur(5px);
 }
 
@@ -3593,7 +3593,7 @@ body.dragging-pane {
   box-shadow:
     var(--shadow-lg),
     0 0 0 1px rgba(0, 0, 0, 0.30),
-    0 0 40px rgba(212, 163, 72, 0.054);
+    0 0 40px var(--accent-a06);
 }
 
 .cp.compact {
@@ -3614,7 +3614,7 @@ body.dragging-pane {
   font-family: var(--font-mono);
   font-size: 14px;
   font-weight: 700;
-  text-shadow: 0 0 8px rgba(212, 163, 72, 0.32);
+  text-shadow: 0 0 8px var(--accent-a35);
   flex-shrink: 0;
 }
 
@@ -3658,8 +3658,8 @@ body.dragging-pane {
 }
 
 .cp-mode-chip.m-actions {
-  background: rgba(212, 163, 72, 0.12);
-  border-color: rgba(212, 163, 72, 0.32);
+  background: var(--accent-a12);
+  border-color: var(--accent-a35);
 }
 
 .cp-mode-chip.m-agents {
@@ -3810,7 +3810,7 @@ body.dragging-pane {
   /* Only the color is overridden; the 2px width comes from `.cp-item`'s
    * `border-left: 2px solid transparent`. */
   border-left-color: var(--cp-accent);
-  box-shadow: inset 0 0 22px rgba(212, 163, 72, 0.03);
+  box-shadow: inset 0 0 22px var(--accent-a015);
 }
 
 .cp-ic {
@@ -3822,7 +3822,7 @@ body.dragging-pane {
 
 .cp-item.active .cp-ic {
   color: var(--cp-accent);
-  filter: drop-shadow(0 0 5px rgba(212, 163, 72, 0.28));
+  filter: drop-shadow(0 0 5px var(--accent-a25));
 }
 
 .cp-main {
@@ -3932,7 +3932,7 @@ body.dragging-pane {
   flex-direction: column;
   overflow: hidden;
   background:
-    radial-gradient(ellipse 70% 50% at 50% 0%, rgba(212, 163, 72, 0.02), transparent 70%),
+    radial-gradient(ellipse 70% 50% at 50% 0%, var(--accent-a015), transparent 70%),
     var(--bg-base);
 }
 
@@ -5216,7 +5216,7 @@ body.dragging-pane {
 }
 
 .settings-titlebar .tl-min {
-  background: #e8b955;
+  background: var(--amber-200);
 }
 
 .settings-titlebar .tl-zoom {
@@ -5245,7 +5245,7 @@ body.dragging-pane {
   display: flex;
   flex-direction: row;
   gap: 0;
-  color: #d1bd94;
+  color: var(--fg-primary);
   font-size: 14px;
   font-weight: 700;
   line-height: 1;
@@ -5337,7 +5337,7 @@ body.dragging-pane {
 
 .settings-statusbar .statusbar-right .sb-cell.amber {
   padding-right: 11px;
-  color: #e0a342;
+  color: var(--amber-200);
 }
 
 .settings-page {
@@ -6679,9 +6679,9 @@ body.dragging-pane {
   min-height: 28px;
   min-width: 0;
   padding: 5px 16px;
-  background: #1c1812;
-  border-color: #342b1e;
-  color: #ebdcb6;
+  background: var(--bg-base);
+  border-color: var(--border-soft);
+  color: var(--fg-primary);
   font-family: var(--font-mono);
   font-size: var(--t-xs);
   font-weight: 600;
@@ -6701,16 +6701,16 @@ body.dragging-pane {
   left: -1px;
   background: transparent;
   border-color: transparent;
-  color: #b8a275;
+  color: var(--fg-secondary);
 }
 
 .set-page-savebar .btn.primary {
   min-height: 27px;
-  background: #d4a348;
-  border-color: #d4a348;
-  color: #746445;
+  background: var(--amber-300);
+  border-color: var(--amber-300);
+  color: var(--bg-void);
   border-radius: 4px;
-  box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);
+  box-shadow: 0 0 6px var(--accent-a20);
 }
 
 .modal-footer {

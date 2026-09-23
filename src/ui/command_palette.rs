@@ -696,7 +696,7 @@ mod tests {
             "align-items: flex-start",
             "justify-content: center",
             "padding-top: 12vh",
-            "background: rgba(10, 8, 6, 0.62)",
+            "background: var(--bg-overlay)",
             "backdrop-filter: blur(5px)",
         ] {
             assert!(scrim.contains(required), ".cp-scrim missing `{required}`");

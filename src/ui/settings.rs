@@ -4303,9 +4303,9 @@ mod tests {
         assert!(css.contains("margin-top: 0;"));
         assert!(css.contains("letter-spacing: 0.2px;"));
         assert!(css_lf.contains(
-            ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: #d4a348;\n  border-color: #d4a348;\n  color: #746445;\n  border-radius: 4px;"
+            ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: var(--amber-300);\n  border-color: var(--amber-300);\n  color: var(--bg-void);\n  border-radius: 4px;"
         ));
-        assert!(css.contains("box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);"));
+        assert!(css.contains("box-shadow: 0 0 6px var(--accent-a20);"));
         assert!(css.contains(".settings-titlebar .titlebar-left"));
         assert!(css.contains("top: -1px;"));
         assert!(css.contains(".settings-tb-breadcrumb"));
@@ -4328,11 +4328,11 @@ mod tests {
             ".set-page-nav-item.nav-keybinds span {\n  position: relative;\n  top: 1px;"
         ));
         assert!(css.contains(".brand-term"));
-        assert!(css.contains(".settings-titlebar .brand-term"));
-        assert!(css.contains("left: 6px;"));
-        assert!(css.contains("color: #e4d2a6;"));
+        assert!(css_lf.contains(
+            ".settings-titlebar .brand-term {\n  position: relative;\n  left: 6px;\n  color: var(--fg-primary);"
+        ));
         assert!(
-            css_lf.contains(".settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: #d1bd94;")
+            css_lf.contains(".settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: var(--fg-primary);")
         );
         assert!(css_lf.contains(
             ".settings-titlebar .brand-name .dot {\n  position: relative;\n  left: 4px;"
@@ -4355,7 +4355,7 @@ mod tests {
         assert!(css.contains("padding-right: 16px;"));
         assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber"));
         assert!(css.contains("padding-right: 11px;"));
-        assert!(css.contains("color: #e0a342;"));
+        assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber {\n  padding-right: 11px;\n  color: var(--amber-200);"));
         assert!(css.contains(".settings-page .set-label"));
         assert!(css.contains("left: 2px;"));
         assert!(css_lf.contains(
