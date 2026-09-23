@@ -145,6 +145,8 @@ semver = "1"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 unshit-test = { path = "crates/unshit-framework/crates/unshit-test" }
+# Isolate metrics published by resize and renderer tests running in parallel.
+unshit-core = { path = "crates/unshit-framework/crates/unshit-core", features = ["test-cell-metrics"] }
 
 # `shellapi` provides ShellExecuteW, used to open Ctrl+clicked links in the
 # default browser without going through a command shell (see src/browser.rs).
