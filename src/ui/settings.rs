@@ -4355,7 +4355,7 @@ mod tests {
         assert!(css.contains("padding-right: 16px;"));
         assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber"));
         assert!(css.contains("padding-right: 11px;"));
-        assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber {\n  padding-right: 11px;\n  color: var(--amber-200);"));
+        assert!(css_lf.contains(".settings-statusbar .statusbar-right .sb-cell.amber {\n  padding-right: 11px;\n  color: var(--amber-200);"));
         assert!(css.contains(".settings-page .set-label"));
         assert!(css.contains("left: 2px;"));
         assert!(css_lf.contains(
