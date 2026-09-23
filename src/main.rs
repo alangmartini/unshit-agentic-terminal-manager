@@ -2939,6 +2939,40 @@ mod tests {
         }
     }
 
+    /// Rebuilds from `shared`'s live state on every render, so `switch_theme`
+    /// can mutate `shared` and call `TestHarness::rebuild` to re-render.
+    fn theme_probe_harness(shared: &SharedState) -> TestHarness {
+        let build_shared = shared.clone();
+        TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(
+                    &snap,
+                    &build_shared,
+                    &std::collections::HashMap::new(),
+                    None,
+                )
+            },
+            1024.0,
+            768.0,
+        )
+    }
+
+    fn switch_theme(harness: &mut TestHarness, shared: &SharedState, theme: &str) {
+        shared.lock().unwrap().theme = theme.to_string();
+        let rebuild_shared = shared.clone();
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            build_tree(
+                &snap,
+                &rebuild_shared,
+                &std::collections::HashMap::new(),
+                None,
+            )
+        });
+    }
+
     #[test]
     fn theme_settings_menu_and_palette_surfaces_follow_theme_switch() {
         // Set TM_THEME_SURFACES_VISUAL_DUMP to capture six GPU-rendered PNGs
@@ -2956,13 +2990,39 @@ mod tests {
                     .expect("save theme surface screenshot");
             }
         };
-        let assert_menu_gradient = |harness: &TestHarness, top, bottom| {
-            let menu = harness.query(".ctx-menu").expect("workspace menu exists");
-            let Background::LinearGradient(gradient) = menu.computed_style.background else {
-                panic!("workspace menu should have a themed gradient");
+        let assert_gradient = |harness: &TestHarness, selector: &str, top, bottom| {
+            let node = harness.query(selector).expect("themed node exists");
+            let Background::LinearGradient(gradient) = node.computed_style.background else {
+                panic!("{selector} should have a themed gradient");
             };
             assert_eq!(gradient.stops.first().expect("top stop").color, top);
             assert_eq!(gradient.stops.last().expect("bottom stop").color, bottom);
+        };
+        let assert_settings = |harness: &TestHarness, save_accent, label_accent, brand| {
+            assert_eq!(
+                harness
+                    .query(".set-page-savebar .btn.primary")
+                    .expect("save button exists")
+                    .computed_style
+                    .background,
+                Background::Color(save_accent)
+            );
+            assert_eq!(
+                harness
+                    .query(".settings-statusbar .sb-cell.amber")
+                    .expect("settings section label exists")
+                    .computed_style
+                    .color,
+                label_accent
+            );
+            assert_eq!(
+                harness
+                    .query(".settings-titlebar .brand-name")
+                    .expect("settings brand exists")
+                    .computed_style
+                    .color,
+                brand
+            );
         };
 
         let mut settings_state = seed_state();
@@ -2970,81 +3030,21 @@ mod tests {
         settings_state.settings_section = SettingsSection::Appearance;
         settings_state.theme = "catppuccin".to_string();
         let settings_shared: SharedState = Arc::new(Mutex::new(settings_state));
-        let build_shared = settings_shared.clone();
-        let mut settings = TestHarness::new(
-            STYLES,
-            move || {
-                let snap = build_shared.lock().unwrap().ui_snapshot();
-                build_tree(
-                    &snap,
-                    &build_shared,
-                    &std::collections::HashMap::new(),
-                    None,
-                )
-            },
-            1024.0,
-            768.0,
-        );
-        assert_eq!(
-            settings
-                .query(".set-page-savebar .btn.primary")
-                .expect("save button exists")
-                .computed_style
-                .background,
-            Background::Color(Color::rgb(0xcb, 0xa6, 0xf7))
-        );
-        assert_eq!(
-            settings
-                .query(".settings-statusbar .sb-cell.amber")
-                .expect("settings section label exists")
-                .computed_style
-                .color,
-            Color::rgb(0xcb, 0xa6, 0xf7)
-        );
-        assert_eq!(
-            settings
-                .query(".settings-titlebar .brand-name")
-                .expect("settings brand exists")
-                .computed_style
-                .color,
-            Color::rgb(0xcd, 0xd6, 0xf4)
+        let mut settings = theme_probe_harness(&settings_shared);
+        assert_settings(
+            &settings,
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgb(0xcd, 0xd6, 0xf4),
         );
         capture(&mut settings, "settings-catppuccin.png");
 
-        settings_shared.lock().unwrap().theme = "dracula".to_string();
-        let rebuild_shared = settings_shared.clone();
-        settings.rebuild(move || {
-            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
-            build_tree(
-                &snap,
-                &rebuild_shared,
-                &std::collections::HashMap::new(),
-                None,
-            )
-        });
-        assert_eq!(
-            settings
-                .query(".set-page-savebar .btn.primary")
-                .expect("save button exists after switch")
-                .computed_style
-                .background,
-            Background::Color(Color::rgb(0xbd, 0x93, 0xf9))
-        );
-        assert_eq!(
-            settings
-                .query(".settings-statusbar .sb-cell.amber")
-                .expect("settings section label exists after switch")
-                .computed_style
-                .color,
-            Color::rgb(0x8b, 0xe9, 0xfd)
-        );
-        assert_eq!(
-            settings
-                .query(".settings-titlebar .brand-name")
-                .expect("settings brand exists after switch")
-                .computed_style
-                .color,
-            Color::rgb(0xf8, 0xf8, 0xf2)
+        switch_theme(&mut settings, &settings_shared, "dracula");
+        assert_settings(
+            &settings,
+            Color::rgb(0xbd, 0x93, 0xf9),
+            Color::rgb(0x8b, 0xe9, 0xfd),
+            Color::rgb(0xf8, 0xf8, 0xf2),
         );
         capture(&mut settings, "settings-dracula.png");
 
@@ -3059,41 +3059,19 @@ mod tests {
             target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
         });
         let menu_shared: SharedState = Arc::new(Mutex::new(menu_state));
-        let build_shared = menu_shared.clone();
-        let mut menu = TestHarness::new(
-            STYLES,
-            move || {
-                let snap = build_shared.lock().unwrap().ui_snapshot();
-                build_tree(
-                    &snap,
-                    &build_shared,
-                    &std::collections::HashMap::new(),
-                    None,
-                )
-            },
-            1024.0,
-            768.0,
-        );
-        assert_menu_gradient(
+        let mut menu = theme_probe_harness(&menu_shared);
+        assert_gradient(
             &menu,
+            ".ctx-menu",
             Color::rgb(0x31, 0x32, 0x44),
             Color::rgb(0x18, 0x18, 0x25),
         );
         capture(&mut menu, "menu-catppuccin.png");
 
-        menu_shared.lock().unwrap().theme = "dracula".to_string();
-        let rebuild_shared = menu_shared.clone();
-        menu.rebuild(move || {
-            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
-            build_tree(
-                &snap,
-                &rebuild_shared,
-                &std::collections::HashMap::new(),
-                None,
-            )
-        });
-        assert_menu_gradient(
+        switch_theme(&mut menu, &menu_shared, "dracula");
+        assert_gradient(
             &menu,
+            ".ctx-menu",
             Color::rgb(0x34, 0x37, 0x46),
             Color::rgb(0x21, 0x22, 0x2c),
         );
@@ -3111,33 +3089,14 @@ mod tests {
                 row.computed_style.background,
                 Background::Color(Color::rgba(accent.r, accent.g, accent.b, 30))
             );
-            let card = harness.query(".cp").expect("palette card exists");
-            let Background::LinearGradient(gradient) = card.computed_style.background else {
-                panic!("palette card should have a themed gradient");
-            };
-            assert_eq!(gradient.stops.first().expect("top stop").color, top);
-            assert_eq!(gradient.stops.last().expect("bottom stop").color, bottom);
+            assert_gradient(harness, ".cp", top, bottom);
         };
         let mut palette_state = seed_state();
         palette_state.theme = "catppuccin".to_string();
         palette_state.palette_open = true;
         palette_state.palette_query = ">".to_string();
         let palette_shared: SharedState = Arc::new(Mutex::new(palette_state));
-        let build_shared = palette_shared.clone();
-        let mut palette = TestHarness::new(
-            STYLES,
-            move || {
-                let snap = build_shared.lock().unwrap().ui_snapshot();
-                build_tree(
-                    &snap,
-                    &build_shared,
-                    &std::collections::HashMap::new(),
-                    None,
-                )
-            },
-            1024.0,
-            768.0,
-        );
+        let mut palette = theme_probe_harness(&palette_shared);
         assert_palette(
             &palette,
             Color::rgb(0xcb, 0xa6, 0xf7),
@@ -3147,17 +3106,7 @@ mod tests {
         );
         capture(&mut palette, "palette-catppuccin.png");
 
-        palette_shared.lock().unwrap().theme = "dracula".to_string();
-        let rebuild_shared = palette_shared.clone();
-        palette.rebuild(move || {
-            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
-            build_tree(
-                &snap,
-                &rebuild_shared,
-                &std::collections::HashMap::new(),
-                None,
-            )
-        });
+        switch_theme(&mut palette, &palette_shared, "dracula");
         assert_palette(
             &palette,
             Color::rgb(0xbd, 0x93, 0xf9),
