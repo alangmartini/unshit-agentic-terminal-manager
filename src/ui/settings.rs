@@ -4733,6 +4733,20 @@ mod tests {
     }
 
     #[test]
+    fn keybinds_section_exposes_editable_new_agent_row() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        let row = find_kb_row(&el, "New agent").expect("New agent keybind row");
+        let binding = row
+            .children
+            .iter()
+            .find(|child| child.classes.contains(&"kb-binding".to_string()))
+            .expect("New agent binding is editable");
+        assert!(find_first_with_class(binding, "edit-pencil").is_some());
+    }
+
+    #[test]
     fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
         let css = include_str!("../../assets/styles.css");
         // Pins the chosen structure: the "+" separators are real spans
