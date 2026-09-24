@@ -1,5 +1,6 @@
 //! Markdown presentation model for editor side previews.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, Tag, TagEnd};
@@ -12,6 +13,8 @@ pub enum MarkdownBlock {
     Heading {
         level: u8,
         text: String,
+        source_line: usize,
+        anchor: String,
     },
     Paragraph(String),
     Code {
@@ -34,7 +37,7 @@ pub struct MarkdownDocument {
 #[derive(Debug)]
 enum DraftNode {
     Container,
-    Heading(u8, String),
+    Heading(u8, String, usize),
     Paragraph(String),
     Code(String, String),
     Quote,
@@ -69,11 +72,19 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
     let mut stack = vec![0usize];
     let options = Options::ENABLE_STRIKETHROUGH;
 
-    for event in Parser::new_ext(text, options) {
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
             Event::Start(tag) => {
                 let parent = *stack.last().expect("draft stack is never empty");
-                let id = start_tag(&mut drafts, parent, tag);
+                let source_line = if matches!(tag, Tag::Heading { .. }) {
+                    text[..range.start]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                } else {
+                    0
+                };
+                let id = start_tag(&mut drafts, parent, tag, source_line);
                 if matches!(
                     drafts[id].node,
                     DraftNode::Heading(..)
@@ -132,17 +143,19 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
         ..MarkdownDocument::default()
     };
     let mut count = 0usize;
+    let mut anchors = BTreeMap::new();
     append_children(
         &drafts,
         0,
         &mut document.blocks,
         &mut count,
         &mut document.truncated,
+        &mut anchors,
     );
     Arc::new(document)
 }
 
-fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag) -> usize {
+fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag, source_line: usize) -> usize {
     let node = match tag {
         Tag::Paragraph => DraftNode::Paragraph(String::new()),
         Tag::Heading { level, .. } => DraftNode::Heading(
@@ -155,6 +168,7 @@ fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag) -> usize {
                 pulldown_cmark::HeadingLevel::H6 => 6,
             },
             String::new(),
+            source_line,
         ),
         Tag::CodeBlock(kind) => DraftNode::Code(
             match kind {
@@ -201,7 +215,7 @@ fn end_tag_pops(tag: TagEnd) -> bool {
 fn append_inline(drafts: &mut [Draft], id: usize, value: &str) {
     match &mut drafts[id].node {
         DraftNode::Paragraph(text)
-        | DraftNode::Heading(_, text)
+        | DraftNode::Heading(_, text, _)
         | DraftNode::Code(_, text)
         | DraftNode::Item(text) => {
             text.push_str(value);
@@ -216,6 +230,7 @@ fn append_children(
     out: &mut Vec<MarkdownBlock>,
     count: &mut usize,
     truncated: &mut bool,
+    anchors: &mut BTreeMap<String, usize>,
 ) {
     for &child in &drafts[id].children {
         if *count == MAX_PREVIEW_BLOCKS {
@@ -226,7 +241,7 @@ fn append_children(
         let block = match &drafts[child].node {
             DraftNode::Container => {
                 let mut nested = Vec::new();
-                append_children(drafts, child, &mut nested, count, truncated);
+                append_children(drafts, child, &mut nested, count, truncated, anchors);
                 MarkdownBlock::Paragraph(
                     nested.iter().map(block_text).collect::<Vec<_>>().join(" "),
                 )
@@ -236,15 +251,21 @@ fn append_children(
                 if !text.trim().is_empty() {
                     nested.push(MarkdownBlock::Paragraph(normalize_space(text)));
                 }
-                append_children(drafts, child, &mut nested, count, truncated);
+                append_children(drafts, child, &mut nested, count, truncated, anchors);
                 MarkdownBlock::Paragraph(
                     nested.iter().map(block_text).collect::<Vec<_>>().join(" "),
                 )
             }
-            DraftNode::Heading(level, text) => MarkdownBlock::Heading {
-                level: *level,
-                text: normalize_space(text),
-            },
+            DraftNode::Heading(level, text, source_line) => {
+                let text = normalize_space(text);
+                let anchor = unique_anchor(&text, anchors);
+                MarkdownBlock::Heading {
+                    level: *level,
+                    text,
+                    source_line: *source_line,
+                    anchor,
+                }
+            }
             DraftNode::Paragraph(text) => MarkdownBlock::Paragraph(normalize_space(text)),
             DraftNode::Code(language, text) => MarkdownBlock::Code {
                 language: language.clone(),
@@ -252,7 +273,7 @@ fn append_children(
             },
             DraftNode::Quote => {
                 let mut nested = Vec::new();
-                append_children(drafts, child, &mut nested, count, truncated);
+                append_children(drafts, child, &mut nested, count, truncated, anchors);
                 MarkdownBlock::Quote(nested)
             }
             DraftNode::List(ordered) => {
@@ -269,7 +290,7 @@ fn append_children(
                             nested.push(MarkdownBlock::Paragraph(normalize_space(text)));
                         }
                     }
-                    append_children(drafts, item, &mut nested, count, truncated);
+                    append_children(drafts, item, &mut nested, count, truncated, anchors);
                     items.push(nested);
                 }
                 MarkdownBlock::List {
@@ -307,6 +328,33 @@ fn normalize_space(text: &str) -> String {
     out
 }
 
+fn unique_anchor(text: &str, seen: &mut BTreeMap<String, usize>) -> String {
+    let mut slug = String::new();
+    let mut last_separator = false;
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            last_separator = false;
+        } else if !last_separator {
+            slug.push('-');
+            last_separator = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    let base = if slug.is_empty() {
+        "section".to_string()
+    } else {
+        slug
+    };
+    let count = seen.entry(base.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        base
+    } else {
+        format!("{base}-{count}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +372,9 @@ mod tests {
             vec![
                 MarkdownBlock::Heading {
                     level: 1,
-                    text: "Title".into()
+                    text: "Title".into(),
+                    source_line: 0,
+                    anchor: "title".into()
                 },
                 MarkdownBlock::Paragraph("Some bold text.".into()),
                 MarkdownBlock::List {
@@ -352,5 +402,27 @@ mod tests {
 
         assert!(document.truncated);
         assert!(document.blocks.len() <= MAX_PREVIEW_BLOCKS);
+    }
+
+    #[test]
+    fn heading_anchors_keep_source_lines_and_unique_slugs() {
+        let document = parse("Intro\n\n# Same Name\n\nText\n\n# Same Name\n");
+        let headings: Vec<_> = document
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                MarkdownBlock::Heading {
+                    source_line,
+                    anchor,
+                    ..
+                } => Some((*source_line, anchor.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            headings,
+            vec![(2, "same-name".to_string()), (6, "same-name-2".to_string())]
+        );
     }
 }

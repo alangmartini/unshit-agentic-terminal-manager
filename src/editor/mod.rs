@@ -1095,7 +1095,9 @@ mod tests {
             after.blocks.first(),
             Some(&crate::markdown::MarkdownBlock::Heading {
                 level: 1,
-                text: "BeforeAfter".into()
+                text: "BeforeAfter".into(),
+                source_line: 0,
+                anchor: "beforeafter".into()
             })
         );
         let _ = std::fs::remove_file(path);

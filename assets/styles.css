@@ -2923,6 +2923,13 @@ input, select {
   font-weight: 700;
   line-height: 1.25;
   margin: 1em 0 0.4em;
+  cursor: pointer;
+}
+
+.markdown-heading:hover {
+  color: var(--amber-50);
+  text-decoration: underline;
+  text-decoration-color: var(--amber-400);
 }
 
 .markdown-h1 { font-size: var(--t-2xl); }

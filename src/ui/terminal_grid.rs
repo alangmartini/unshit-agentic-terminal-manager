@@ -678,6 +678,7 @@ fn handle_instant_wheel(
     };
     unshit::app::app::ScrollGridPatch {
         grid,
+        scroll_fractions: Vec::new(),
         animation: None,
     }
 }
@@ -712,6 +713,7 @@ fn handle_animated_wheel(
     if armed.is_none() {
         return unshit::app::app::ScrollGridPatch {
             grid: None,
+            scroll_fractions: Vec::new(),
             animation: None,
         };
     }
@@ -744,6 +746,7 @@ fn handle_animated_wheel(
     };
     unshit::app::app::ScrollGridPatch {
         grid: None,
+        scroll_fractions: Vec::new(),
         animation: Some(unshit::app::GridAnimationHook {
             deadline: now + duration + SCROLL_ANIM_DEADLINE_GRACE,
             tick: std::sync::Arc::new(tick),
@@ -806,6 +809,7 @@ fn forward_wheel_if_mouse_mode(
         }
         Some(unshit::app::app::ScrollGridPatch {
             grid: None,
+            scroll_fractions: Vec::new(),
             animation: None,
         })
     })
