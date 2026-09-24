@@ -14,6 +14,7 @@ pub mod highlight;
 pub mod telemetry;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use unshit::core::cell_grid::CellGrid;
 
@@ -137,6 +138,12 @@ pub struct EditorPane {
     /// Block-comment state per line, extended lazily as the viewport
     /// moves and invalidated from the first line each edit damages.
     syntax: SyntaxCache,
+    /// Increments whenever Markdown source changes. The preview cache is keyed
+    /// by this revision so ordinary snapshots reuse the parsed presentation.
+    markdown_revision: u64,
+    markdown_cache: Mutex<Option<(u64, Arc<crate::markdown::MarkdownDocument>)>>,
+    /// Whether a Markdown editor shows its rendered side pane.
+    pub markdown_preview_open: bool,
 }
 
 impl EditorPane {
@@ -171,6 +178,9 @@ impl EditorPane {
             kind: EditorKind::File,
             find: None,
             syntax: SyntaxCache::new(language),
+            markdown_revision: 0,
+            markdown_cache: Mutex::new(None),
+            markdown_preview_open: language == crate::syntax::Language::Markdown,
         };
         pane.repaint_viewport();
         pane.sync_cursor_into_grid();
@@ -209,6 +219,9 @@ impl EditorPane {
             kind: EditorKind::Diff(Box::new(DiffView::loading(spec, repo_root, job_id))),
             find: None,
             syntax: SyntaxCache::new(crate::syntax::Language::Plain),
+            markdown_revision: 0,
+            markdown_cache: Mutex::new(None),
+            markdown_preview_open: false,
         };
         pane.repaint_viewport();
         pane.sync_cursor_into_grid();
@@ -279,6 +292,27 @@ impl EditorPane {
     /// decides the line-comment token for `editor.toggle_comment`.
     pub fn language(&self) -> crate::syntax::Language {
         self.syntax.language()
+    }
+
+    pub fn is_markdown(&self) -> bool {
+        self.language() == crate::syntax::Language::Markdown
+    }
+
+    /// Return the current Markdown presentation, parsing at most once per
+    /// buffer revision. Cursor and selection-only changes reuse the cache.
+    pub fn markdown_document(&self) -> Option<Arc<crate::markdown::MarkdownDocument>> {
+        if !self.is_markdown() {
+            return None;
+        }
+        let mut cache = self.markdown_cache.lock().expect("markdown preview cache");
+        if let Some((revision, document)) = cache.as_ref() {
+            if *revision == self.markdown_revision {
+                return Some(Arc::clone(document));
+            }
+        }
+        let document = crate::markdown::parse(&self.buffer.to_text());
+        *cache = Some((self.markdown_revision, Arc::clone(&document)));
+        Some(document)
     }
 
     pub fn is_diff(&self) -> bool {
@@ -614,6 +648,7 @@ impl EditorPane {
         let new_sel = self.buffer.selection();
         let content_changed = damage != buffer::Damage::None;
         if content_changed {
+            self.markdown_revision = self.markdown_revision.saturating_add(1);
             // A read-only pane must never reach here with real damage:
             // `apply_edit` refuses first. Guard anyway so a future caller
             // cannot quietly make a diff pane editable.
@@ -1036,6 +1071,34 @@ mod tests {
         let mut f = std::fs::File::create(&path).expect("create temp file");
         f.write_all(contents).expect("write temp file");
         path
+    }
+
+    #[test]
+    fn markdown_preview_document_follows_buffer_edits() {
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-markdown-{}-{}.md",
+            std::process::id(),
+            generate_correlation_id()
+        ));
+        std::fs::write(&path, "# Before\n").expect("write temp file");
+        let mut pane = EditorPane::open(&path, 10, 40).expect("open");
+        let before = pane.markdown_document().expect("markdown document");
+
+        assert!(pane.apply_edit(|buffer| {
+            buffer.set_cursor(Position { line: 0, col: 8 }, false);
+            buffer.insert_str("After")
+        }));
+        let after = pane.markdown_document().expect("updated markdown document");
+
+        assert_ne!(before.blocks, after.blocks);
+        assert_eq!(
+            after.blocks.first(),
+            Some(&crate::markdown::MarkdownBlock::Heading {
+                level: 1,
+                text: "BeforeAfter".into()
+            })
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

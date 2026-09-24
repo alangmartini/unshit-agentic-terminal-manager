@@ -406,6 +406,8 @@ fn build_pane_with_event_sink(
             capture_keyboard,
             state.terminal_font_size_pt,
             state.editor_find_bars.get(&pane.id.0),
+            state.markdown_editor_panes.contains(&pane.id.0),
+            state.markdown_previews.get(&pane.id.0).cloned(),
             shared,
             grids,
         )

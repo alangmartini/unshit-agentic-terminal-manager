@@ -352,4 +352,99 @@ mod tests {
         assert!(!state.explorer.keyboard_focus);
         std::fs::remove_file(file).unwrap();
     }
+
+    #[test]
+    fn explorer_hover_moves_between_rows_immediately() {
+        use unshit_test::TestHarness;
+
+        let root = std::env::temp_dir().join(format!(
+            "tm-explorer-hover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = root.join("alpha.md");
+        let second = root.join("beta.md");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&first, "alpha\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+
+        let mut state = crate::state::seed_state();
+        state.explorer.set_root(Some(root.clone()));
+        state.explorer.listings.insert(
+            root.clone(),
+            Arc::new(Listing::Ready(vec![
+                Entry {
+                    path: first.clone(),
+                    name: "alpha.md".into(),
+                    directory: false,
+                },
+                Entry {
+                    path: second.clone(),
+                    name: "beta.md".into(),
+                    directory: false,
+                },
+            ])),
+        );
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let tree_snapshot = snapshot.clone();
+        let tree_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            include_str!("../../assets/styles.css"),
+            move || ElementTree {
+                root: ElementDef::new(Tag::Div)
+                    .with_class("app")
+                    .with_class("theme-amber")
+                    .with_child(build_explorer(&tree_snapshot, &tree_shared)),
+            },
+            500.0,
+            700.0,
+        );
+
+        let rows = harness.query_all(".explorer-row");
+        assert!(rows.len() >= 3, "root, alpha, and beta rows");
+        let first_rect = rows[1].layout_rect;
+        let second_rect = rows[2].layout_rect;
+        let base_first = rows[1].computed_style.background.clone();
+        let base_second = rows[2].computed_style.background.clone();
+
+        harness.mouse_move(
+            first_rect.x + first_rect.width / 2.0,
+            first_rect.y + first_rect.height / 2.0,
+        );
+        harness.step();
+        let first_hover = harness.query_all(".explorer-row")[1]
+            .computed_style
+            .background
+            .clone();
+        let second_idle = harness.query_all(".explorer-row")[2]
+            .computed_style
+            .background
+            .clone();
+        assert_ne!(first_hover, base_first, "first row must highlight on entry");
+        assert_eq!(
+            second_idle, base_second,
+            "hover must not bleed into siblings"
+        );
+
+        harness.mouse_move(
+            second_rect.x + second_rect.width / 2.0,
+            second_rect.y + second_rect.height / 2.0,
+        );
+        harness.step();
+        let rows = harness.query_all(".explorer-row");
+        assert_eq!(
+            rows[1].computed_style.background, base_first,
+            "leaving the first row must clear its hover in the same frame"
+        );
+        assert_ne!(
+            rows[2].computed_style.background, base_second,
+            "the second row must highlight immediately"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

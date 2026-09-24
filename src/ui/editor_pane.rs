@@ -453,6 +453,8 @@ pub fn build_editor_pane_body(
     capture_keyboard: bool,
     font_size_pt: u32,
     find: Option<&crate::state::EditorFindView>,
+    markdown_editor: bool,
+    markdown_document: Option<std::sync::Arc<crate::markdown::MarkdownDocument>>,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -640,8 +642,148 @@ pub fn build_editor_pane_body(
         })
     });
 
+    if markdown_editor {
+        let open = markdown_document.is_some();
+        body = body
+            .with_child(build_markdown_toolbar(shared, open).with_key("markdown-toolbar"))
+            .with_class("has-markdown-toolbar");
+        if let Some(document) = markdown_document {
+            body = body
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("markdown-split-row")
+                        .with_key("markdown-split-row")
+                        .with_child(
+                            ElementDef::new(Tag::Div)
+                                .with_class("editor-source")
+                                .with_key("editor-source")
+                                .with_child(grid_el),
+                        )
+                        .with_child(build_markdown_preview(&document).with_key("markdown-preview")),
+                )
+                .with_class("has-markdown-preview");
+            return body;
+        }
+    }
+
     body = body.with_child(grid_el);
     body
+}
+
+fn build_markdown_toolbar(shared: &SharedState, preview_open: bool) -> ElementDef {
+    let preview_state = shared.clone();
+    let action = if preview_open {
+        "Hide preview"
+    } else {
+        "Show preview"
+    };
+    ElementDef::new(Tag::Div)
+        .with_class("editor-toolbar")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("editor-toolbar-title")
+                .with_text("Markdown"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("editor-toolbar-button")
+                .with_text(action)
+                .on_click(move || {
+                    mutate_with(&preview_state, |st| {
+                        crate::state::dispatch(st, "editor.markdown_preview.toggle");
+                    });
+                }),
+        )
+}
+
+fn build_markdown_preview(
+    document: &std::sync::Arc<crate::markdown::MarkdownDocument>,
+) -> ElementDef {
+    let mut body = ElementDef::new(Tag::Div).with_class("markdown-body");
+    append_markdown_blocks(&document.blocks, &mut body);
+    if document.truncated {
+        body = body.with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("markdown-truncated")
+                .with_text(format!(
+                    "Preview shows the first {} blocks.",
+                    crate::markdown::MAX_PREVIEW_BLOCKS
+                )),
+        );
+    }
+    ElementDef::new(Tag::Div)
+        .with_class("markdown-preview")
+        .with_child(
+            ElementDef::new(Tag::Div)
+                .with_class("markdown-preview-header")
+                .with_child(
+                    ElementDef::new(Tag::Span)
+                        .with_class("markdown-preview-title")
+                        .with_text("Preview"),
+                ),
+        )
+        .with_child(body)
+}
+
+fn append_markdown_blocks(blocks: &[crate::markdown::MarkdownBlock], parent: &mut ElementDef) {
+    use crate::markdown::MarkdownBlock;
+
+    for block in blocks {
+        let child = match block {
+            MarkdownBlock::Heading { level, text } => ElementDef::new(Tag::Div)
+                .with_class("markdown-heading")
+                .with_class(format!("markdown-h{level}"))
+                .with_text(text.clone()),
+            MarkdownBlock::Paragraph(text) => ElementDef::new(Tag::Div)
+                .with_class("markdown-paragraph")
+                .with_text(text.clone()),
+            MarkdownBlock::Code { language, text } => ElementDef::new(Tag::Div)
+                .with_class("markdown-code")
+                .with_child(if language.is_empty() {
+                    ElementDef::new(Tag::Span)
+                        .with_class("markdown-code-language")
+                        .with_text("text")
+                } else {
+                    ElementDef::new(Tag::Span)
+                        .with_class("markdown-code-language")
+                        .with_text(language.clone())
+                })
+                .with_child(
+                    ElementDef::new(Tag::Div)
+                        .with_class("markdown-code-body")
+                        .with_text(text.clone()),
+                ),
+            MarkdownBlock::Quote(blocks) => {
+                let mut quote = ElementDef::new(Tag::Div).with_class("markdown-quote");
+                append_markdown_blocks(blocks, &mut quote);
+                quote
+            }
+            MarkdownBlock::List { ordered, items } => {
+                let mut list = ElementDef::new(Tag::Div).with_class("markdown-list");
+                if *ordered {
+                    list = list.with_class("ordered");
+                }
+                for (index, item_blocks) in items.iter().enumerate() {
+                    let marker = if *ordered {
+                        format!("{}.", index + 1)
+                    } else {
+                        "•".to_string()
+                    };
+                    let mut item = ElementDef::new(Tag::Div).with_class("markdown-list-item");
+                    item = item.with_child(
+                        ElementDef::new(Tag::Span)
+                            .with_class("markdown-list-marker")
+                            .with_text(marker),
+                    );
+                    let mut content = ElementDef::new(Tag::Div).with_class("markdown-list-content");
+                    append_markdown_blocks(item_blocks, &mut content);
+                    list = list.with_child(item.with_child(content));
+                }
+                list
+            }
+        };
+        parent.children.push(child);
+    }
 }
 
 #[cfg(test)]
@@ -742,7 +884,7 @@ mod tests {
     fn editor_pane_body_renders_grid_with_content() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let grid_el = &el.children[0];
@@ -753,10 +895,66 @@ mod tests {
     }
 
     #[test]
+    fn markdown_editor_renders_document_preview_beside_source() {
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-pane-preview-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "# Heading\n\nParagraph\n").unwrap();
+        let mut state = seed_state();
+        crate::state::dispatch(&mut state, &format!("editor.open:{}", path.display()));
+        let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let snapshot = shared.lock().unwrap().ui_snapshot();
+        let pane_id = snapshot.active_pane;
+        let document = snapshot.markdown_previews.get(&pane_id.0).cloned().unwrap();
+        let grids: std::collections::HashMap<u32, _> = {
+            let guard = shared.lock().unwrap();
+            guard
+                .editors
+                .iter()
+                .map(|(&id, e)| (id, e.grid.clone()))
+                .collect()
+        };
+
+        let body = build_editor_pane_body(
+            pane_id,
+            true,
+            13,
+            None,
+            true,
+            Some(document),
+            &shared,
+            &grids,
+        );
+
+        assert_eq!(body.children.len(), 2, "toolbar and split row");
+        assert!(body.children[0]
+            .classes
+            .iter()
+            .any(|c| c == "editor-toolbar"));
+        let split = &body.children[1];
+        assert!(split.classes.iter().any(|c| c == "markdown-split-row"));
+        assert_eq!(split.children.len(), 2, "source and preview");
+        assert!(split.children[0]
+            .classes
+            .iter()
+            .any(|c| c == "editor-source"));
+        assert!(split.children[1]
+            .classes
+            .iter()
+            .any(|c| c == "markdown-preview"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn active_editor_pane_captures_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         assert!(el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -765,7 +963,7 @@ mod tests {
     fn inactive_editor_pane_does_not_capture_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
         assert!(!el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -776,7 +974,7 @@ mod tests {
     fn inactive_editor_pane_still_registers_scroll_handler() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
         assert!(
             el.children[0]
                 .handlers
@@ -791,7 +989,7 @@ mod tests {
     fn missing_grid_renders_empty_body() {
         let (shared, path) = shared_with_editor();
         let grids = std::collections::HashMap::new();
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         assert!(el.children.is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -1097,7 +1295,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1127,7 +1325,7 @@ mod tests {
     fn editor_pane_registers_mouse_handlers_even_when_inactive() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(
             grid_el
@@ -1306,7 +1504,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1375,7 +1573,16 @@ mod tests {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
         let view = find_view("row 1", "2 of 11");
-        let el = build_editor_pane_body(PaneId(1), true, 13, Some(&view), &shared, &grids);
+        let el = build_editor_pane_body(
+            PaneId(1),
+            true,
+            13,
+            Some(&view),
+            false,
+            None,
+            &shared,
+            &grids,
+        );
 
         assert_eq!(el.children.len(), 2, "bar, then grid");
         let bar = &el.children[0];
@@ -1397,7 +1604,7 @@ mod tests {
     fn find_bar_is_absent_when_no_search_is_open() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
         assert_eq!(el.children.len(), 1);
         let _ = std::fs::remove_file(path);
     }

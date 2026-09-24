@@ -1368,6 +1368,21 @@ impl AppState {
             .chain(self.agent_restarts.keys())
             .copied()
             .collect();
+        let mut markdown_editor_panes = std::collections::HashSet::new();
+        let mut markdown_previews = std::collections::HashMap::new();
+        for pane_id in self.panes.iter().flatten().map(|pane| pane.id.0) {
+            let Some(editor) = self.editors.get(&pane_id) else {
+                continue;
+            };
+            if editor.is_markdown() {
+                markdown_editor_panes.insert(pane_id);
+                if editor.markdown_preview_open {
+                    if let Some(document) = editor.markdown_document() {
+                        markdown_previews.insert(pane_id, document);
+                    }
+                }
+            }
+        }
         let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
             self.terminals
                 .get(&self.active_pane.0)
@@ -1459,6 +1474,8 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            markdown_editor_panes,
+            markdown_previews,
             diff_review: self.diff_review.clone(),
             editor_find_bars: self
                 .editors
@@ -1632,6 +1649,11 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Markdown editor panes in the active tab, whether or not preview is open.
+    pub markdown_editor_panes: std::collections::HashSet<u32>,
+    /// Rendered Markdown documents for open side previews in the active tab.
+    pub markdown_previews:
+        std::collections::HashMap<u32, std::sync::Arc<crate::markdown::MarkdownDocument>>,
     pub diff_review: Option<crate::diff_review::Review>,
     /// Find bars that are currently open, by pane id. Only what the bar
     /// renders, so the tree build never reaches into a live pane.
@@ -8846,6 +8868,17 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "dialog.goto_commit" => dispatch_goto_commit(state),
         "editor.find" => dispatch_editor_find(state, FindCommand::Open),
+        "editor.markdown_preview.toggle" => {
+            let pane_id = state.active_pane.0;
+            let Some(editor) = state.editors.get_mut(&pane_id) else {
+                return false;
+            };
+            if !editor.is_markdown() {
+                return false;
+            }
+            editor.markdown_preview_open = !editor.markdown_preview_open;
+            true
+        }
         "editor.find_close" => dispatch_editor_find(state, FindCommand::Close),
         "editor.find_next" => dispatch_editor_find(state, FindCommand::Next),
         "editor.find_prev" => dispatch_editor_find(state, FindCommand::Prev),

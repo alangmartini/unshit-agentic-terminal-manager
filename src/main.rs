@@ -24,6 +24,7 @@ pub mod git;
 pub mod git_watch;
 pub mod keybinds;
 pub mod launch_target;
+pub mod markdown;
 pub mod notifications;
 pub mod pane_restore;
 pub mod persist;
