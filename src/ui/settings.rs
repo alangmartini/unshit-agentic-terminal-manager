@@ -4733,17 +4733,19 @@ mod tests {
     }
 
     #[test]
-    fn keybinds_section_exposes_editable_new_agent_row() {
+    fn keybinds_section_exposes_editable_agent_rows() {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_keybinds_section(&snap, &shared);
-        let row = find_kb_row(&el, "New agent").expect("New agent keybind row");
-        let binding = row
-            .children
-            .iter()
-            .find(|child| child.classes.contains(&"kb-binding".to_string()))
-            .expect("New agent binding is editable");
-        assert!(find_first_with_class(binding, "edit-pencil").is_some());
+        for label in ["New agent", "New Claude Code agent", "New Codex agent"] {
+            let row = find_kb_row(&el, label).unwrap_or_else(|| panic!("{label} keybind row"));
+            let binding = row
+                .children
+                .iter()
+                .find(|child| child.classes.contains(&"kb-binding".to_string()))
+                .unwrap_or_else(|| panic!("{label} binding is editable"));
+            assert!(find_first_with_class(binding, "edit-pencil").is_some());
+        }
     }
 
     #[test]

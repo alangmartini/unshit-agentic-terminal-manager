@@ -465,7 +465,7 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         description: "Open a new tab running Claude Code in the active workspace.",
         group: PaletteGroup::Session,
         icon: PaletteIcon::Agent,
-        keybind: None,
+        keybind: Some(KeybindAction::NewClaudeAgent),
         shortcut_label: None,
         dispatch: "agent.new:claude",
         keywords: &["new", "agent", "claude", "anthropic", "tab"],
@@ -477,7 +477,7 @@ pub const SAFE_ACTIONS: &[PaletteAction] = &[
         description: "Open a new tab running Codex in the active workspace.",
         group: PaletteGroup::Session,
         icon: PaletteIcon::Agent,
-        keybind: None,
+        keybind: Some(KeybindAction::NewCodexAgent),
         shortcut_label: None,
         dispatch: "agent.new:codex",
         keywords: &["new", "agent", "codex", "openai", "tab"],
@@ -1746,6 +1746,17 @@ mod tests {
             .iter()
             .filter(|item| !item.enabled)
             .all(|item| item.dispatch.is_some()));
+        for (id, keybind) in [
+            ("new_agent", KeybindAction::NewAgent),
+            ("new_claude_agent", KeybindAction::NewClaudeAgent),
+            ("new_codex_agent", KeybindAction::NewCodexAgent),
+        ] {
+            let action = SAFE_ACTIONS
+                .iter()
+                .find(|action| action.id == id)
+                .unwrap_or_else(|| panic!("{id} action"));
+            assert_eq!(action.keybind, Some(keybind));
+        }
     }
 
     #[test]

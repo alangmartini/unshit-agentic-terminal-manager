@@ -21,6 +21,8 @@ use unshit::core::shortcut::KeyCombo;
 pub enum KeybindAction {
     NewTerminal,
     NewAgent,
+    NewClaudeAgent,
+    NewCodexAgent,
     CloseTab,
     SplitRight,
     SplitDown,
@@ -77,6 +79,8 @@ impl KeybindAction {
     pub const ALL: &'static [KeybindAction] = &[
         Self::NewTerminal,
         Self::NewAgent,
+        Self::NewClaudeAgent,
+        Self::NewCodexAgent,
         Self::CloseTab,
         Self::SplitRight,
         Self::SplitDown,
@@ -108,6 +112,8 @@ impl KeybindAction {
         match self {
             Self::NewTerminal => "new_terminal",
             Self::NewAgent => "new_agent",
+            Self::NewClaudeAgent => "new_claude_agent",
+            Self::NewCodexAgent => "new_codex_agent",
             Self::CloseTab => "close_tab",
             Self::SplitRight => "split_right",
             Self::SplitDown => "split_down",
@@ -145,6 +151,8 @@ impl KeybindAction {
         match self {
             Self::NewTerminal => "New terminal",
             Self::NewAgent => "New agent",
+            Self::NewClaudeAgent => "New Claude Code agent",
+            Self::NewCodexAgent => "New Codex agent",
             Self::CloseTab => "Close tab",
             Self::SplitRight => "Split right",
             Self::SplitDown => "Split down",
@@ -179,6 +187,8 @@ impl KeybindAction {
             Self::NewAgent => {
                 "Open a new tab running the default agent CLI in the active workspace"
             }
+            Self::NewClaudeAgent => "Open a new tab running Claude Code in the active workspace",
+            Self::NewCodexAgent => "Open a new tab running Codex in the active workspace",
             Self::CloseTab => "Close the current tab",
             Self::SplitRight => "Open a new pane to the right",
             Self::SplitDown => "Open a new pane below",
@@ -218,6 +228,8 @@ impl KeybindAction {
             | Self::FocusDown => KeybindGroup::Panes,
             Self::NewTerminal
             | Self::NewAgent
+            | Self::NewClaudeAgent
+            | Self::NewCodexAgent
             | Self::CloseTab
             | Self::NextTab
             | Self::PrevTab
@@ -246,6 +258,8 @@ impl KeybindAction {
         match self {
             Self::NewTerminal => "tab.new",
             Self::NewAgent => "agent.new",
+            Self::NewClaudeAgent => "agent.new:claude",
+            Self::NewCodexAgent => "agent.new:codex",
             Self::CloseTab => "tab.close.active",
             Self::SplitRight => "pane.split_right",
             Self::SplitDown => "pane.split_down",
@@ -283,6 +297,8 @@ impl KeybindAction {
         let combo = match self {
             Self::NewTerminal => "Meta+T",
             Self::NewAgent => "Shift+Meta+A",
+            Self::NewClaudeAgent => "Shift+Meta+L",
+            Self::NewCodexAgent => "Shift+Meta+X",
             Self::CloseTab => "Shift+Meta+W",
             Self::SplitRight => "Meta+D",
             Self::SplitDown => "Shift+Meta+D",
@@ -320,6 +336,8 @@ impl KeybindAction {
             // Ctrl+Shift chord: plain Ctrl+A must keep reaching the
             // terminal (readline line-start, select-all in TUIs).
             Self::NewAgent => "Ctrl+Shift+A",
+            Self::NewClaudeAgent => "Ctrl+Shift+L",
+            Self::NewCodexAgent => "Ctrl+Shift+X",
             Self::CloseTab => "Ctrl+Shift+W",
             Self::SplitRight => "Ctrl+D",
             Self::SplitDown => "Ctrl+Shift+D",
@@ -373,8 +391,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn all_has_twenty_six_variants() {
-        assert_eq!(KeybindAction::ALL.len(), 26);
+    fn all_has_twenty_eight_variants() {
+        assert_eq!(KeybindAction::ALL.len(), 28);
     }
 
     #[test]
@@ -405,6 +423,35 @@ mod tests {
             KeybindAction::from_id("new_agent"),
             Some(KeybindAction::NewAgent)
         );
+    }
+
+    #[test]
+    fn provider_specific_agent_launches_have_editable_shortcuts() {
+        for (action, id, dispatch) in [
+            (
+                KeybindAction::NewClaudeAgent,
+                "new_claude_agent",
+                "agent.new:claude",
+            ),
+            (
+                KeybindAction::NewCodexAgent,
+                "new_codex_agent",
+                "agent.new:codex",
+            ),
+        ] {
+            assert_eq!(action.id(), id);
+            assert_eq!(action.dispatch_command(), dispatch);
+            assert_eq!(action.group(), KeybindGroup::Tabs);
+            assert_eq!(KeybindAction::from_id(id), Some(action));
+        }
+
+        let (claude, codex) = if cfg!(target_os = "macos") {
+            ("Shift+Meta+L", "Shift+Meta+X")
+        } else {
+            ("Ctrl+Shift+L", "Ctrl+Shift+X")
+        };
+        assert_eq!(KeybindAction::NewClaudeAgent.default_combo_str(), claude);
+        assert_eq!(KeybindAction::NewCodexAgent.default_combo_str(), codex);
     }
 
     #[test]
