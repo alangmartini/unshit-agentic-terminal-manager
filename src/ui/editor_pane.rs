@@ -11,6 +11,7 @@ use unshit::core::event::{
 };
 use unshit::core::style::parse::StyleDeclaration;
 
+use super::markdown_preview;
 use crate::state::{mutate_with, PaneId, SharedState};
 
 /// Lines per PageUp/PageDown step for a viewport of `rows`.
@@ -446,6 +447,63 @@ fn build_find_bar(
     bar
 }
 
+/// Scroll the editor for one wheel event and return the paint-only patch, or
+/// `None` when the pane is gone or the event carries no delta.
+///
+/// Shift+wheel scrolls horizontally (VS Code / xterm convention) in
+/// character steps against the cell width; plain wheel scrolls whole lines
+/// against the cell height. delta_y > 0 is wheel up (toward the top of the
+/// file / start of the line). `preview_id` names an overflow container that
+/// mirrors the editor's vertical position (the Markdown preview).
+pub(super) fn wheel_scroll_patch(
+    shared: &SharedState,
+    pane_id: PaneId,
+    se: &unshit::core::event::ScrollEvent,
+    preview_id: Option<&str>,
+) -> Option<unshit::app::app::ScrollGridPatch> {
+    let horizontal = se.modifiers.contains(Modifiers::SHIFT);
+    let cell = if horizontal {
+        unshit::core::cell_grid::CellGrid::global_cell_w()
+    } else {
+        unshit::core::cell_grid::CellGrid::global_cell_h()
+    }
+    .max(1.0);
+    let units = (se.delta_y / cell).round() as isize;
+    mutate_with(shared, |st| {
+        let editor = st.editors.get_mut(&pane_id.0)?;
+        let step = if units == 0 {
+            if se.delta_y > 0.0 {
+                -1
+            } else if se.delta_y < 0.0 {
+                1
+            } else {
+                return None;
+            }
+        } else {
+            -units
+        };
+        let moved = if horizontal {
+            editor.scroll_h_by(step)
+        } else {
+            editor.scroll_by(step)
+        };
+        let scroll_fractions = preview_id
+            .filter(|_| !horizontal)
+            .map(|id| unshit::app::ScrollFractionPatch {
+                id: id.to_string(),
+                x: None,
+                y: Some(editor.scroll_fraction()),
+            })
+            .into_iter()
+            .collect();
+        Some(unshit::app::app::ScrollGridPatch {
+            grid: moved.then(|| editor.grid.clone()),
+            scroll_fractions,
+            animation: None,
+        })
+    })
+}
+
 /// Build the editor pane body. `capture_keyboard` is true for the active
 /// pane only, exactly like terminal panes.
 pub fn build_editor_pane_body(
@@ -453,8 +511,7 @@ pub fn build_editor_pane_body(
     capture_keyboard: bool,
     font_size_pt: u32,
     find: Option<&crate::state::EditorFindView>,
-    markdown_editor: bool,
-    markdown_document: Option<std::sync::Arc<crate::markdown::MarkdownDocument>>,
+    markdown: Option<&crate::markdown::MarkdownView>,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -519,74 +576,21 @@ pub fn build_editor_pane_body(
     // above stays focus-gated.
     let scroll_shared = shared.clone();
     let scroll_pane = pane_id;
-    let preview_sync_target = markdown_document
-        .is_some()
-        .then(|| markdown_preview_body_id(pane_id));
+    let preview_sync_target = matches!(markdown, Some(crate::markdown::MarkdownView::Open(_)))
+        .then(|| markdown_preview::body_id(pane_id));
     grid_el = grid_el.on(
         EventType::Scroll,
         move |event: &Event| -> Option<Box<dyn std::any::Any>> {
             let Event::Scroll(se) = event else {
                 return None;
             };
-            // Shift+wheel scrolls horizontally (VS Code / xterm
-            // convention) in character steps against the cell width;
-            // plain wheel scrolls whole lines against the cell
-            // height. delta_y > 0 is wheel up (toward the top of
-            // the file / start of the line).
-            let horizontal = se.modifiers.contains(Modifiers::SHIFT);
-            let cell = if horizontal {
-                unshit::core::cell_grid::CellGrid::global_cell_w()
-            } else {
-                unshit::core::cell_grid::CellGrid::global_cell_h()
-            }
-            .max(1.0);
-            let units = (se.delta_y / cell).round() as isize;
-            let (grid, preview_fraction) = mutate_with(&scroll_shared, |st| {
-                let editor = st.editors.get_mut(&scroll_pane.0)?;
-                let step = if units == 0 {
-                    if se.delta_y > 0.0 {
-                        -1
-                    } else if se.delta_y < 0.0 {
-                        1
-                    } else {
-                        return None;
-                    }
-                } else {
-                    -units
-                };
-                let moved = if horizontal {
-                    editor.scroll_h_by(step)
-                } else {
-                    editor.scroll_by(step)
-                };
-                let grid = moved.then(|| editor.grid.clone());
-                let preview_fraction = (!horizontal && preview_sync_target.is_some()).then(|| {
-                    let max_top_line = editor.max_top_line();
-                    if max_top_line == 0 {
-                        0.0
-                    } else {
-                        editor.top_line as f32 / max_top_line as f32
-                    }
-                });
-                Some((grid, preview_fraction))
-            })?;
-            let scroll_fractions = preview_fraction
-                .and_then(|fraction| {
-                    preview_sync_target
-                        .clone()
-                        .map(|id| unshit::app::ScrollFractionPatch {
-                            id,
-                            x: None,
-                            y: Some(fraction),
-                        })
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
-            Some(Box::new(unshit::app::app::ScrollGridPatch {
-                grid,
-                scroll_fractions,
-                animation: None,
-            }))
+            let patch = wheel_scroll_patch(
+                &scroll_shared,
+                scroll_pane,
+                se,
+                preview_sync_target.as_deref(),
+            )?;
+            Some(Box::new(patch))
         },
     );
 
@@ -667,226 +671,9 @@ pub fn build_editor_pane_body(
         })
     });
 
-    if markdown_editor {
-        let open = markdown_document.is_some();
-        body = body
-            .with_child(build_markdown_toolbar(shared, open).with_key("markdown-toolbar"))
-            .with_class("has-markdown-toolbar");
-        if let Some(document) = markdown_document {
-            body = body
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("markdown-split-row")
-                        .with_key("markdown-split-row")
-                        .with_child(
-                            ElementDef::new(Tag::Div)
-                                .with_class("editor-source")
-                                .with_key("editor-source")
-                                .with_child(grid_el),
-                        )
-                        .with_child(
-                            build_markdown_preview(&document, pane_id, shared)
-                                .with_key("markdown-preview"),
-                        ),
-                )
-                .with_class("has-markdown-preview");
-            return body;
-        }
-    }
-
-    body = body.with_child(grid_el);
-    body
-}
-
-fn build_markdown_toolbar(shared: &SharedState, preview_open: bool) -> ElementDef {
-    let preview_state = shared.clone();
-    let action = if preview_open {
-        "Hide preview"
-    } else {
-        "Show preview"
-    };
-    ElementDef::new(Tag::Div)
-        .with_class("editor-toolbar")
-        .with_child(
-            ElementDef::new(Tag::Span)
-                .with_class("editor-toolbar-title")
-                .with_text("Markdown"),
-        )
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("editor-toolbar-button")
-                .with_text(action)
-                .on_click(move || {
-                    mutate_with(&preview_state, |st| {
-                        crate::state::dispatch(st, "editor.markdown_preview.toggle");
-                    });
-                }),
-        )
-}
-
-fn markdown_preview_body_id(pane_id: PaneId) -> String {
-    format!("markdown-preview-body-{}", pane_id.0)
-}
-
-fn build_markdown_preview(
-    document: &std::sync::Arc<crate::markdown::MarkdownDocument>,
-    pane_id: PaneId,
-    shared: &SharedState,
-) -> ElementDef {
-    let scroll_shared = shared.clone();
-    let scroll_pane = pane_id;
-    let mut body = ElementDef::new(Tag::Div)
-        .with_class("markdown-body")
-        .with_id(markdown_preview_body_id(pane_id))
-        .with_key(markdown_preview_body_id(pane_id))
-        .on(
-            EventType::Scroll,
-            move |event: &Event| -> Option<Box<dyn std::any::Any>> {
-                let Event::Scroll(se) = event else {
-                    return None;
-                };
-                let horizontal = se.modifiers.contains(Modifiers::SHIFT);
-                let cell = if horizontal {
-                    unshit::core::cell_grid::CellGrid::global_cell_w()
-                } else {
-                    unshit::core::cell_grid::CellGrid::global_cell_h()
-                }
-                .max(1.0);
-                let units = (se.delta_y / cell).round() as isize;
-                let grid = mutate_with(&scroll_shared, |st| {
-                    let editor = st.editors.get_mut(&scroll_pane.0)?;
-                    let step = if units == 0 {
-                        if se.delta_y > 0.0 {
-                            -1
-                        } else if se.delta_y < 0.0 {
-                            1
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        -units
-                    };
-                    let moved = if horizontal {
-                        editor.scroll_h_by(step)
-                    } else {
-                        editor.scroll_by(step)
-                    };
-                    moved.then(|| editor.grid.clone())
-                });
-                Some(Box::new(unshit::app::app::ScrollGridPatch {
-                    grid,
-                    scroll_fractions: Vec::new(),
-                    animation: None,
-                }))
-            },
-        );
-    append_markdown_blocks(&document.blocks, &mut body, pane_id, shared);
-    if document.truncated {
-        body = body.with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("markdown-truncated")
-                .with_text(format!(
-                    "Preview shows the first {} blocks.",
-                    crate::markdown::MAX_PREVIEW_BLOCKS
-                )),
-        );
-    }
-    ElementDef::new(Tag::Div)
-        .with_class("markdown-preview")
-        .with_child(
-            ElementDef::new(Tag::Div)
-                .with_class("markdown-preview-header")
-                .with_child(
-                    ElementDef::new(Tag::Span)
-                        .with_class("markdown-preview-title")
-                        .with_text("Preview"),
-                ),
-        )
-        .with_child(body)
-}
-
-fn append_markdown_blocks(
-    blocks: &[crate::markdown::MarkdownBlock],
-    parent: &mut ElementDef,
-    pane_id: PaneId,
-    shared: &SharedState,
-) {
-    use crate::markdown::MarkdownBlock;
-
-    for block in blocks {
-        let child = match block {
-            MarkdownBlock::Heading {
-                level,
-                text,
-                source_line,
-                anchor,
-            } => {
-                let heading_shared = shared.clone();
-                let heading_pane = pane_id;
-                let target_line = source_line + 1;
-                ElementDef::new(Tag::Div)
-                    .with_class("markdown-heading")
-                    .with_class(format!("markdown-h{level}"))
-                    .with_id(format!("markdown-anchor-{}-{anchor}", pane_id.0))
-                    .with_key(format!("markdown-anchor-{anchor}"))
-                    .with_text(text.clone())
-                    .on_click(move || {
-                        mutate_with(&heading_shared, |st| {
-                            if let Some(editor) = st.editors.get_mut(&heading_pane.0) {
-                                editor.goto_line(target_line, None);
-                            }
-                        });
-                    })
-            }
-            MarkdownBlock::Paragraph(text) => ElementDef::new(Tag::Div)
-                .with_class("markdown-paragraph")
-                .with_text(text.clone()),
-            MarkdownBlock::Code { language, text } => ElementDef::new(Tag::Div)
-                .with_class("markdown-code")
-                .with_child(if language.is_empty() {
-                    ElementDef::new(Tag::Span)
-                        .with_class("markdown-code-language")
-                        .with_text("text")
-                } else {
-                    ElementDef::new(Tag::Span)
-                        .with_class("markdown-code-language")
-                        .with_text(language.clone())
-                })
-                .with_child(
-                    ElementDef::new(Tag::Div)
-                        .with_class("markdown-code-body")
-                        .with_text(text.clone()),
-                ),
-            MarkdownBlock::Quote(blocks) => {
-                let mut quote = ElementDef::new(Tag::Div).with_class("markdown-quote");
-                append_markdown_blocks(blocks, &mut quote, pane_id, shared);
-                quote
-            }
-            MarkdownBlock::List { ordered, items } => {
-                let mut list = ElementDef::new(Tag::Div).with_class("markdown-list");
-                if *ordered {
-                    list = list.with_class("ordered");
-                }
-                for (index, item_blocks) in items.iter().enumerate() {
-                    let marker = if *ordered {
-                        format!("{}.", index + 1)
-                    } else {
-                        "•".to_string()
-                    };
-                    let mut item = ElementDef::new(Tag::Div).with_class("markdown-list-item");
-                    item = item.with_child(
-                        ElementDef::new(Tag::Span)
-                            .with_class("markdown-list-marker")
-                            .with_text(marker),
-                    );
-                    let mut content = ElementDef::new(Tag::Div).with_class("markdown-list-content");
-                    append_markdown_blocks(item_blocks, &mut content, pane_id, shared);
-                    list = list.with_child(item.with_child(content));
-                }
-                list
-            }
-        };
-        parent.children.push(child);
+    match markdown {
+        Some(view) => markdown_preview::attach(body, grid_el, view, pane_id, shared),
+        None => body.with_child(grid_el),
     }
 }
 
@@ -930,15 +717,6 @@ mod tests {
             return Some(el);
         }
         el.children.iter().find_map(any_focusable)
-    }
-
-    fn find_by_class<'a>(el: &'a ElementDef, class: &str) -> Option<&'a ElementDef> {
-        if el.classes.iter().any(|candidate| candidate == class) {
-            return Some(el);
-        }
-        el.children
-            .iter()
-            .find_map(|child| find_by_class(child, class))
     }
 
     /// Clicking a find-bar control used to move focus off the query input
@@ -997,7 +775,7 @@ mod tests {
     fn editor_pane_body_renders_grid_with_content() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let grid_el = &el.children[0];
@@ -1008,229 +786,10 @@ mod tests {
     }
 
     #[test]
-    fn markdown_editor_renders_document_preview_beside_source() {
-        let path = std::env::temp_dir().join(format!(
-            "tm-editor-pane-preview-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, "# Heading\n\nParagraph\n").unwrap();
-        let mut state = seed_state();
-        crate::state::dispatch(&mut state, &format!("editor.open:{}", path.display()));
-        let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state));
-        let snapshot = shared.lock().unwrap().ui_snapshot();
-        let pane_id = snapshot.active_pane;
-        let document = snapshot.markdown_previews.get(&pane_id.0).cloned().unwrap();
-        let grids: std::collections::HashMap<u32, _> = {
-            let guard = shared.lock().unwrap();
-            guard
-                .editors
-                .iter()
-                .map(|(&id, e)| (id, e.grid.clone()))
-                .collect()
-        };
-
-        let body = build_editor_pane_body(
-            pane_id,
-            true,
-            13,
-            None,
-            true,
-            Some(document),
-            &shared,
-            &grids,
-        );
-
-        assert_eq!(body.children.len(), 2, "toolbar and split row");
-        assert!(body.children[0]
-            .classes
-            .iter()
-            .any(|c| c == "editor-toolbar"));
-        let split = &body.children[1];
-        assert!(split.classes.iter().any(|c| c == "markdown-split-row"));
-        assert_eq!(split.children.len(), 2, "source and preview");
-        assert!(split.children[0]
-            .classes
-            .iter()
-            .any(|c| c == "editor-source"));
-        assert!(split.children[1]
-            .classes
-            .iter()
-            .any(|c| c == "markdown-preview"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn clicking_markdown_heading_moves_source_cursor_to_its_line() {
-        let path = std::env::temp_dir().join(format!(
-            "tm-editor-heading-click-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut source = String::new();
-        for index in 0..30 {
-            source.push_str(&format!("Intro line {index}\n"));
-        }
-        source.push_str("\n# Target\n\nBody\n");
-        std::fs::write(&path, source).unwrap();
-        let mut state = seed_state();
-        crate::state::dispatch(&mut state, &format!("editor.open:{}", path.display()));
-        let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state));
-        let snapshot = shared.lock().unwrap().ui_snapshot();
-        let pane_id = snapshot.active_pane;
-        let document = snapshot.markdown_previews.get(&pane_id.0).cloned().unwrap();
-        let grids: std::collections::HashMap<u32, _> = {
-            let guard = shared.lock().unwrap();
-            guard
-                .editors
-                .iter()
-                .map(|(&id, editor)| (id, editor.grid.clone()))
-                .collect()
-        };
-        let body = build_editor_pane_body(
-            pane_id,
-            true,
-            13,
-            None,
-            true,
-            Some(document),
-            &shared,
-            &grids,
-        );
-
-        let heading = find_by_class(&body, "markdown-heading").expect("preview heading");
-        heading.on_click.as_ref().expect("heading click handler")();
-        let guard = shared.lock().unwrap();
-        let editor = guard.editors.get(&pane_id.0).expect("editor");
-        assert_eq!(editor.buffer.cursor().line, 31);
-        assert!(editor.top_line > 0);
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn markdown_scroll_fixture() -> (
-        SharedState,
-        PaneId,
-        std::path::PathBuf,
-        unshit_test::TestHarness,
-    ) {
-        use unshit_test::TestHarness;
-
-        let path = std::env::temp_dir().join(format!(
-            "tm-editor-markdown-scroll-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut source = "# Top\n\n".to_string();
-        for index in 0..100 {
-            source.push_str(&format!(
-                "Paragraph {index} with enough text to occupy preview height.\n\n"
-            ));
-        }
-        std::fs::write(&path, source).unwrap();
-        let mut state = seed_state();
-        crate::state::dispatch(&mut state, &format!("editor.open:{}", path.display()));
-        let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state));
-        let snapshot = shared.lock().unwrap().ui_snapshot();
-        let pane_id = snapshot.active_pane;
-        let document = snapshot.markdown_previews.get(&pane_id.0).cloned().unwrap();
-        let grids: std::collections::HashMap<u32, _> = {
-            let guard = shared.lock().unwrap();
-            guard
-                .editors
-                .iter()
-                .map(|(&id, editor)| (id, editor.grid.clone()))
-                .collect()
-        };
-        let tree_snapshot = snapshot;
-        let tree_document = document;
-        let tree_grids = grids;
-        let tree_shared = shared.clone();
-        let harness = TestHarness::new(
-            include_str!("../../assets/styles.css"),
-            move || {
-                let body = build_editor_pane_body(
-                    tree_snapshot.active_pane,
-                    true,
-                    13,
-                    tree_snapshot
-                        .editor_find_bars
-                        .get(&tree_snapshot.active_pane.0),
-                    true,
-                    Some(tree_document.clone()),
-                    &tree_shared,
-                    &tree_grids,
-                );
-                ElementTree {
-                    root: ElementDef::new(Tag::Div)
-                        .with_class("app")
-                        .with_class("theme-amber")
-                        .with_child(body),
-                }
-            },
-            1000.0,
-            620.0,
-        );
-        (shared, pane_id, path, harness)
-    }
-
-    #[test]
-    fn scrolling_preview_drives_markdown_source_grid() {
-        let (shared, pane_id, path, mut harness) = markdown_scroll_fixture();
-        let preview = harness.query(".markdown-body").expect("preview body");
-        let x = preview.layout_rect.x + preview.layout_rect.width / 2.0;
-        let y = preview.layout_rect.y + preview.layout_rect.height / 2.0;
-
-        harness.mouse_move(x, y);
-        harness.mouse_wheel(x, y, 0.0, -120.0);
-
-        assert!(
-            harness.query(".markdown-body").unwrap().scroll_y > 0.0,
-            "native preview scrolling must still run"
-        );
-        let guard = shared.lock().unwrap();
-        let editor = guard.editors.get(&pane_id.0).expect("editor");
-        assert!(
-            editor.top_line > 0,
-            "preview wheel must drive the source grid through a paint patch"
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn scrolling_source_drives_markdown_preview() {
-        let (shared, pane_id, path, mut harness) = markdown_scroll_fixture();
-        let source = harness.query(".editor-content").expect("source grid");
-        let x = source.layout_rect.x + source.layout_rect.width / 2.0;
-        let y = source.layout_rect.y + source.layout_rect.height / 2.0;
-
-        harness.mouse_move(x, y);
-        harness.mouse_wheel(x, y, 0.0, -120.0);
-
-        let guard = shared.lock().unwrap();
-        let editor = guard.editors.get(&pane_id.0).expect("editor");
-        assert!(editor.top_line > 0, "source wheel must scroll the grid");
-        drop(guard);
-        assert!(
-            harness.query(".markdown-body").unwrap().scroll_y > 0.0,
-            "the companion scroll patch must move the preview without a rebuild"
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn active_editor_pane_captures_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -1239,7 +798,7 @@ mod tests {
     fn inactive_editor_pane_does_not_capture_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         assert!(!el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -1250,7 +809,7 @@ mod tests {
     fn inactive_editor_pane_still_registers_scroll_handler() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         assert!(
             el.children[0]
                 .handlers
@@ -1265,7 +824,7 @@ mod tests {
     fn missing_grid_renders_empty_body() {
         let (shared, path) = shared_with_editor();
         let grids = std::collections::HashMap::new();
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.children.is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -1571,7 +1130,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1601,7 +1160,7 @@ mod tests {
     fn editor_pane_registers_mouse_handlers_even_when_inactive() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(
             grid_el
@@ -1780,7 +1339,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1849,16 +1408,7 @@ mod tests {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
         let view = find_view("row 1", "2 of 11");
-        let el = build_editor_pane_body(
-            PaneId(1),
-            true,
-            13,
-            Some(&view),
-            false,
-            None,
-            &shared,
-            &grids,
-        );
+        let el = build_editor_pane_body(PaneId(1), true, 13, Some(&view), None, &shared, &grids);
 
         assert_eq!(el.children.len(), 2, "bar, then grid");
         let bar = &el.children[0];
@@ -1880,7 +1430,7 @@ mod tests {
     fn find_bar_is_absent_when_no_search_is_open() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, false, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert_eq!(el.children.len(), 1);
         let _ = std::fs::remove_file(path);
     }

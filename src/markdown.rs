@@ -34,6 +34,14 @@ pub struct MarkdownDocument {
     pub truncated: bool,
 }
 
+/// How a Markdown editor pane presents itself in the UI snapshot.
+#[derive(Clone, Debug)]
+pub enum MarkdownView {
+    /// Source only; the toolbar offers to open the preview.
+    Closed,
+    Open(Arc<MarkdownDocument>),
+}
+
 #[derive(Debug)]
 enum DraftNode {
     Container,
@@ -72,68 +80,46 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
     let mut stack = vec![0usize];
     let options = Options::ENABLE_STRIKETHROUGH;
 
+    // Heading lines are counted incrementally: headings start in document
+    // order, so each one only scans the text since the previous heading.
+    let mut heading_line = 0usize;
+    let mut scanned = 0usize;
+
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        let current = *stack.last().expect("draft stack is never empty");
         match event {
             Event::Start(tag) => {
-                let parent = *stack.last().expect("draft stack is never empty");
                 let source_line = if matches!(tag, Tag::Heading { .. }) {
-                    text[..range.start]
+                    heading_line += text[scanned..range.start]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
-                        .count()
+                        .count();
+                    scanned = range.start;
+                    heading_line
                 } else {
                     0
                 };
-                let id = start_tag(&mut drafts, parent, tag, source_line);
-                if matches!(
-                    drafts[id].node,
-                    DraftNode::Heading(..)
-                        | DraftNode::Paragraph(_)
-                        | DraftNode::Code(..)
-                        | DraftNode::Quote
-                        | DraftNode::List(_)
-                        | DraftNode::Item(_)
-                ) {
+                let id = start_tag(&mut drafts, current, tag, source_line);
+                // Containers stay leaves so their inline text folds into the
+                // enclosing block.
+                if !matches!(drafts[id].node, DraftNode::Container) {
                     stack.push(id);
                 }
             }
             Event::End(tag) => {
-                if end_tag_pops(tag)
-                    && matches!(
-                        drafts[*stack.last().expect("draft stack is never empty")].node,
-                        DraftNode::Heading(..)
-                            | DraftNode::Paragraph(_)
-                            | DraftNode::Code(..)
-                            | DraftNode::Quote
-                            | DraftNode::List(_)
-                            | DraftNode::Item(_)
-                    )
-                    && stack.len() > 1
-                {
+                // Only block tags are ever pushed, so the root is all that
+                // is left once the stack has one entry.
+                if end_tag_pops(tag) && stack.len() > 1 {
                     stack.pop();
                 }
             }
             Event::Text(value) | Event::Code(value) => {
-                append_inline(
-                    &mut drafts,
-                    *stack.last().expect("draft stack is never empty"),
-                    &value,
-                );
+                append_inline(&mut drafts, current, &value);
             }
-            Event::SoftBreak | Event::HardBreak => {
-                append_inline(
-                    &mut drafts,
-                    *stack.last().expect("draft stack is never empty"),
-                    " ",
-                );
-            }
+            Event::SoftBreak | Event::HardBreak => append_inline(&mut drafts, current, " "),
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "[done] " } else { "[ ] " };
-                append_inline(
-                    &mut drafts,
-                    *stack.last().expect("draft stack is never empty"),
-                    marker,
-                );
+                append_inline(&mut drafts, current, marker);
             }
             _ => {}
         }
@@ -205,10 +191,6 @@ fn end_tag_pops(tag: TagEnd) -> bool {
             | TagEnd::BlockQuote(_)
             | TagEnd::List(_)
             | TagEnd::Item
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
     )
 }
 
