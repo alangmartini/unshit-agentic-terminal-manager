@@ -203,7 +203,7 @@ Confirm one of: no schema change (asserted in a test), forward migration exists 
 Spawn only enabled docs agents in ONE message.
 
 - `docs.rustdoc` (general-purpose): doc comments on new public items in `src/` and `crates/unshit-framework/`. One short line unless a non-obvious invariant needs noting.
-- `docs.changelog` (general-purpose): only if `changelog.d/unreleased/` exists. Creates `changelog.d/unreleased/<PR-number>-<short-desc>.md` with Keep a Changelog sections, following an existing fragment (there is no `TEMPLATE.md`). The draft PR from Phase 3a supplies the number, so the name is final the first time (CLAUDE.md mandate).
+- `docs.changelog` (general-purpose): only if `changelog.d/unreleased/` exists. Creates `changelog.d/unreleased/<PR-number>-<short-desc>.md` with `### Added` / `### Changed` / `### Fixed` sections as in `CHANGELOG.md` (the directory is empty apart from `.gitkeep`, and there is no `TEMPLATE.md`). The draft PR from Phase 3a supplies the number, so the name is final the first time (CLAUDE.md mandate).
 
 This phase does not touch CLAUDE.md, `.claude/`, or project memory.
 
