@@ -28,7 +28,7 @@ Main Claude (no subagent) produces a routing manifest at `.claude/tmp/<feature-s
 
 | Signal | Detection heuristic | Enables |
 |--------|--------------------|---------|
-| `surface.ui` | Touches `src/ui/`, `assets/styles.css`, user visible behavior | a11y + obs review, Phase 7 screenshots |
+| `surface.ui` | Touches `src/ui/`, `assets/styles.css`, `crates/unshit-framework` layout/render/reconcile code, user visible behavior | a11y + obs review, Phase 7 screenshots |
 | `surface.perf` | Touches `src/renderer/`, `src/pty/`, render hot path, PTY buffer path | perf review, bench gate |
 | `surface.security` | Touches `unsafe`, PTY command input, path handling, config parse, deserialization | security review |
 | `surface.persistence` | Touches saved settings, workspace layout, persisted tab order | migration check |
@@ -209,7 +209,7 @@ This phase does not touch CLAUDE.md, `.claude/`, or project memory.
 
 ## Phase 7: Visual verification (app driven)
 
-Runs whenever `surface.ui` is on, or the change touches `crates/unshit-framework` layout, rendering, or reconcile code. Unit tests pass while the rendered UI is broken often enough that a screenshot is required.
+Runs whenever `surface.ui` is on. Unit tests pass while the rendered UI is broken often enough that a screenshot is required.
 
 1. Build the worktree (`cargo build`, worktree-local `CARGO_TARGET_DIR`).
 2. Capture each AC's visible state with a `scripts/*-shot.ps1` script. Reuse one that covers the surface, pointing `-ExeDir` at the worktree's `target/debug`, or write a new one modeled on `scripts/ctx-menu-shot.ps1`:
