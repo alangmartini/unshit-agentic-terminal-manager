@@ -1379,6 +1379,15 @@ impl AppState {
             .chain(self.agent_restarts.keys())
             .copied()
             .collect();
+        let markdown_panes = self
+            .panes
+            .iter()
+            .flatten()
+            .filter_map(|pane| {
+                let view = self.editors.get(&pane.id.0)?.markdown_view()?;
+                Some((pane.id.0, view))
+            })
+            .collect();
         let attention_pane_ids = self.attention_pane_ids.clone();
         let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
             self.terminals
@@ -1472,6 +1481,7 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            markdown_panes,
             diff_review: self.diff_review.clone(),
             editor_find_bars: self
                 .editors
@@ -1648,6 +1658,9 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Markdown editor panes in the active tab; the view carries the rendered
+    /// document while the side preview is open.
+    pub markdown_panes: std::collections::HashMap<u32, crate::markdown::MarkdownView>,
     pub diff_review: Option<crate::diff_review::Review>,
     /// Find bars that are currently open, by pane id. Only what the bar
     /// renders, so the tree build never reaches into a live pane.
@@ -8866,6 +8879,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "dialog.goto_commit" => dispatch_goto_commit(state),
         "editor.find" => dispatch_editor_find(state, FindCommand::Open),
+        "editor.markdown_preview.toggle" => {
+            let pane_id = state.active_pane.0;
+            state
+                .editors
+                .get_mut(&pane_id)
+                .is_some_and(|editor| editor.toggle_markdown_preview())
+        }
         "editor.find_close" => dispatch_editor_find(state, FindCommand::Close),
         "editor.find_next" => dispatch_editor_find(state, FindCommand::Next),
         "editor.find_prev" => dispatch_editor_find(state, FindCommand::Prev),

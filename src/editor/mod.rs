@@ -14,6 +14,7 @@ pub mod highlight;
 pub mod telemetry;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use unshit::core::cell_grid::CellGrid;
 
@@ -137,6 +138,11 @@ pub struct EditorPane {
     /// Block-comment state per line, extended lazily as the viewport
     /// moves and invalidated from the first line each edit damages.
     syntax: SyntaxCache,
+    /// Parsed Markdown presentation, dropped whenever the source changes so
+    /// ordinary snapshots reuse it.
+    markdown_cache: OnceLock<Arc<crate::markdown::MarkdownDocument>>,
+    /// Whether a Markdown editor shows its rendered side pane.
+    markdown_preview_open: bool,
 }
 
 impl EditorPane {
@@ -171,6 +177,8 @@ impl EditorPane {
             kind: EditorKind::File,
             find: None,
             syntax: SyntaxCache::new(language),
+            markdown_cache: OnceLock::new(),
+            markdown_preview_open: language == crate::syntax::Language::Markdown,
         };
         pane.repaint_viewport();
         pane.sync_cursor_into_grid();
@@ -209,6 +217,8 @@ impl EditorPane {
             kind: EditorKind::Diff(Box::new(DiffView::loading(spec, repo_root, job_id))),
             find: None,
             syntax: SyntaxCache::new(crate::syntax::Language::Plain),
+            markdown_cache: OnceLock::new(),
+            markdown_preview_open: false,
         };
         pane.repaint_viewport();
         pane.sync_cursor_into_grid();
@@ -281,6 +291,43 @@ impl EditorPane {
         self.syntax.language()
     }
 
+    pub fn is_markdown(&self) -> bool {
+        self.language() == crate::syntax::Language::Markdown
+    }
+
+    /// Return the current Markdown presentation, parsing at most once per
+    /// content change. Cursor and selection-only changes reuse the cache.
+    pub fn markdown_document(&self) -> Option<Arc<crate::markdown::MarkdownDocument>> {
+        self.is_markdown().then(|| {
+            Arc::clone(
+                self.markdown_cache
+                    .get_or_init(|| crate::markdown::parse(&self.buffer.to_text())),
+            )
+        })
+    }
+
+    /// How this pane presents Markdown, or `None` when it is not a
+    /// Markdown editor.
+    pub fn markdown_view(&self) -> Option<crate::markdown::MarkdownView> {
+        use crate::markdown::MarkdownView;
+        // Only parse while the preview is showing.
+        let document = self
+            .markdown_preview_open
+            .then(|| self.markdown_document())
+            .flatten();
+        self.is_markdown()
+            .then(|| document.map_or(MarkdownView::Closed, MarkdownView::Open))
+    }
+
+    /// Flip the side preview. Returns false when this is not a Markdown editor.
+    pub fn toggle_markdown_preview(&mut self) -> bool {
+        let markdown = self.is_markdown();
+        if markdown {
+            self.markdown_preview_open = !self.markdown_preview_open;
+        }
+        markdown
+    }
+
     pub fn is_diff(&self) -> bool {
         matches!(self.kind, EditorKind::Diff(_))
     }
@@ -292,6 +339,14 @@ impl EditorPane {
     /// Largest allowed `top_line`: keeps at least one buffer line in view.
     pub fn max_top_line(&self) -> usize {
         self.buffer.line_count().saturating_sub(1)
+    }
+
+    /// Vertical scroll position as a `0..=1` fraction of the scrollable range.
+    pub fn scroll_fraction(&self) -> f32 {
+        match self.max_top_line() {
+            0 => 0.0,
+            max => self.top_line as f32 / max as f32,
+        }
     }
 
     /// Paint viewport row `row` from the buffer line it shows, with
@@ -614,6 +669,7 @@ impl EditorPane {
         let new_sel = self.buffer.selection();
         let content_changed = damage != buffer::Damage::None;
         if content_changed {
+            self.markdown_cache = OnceLock::new();
             // A read-only pane must never reach here with real damage:
             // `apply_edit` refuses first. Guard anyway so a future caller
             // cannot quietly make a diff pane editable.
@@ -1036,6 +1092,36 @@ mod tests {
         let mut f = std::fs::File::create(&path).expect("create temp file");
         f.write_all(contents).expect("write temp file");
         path
+    }
+
+    #[test]
+    fn markdown_preview_document_follows_buffer_edits() {
+        let path = std::env::temp_dir().join(format!(
+            "tm-editor-markdown-{}-{}.md",
+            std::process::id(),
+            generate_correlation_id()
+        ));
+        std::fs::write(&path, "# Before\n").expect("write temp file");
+        let mut pane = EditorPane::open(&path, 10, 40).expect("open");
+        let before = pane.markdown_document().expect("markdown document");
+
+        assert!(pane.apply_edit(|buffer| {
+            buffer.set_cursor(Position { line: 0, col: 8 }, false);
+            buffer.insert_str("After")
+        }));
+        let after = pane.markdown_document().expect("updated markdown document");
+
+        assert_ne!(before.blocks, after.blocks);
+        assert_eq!(
+            after.blocks.first(),
+            Some(&crate::markdown::MarkdownBlock::Heading {
+                level: 1,
+                text: "BeforeAfter".into(),
+                source_line: 0,
+                anchor: "beforeafter".into()
+            })
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

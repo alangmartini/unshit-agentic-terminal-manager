@@ -29,14 +29,24 @@ impl Default for TabSizing {
 }
 
 pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
-    let mut tabs = ElementDef::new(Tag::Div).with_class("tabs").with_id("tabs");
     let visible = crate::state::grouped_tab_indices(
         &state.tabs,
         state.active_tab,
         &state.panes,
         state.active_pane,
         |id| state.agent_pane_ids.contains(&id),
-    );
+    )
+    .into_iter()
+    .filter(|&index| !is_file_tab(state, index, &state.tabs[index]))
+    .collect::<Vec<_>>();
+    let file_indices = (0..state.tabs.len())
+        .filter(|&index| is_file_tab(state, index, &state.tabs[index]))
+        .collect::<Vec<_>>();
+    let mut tabs = ElementDef::new(Tag::Div)
+        .with_class("tabs")
+        .with_class("terminal-tabs")
+        .with_id("tabs")
+        .with_key("terminal-tabs");
     let placeholder_slot = pane_drag_insertion_slot(state, visible.len());
     let dragging_source_id = state.drag.dragged_tab().map(|s| s.to_string());
     let sizing = TabSizing {
@@ -57,6 +67,7 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
             index == state.active_tab,
             is_dragging,
             is_agent,
+            false,
             needs_attention,
             sizing,
             shared,
@@ -122,10 +133,40 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 .with_child(svg_icon(icon_settings())),
         );
 
+    let mut file_tabs = ElementDef::new(Tag::Div)
+        .with_class("tabs")
+        .with_class("file-tabs")
+        .with_key("file-tabs");
+    for &index in &file_indices {
+        let tab = &state.tabs[index];
+        file_tabs = file_tabs.with_child(build_tab_with_attention(
+            index,
+            tab,
+            index == state.active_tab,
+            dragging_source_id.as_deref() == Some(tab.id.as_str()),
+            false,
+            true,
+            false,
+            sizing,
+            shared,
+        ));
+    }
+
+    let mut strips = ElementDef::new(Tag::Div)
+        .with_class("tabbar-strips")
+        .with_key("tabbar-strips")
+        .with_child(tabs);
+    if !file_indices.is_empty() {
+        strips = strips.with_child(file_tabs);
+    }
+
     let resize_state = shared.clone();
-    ElementDef::new(Tag::Div)
-        .with_class("tabbar")
-        .with_child(tabs)
+    let mut tabbar = ElementDef::new(Tag::Div).with_class("tabbar");
+    if !file_indices.is_empty() {
+        tabbar = tabbar.with_class("has-file-tabs");
+    }
+    tabbar
+        .with_child(strips)
         .with_child(actions)
         .on_resize(move |w, h| {
             mutate_with(&resize_state, |st| {
@@ -146,6 +187,27 @@ pub fn build_tabbar(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
                 };
             });
         })
+}
+
+fn tab_panes<'a>(
+    state: &'a UiSnapshot,
+    index: usize,
+    tab: &'a TerminalTab,
+) -> &'a [Vec<crate::state::Pane>] {
+    if index == state.active_tab {
+        &state.panes
+    } else {
+        &tab.panes
+    }
+}
+
+fn is_file_tab(state: &UiSnapshot, index: usize, tab: &TerminalTab) -> bool {
+    let panes = tab_panes(state, index, tab);
+    !panes.is_empty()
+        && panes
+            .iter()
+            .flatten()
+            .all(|pane| state.editor_panes.contains(&pane.id.0))
 }
 
 /// When a pane drag is active and the cursor is over the tab bar,
@@ -169,12 +231,7 @@ fn agent_pane_ids_in_tab(state: &UiSnapshot, index: usize, tab: &TerminalTab) ->
     if state.agent_pane_ids.is_empty() {
         return false;
     }
-    let panes = if index == state.active_tab {
-        &state.panes
-    } else {
-        &tab.panes
-    };
-    panes
+    tab_panes(state, index, tab)
         .iter()
         .flatten()
         .any(|p| state.agent_pane_ids.contains(&p.id.0))
@@ -184,12 +241,7 @@ fn tab_needs_attention(state: &UiSnapshot, index: usize, tab: &TerminalTab) -> b
     if state.attention_pane_ids.is_empty() {
         return false;
     }
-    let panes = if index == state.active_tab {
-        &state.panes
-    } else {
-        &tab.panes
-    };
-    panes
+    tab_panes(state, index, tab)
         .iter()
         .flatten()
         .any(|pane| state.attention_pane_ids.contains(&pane.id.0))
@@ -212,6 +264,7 @@ fn build_tab(
         is_dragging_source,
         is_agent,
         false,
+        false,
         sizing,
         shared,
     )
@@ -223,6 +276,7 @@ fn build_tab_with_attention(
     is_active: bool,
     is_dragging_source: bool,
     is_agent: bool,
+    is_file: bool,
     needs_attention: bool,
     sizing: TabSizing,
     shared: &SharedState,
@@ -258,6 +312,9 @@ fn build_tab_with_attention(
 
     if is_agent {
         btn = btn.with_class("agent");
+    }
+    if is_file {
+        btn = btn.with_class("file");
     }
     if needs_attention {
         btn = btn.with_class("needs-attention");
@@ -337,6 +394,9 @@ fn build_tab_with_attention(
     );
     if is_agent {
         btn = btn.with_child(svg_icon(icon_agent()).with_class("tab-agent-ic"));
+    }
+    if is_file {
+        btn = btn.with_child(svg_icon(icon_file()).with_class("tab-file-ic"));
     }
     btn.with_child(tab_name)
         .with_child(
@@ -455,13 +515,49 @@ mod tests {
                 pane_id
             ));
             let el = build_tabbar(&state.ui_snapshot(), &shared);
-            let tabs = &el.children[0];
+            let tabs = &el.children[0].children[0];
             assert_eq!(tabs.children.len(), 2, "one matching tab plus add");
             assert_eq!(
                 tabs.children[0].key.as_deref(),
                 Some(format!("tab:{}", state.tabs[index].id).as_str())
             );
         }
+    }
+
+    #[test]
+    fn file_editor_tabs_use_their_own_horizontal_strip() {
+        let shared = make_shared();
+        let path = std::env::temp_dir().join(format!(
+            "tm-file-tab-strip-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "# preview\n").unwrap();
+        {
+            let mut guard = shared.lock().unwrap();
+            crate::state::dispatch(&mut guard, &format!("editor.open:{}", path.display()));
+        }
+        let state = shared.lock().unwrap().ui_snapshot();
+        let el = build_tabbar(&state, &shared);
+
+        assert!(has_class(&el, "has-file-tabs"));
+        let strips = &el.children[0];
+        assert_eq!(strips.children.len(), 2, "terminal and file strips");
+        let terminal_tabs = &strips.children[0];
+        let file_tabs = &strips.children[1];
+        assert!(has_class(terminal_tabs, "terminal-tabs"));
+        assert!(has_class(file_tabs, "file-tabs"));
+        assert_eq!(
+            terminal_tabs.children.len(),
+            2,
+            "terminal tab plus add button"
+        );
+        assert_eq!(file_tabs.children.len(), 1, "one editor tab");
+        assert!(has_class(&file_tabs.children[0], "file"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -479,7 +575,7 @@ mod tests {
         let shared = make_shared();
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs = &el.children[0];
+        let tabs = &el.children[0].children[0];
         assert!(has_class(tabs, "tabs"));
         assert_eq!(tabs.id.as_deref(), Some("tabs"));
         // seed_state has 1 tab + the add button
@@ -491,7 +587,7 @@ mod tests {
         let shared = make_shared();
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs = &el.children[0];
+        let tabs = &el.children[0].children[0];
         let add_btn = tabs.children.last().unwrap();
         assert!(has_class(add_btn, "tab-add"));
         assert_eq!(add_btn.tag, Tag::Button);
@@ -534,7 +630,7 @@ mod tests {
         }
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs = &el.children[0];
+        let tabs = &el.children[0].children[0];
         // 3 tabs + add button
         assert_eq!(tabs.children.len(), 4);
     }
@@ -699,7 +795,7 @@ mod tests {
         let initial_count = shared.lock().unwrap().tabs.len();
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
         // Last child in tabs is the add button
         let add_btn = tabs_el.children.last().unwrap();
         assert!(has_class(add_btn, "tab-add"));
@@ -720,7 +816,7 @@ mod tests {
         }
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
         // Click the second tab (index 1)
         let tab_btn = &tabs_el.children[1];
         (tab_btn.on_click.as_ref().unwrap())();
@@ -740,7 +836,7 @@ mod tests {
         }
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
         // Click the already active tab (index 0)
         let tab_btn = &tabs_el.children[0];
         (tab_btn.on_click.as_ref().unwrap())();
@@ -760,7 +856,7 @@ mod tests {
         }
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
         // The first tab button has children; the close is the 4th child (index 3)
         let first_tab = &tabs_el.children[0];
         let close_span = &first_tab.children[3];
@@ -809,7 +905,7 @@ mod tests {
         let shared = make_shared();
         let state = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&state, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
         let add_btn = tabs_el.children.last().unwrap();
         assert!(add_btn.on_click.is_some());
     }
@@ -1002,7 +1098,7 @@ mod tests {
         }
         let snap = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&snap, &shared);
-        let tabs = &el.children[0];
+        let tabs = &el.children[0].children[0];
         assert!(
             find_by_class(tabs, "tab-drop-placeholder").is_some(),
             "insertion placeholder must appear during a pane drag over the tab bar"
@@ -1044,7 +1140,7 @@ mod tests {
         // etc. are naturally unique, but we want the assertion explicit.
         let snap = shared.lock().unwrap().ui_snapshot();
         let el = build_tabbar(&snap, &shared);
-        let tabs_el = &el.children[0];
+        let tabs_el = &el.children[0].children[0];
 
         let mut seen = std::collections::HashSet::new();
         for (i, child) in tabs_el.children.iter().enumerate() {
@@ -1112,11 +1208,7 @@ mod agents_tab_tests {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
         let snap = shared.lock().unwrap().ui_snapshot();
         let bar = build_tabbar(&snap, &shared);
-        let strip = bar
-            .children
-            .iter()
-            .find(|c| c.id.as_deref() == Some("tabs"))
-            .expect("tab strip");
+        let strip = find_by_class(&bar, "tabs").expect("tab strip");
         let tabs: Vec<&ElementDef> = strip
             .children
             .iter()
