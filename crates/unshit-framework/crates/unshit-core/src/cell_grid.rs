@@ -9,13 +9,10 @@ use std::sync::atomic::AtomicU32;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::cell_metrics;
 use crate::style::types::Color;
 use bitflags::bitflags;
 
-/// Global cell metrics published by the renderer. Application code reads
-/// these to compute PTY column/row counts that match the renderer exactly.
-static GLOBAL_CELL_W: AtomicU32 = AtomicU32::new(0);
-static GLOBAL_CELL_H: AtomicU32 = AtomicU32::new(0);
 /// Pending grid dimensions computed by the renderer. The renderer writes
 /// these after measuring cell metrics and element size; the app reads and
 /// clears them to resize the PTY without a timing gap.
@@ -801,20 +798,21 @@ impl CellGrid {
 
     /// Store the most recently computed cell dimensions in a global so
     /// application code (resize handlers) can read the exact same values
-    /// the renderer used. Thread-safe via atomics.
+    /// the renderer used. Thread-safe via atomics, except with the
+    /// `test-cell-metrics` feature, where values are isolated per thread and
+    /// spawned workers must publish their own metrics.
     pub fn publish_cell_metrics(w: f32, h: f32) {
-        GLOBAL_CELL_W.store(w.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        GLOBAL_CELL_H.store(h.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        cell_metrics::set(w, h);
     }
 
     /// Read the last published cell width (0.0 if never set).
     pub fn global_cell_w() -> f32 {
-        f32::from_bits(GLOBAL_CELL_W.load(std::sync::atomic::Ordering::Relaxed))
+        cell_metrics::get().0
     }
 
     /// Read the last published cell height (0.0 if never set).
     pub fn global_cell_h() -> f32 {
-        f32::from_bits(GLOBAL_CELL_H.load(std::sync::atomic::Ordering::Relaxed))
+        cell_metrics::get().1
     }
 
     /// Update the global window focus state.

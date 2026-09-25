@@ -3558,9 +3558,15 @@ mod tests {
             (vertical.track_x - 913.0).abs() <= 1.0
                 && (vertical.track_y - 52.0).abs() <= 1.0
                 && (vertical.track_w - 12.0).abs() <= 0.1
-                && vertical.thumb_h >= 100.0,
+                && vertical.thumb_h >= unshit::core::scroll::MIN_THUMB_SIZE,
             "target viewport scrollbar should match the browser-like right edge, got {:?}",
             vertical
+        );
+        assert!(
+            (vertical.thumb_h / vertical.track_h - vertical.container_size / vertical.content_size)
+                .abs()
+                < 0.0001,
+            "settings thumb should represent the visible fraction of content"
         );
     }
 
