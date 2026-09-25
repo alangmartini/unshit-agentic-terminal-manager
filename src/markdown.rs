@@ -44,7 +44,8 @@ pub enum MarkdownView {
 
 #[derive(Debug)]
 enum DraftNode {
-    Container,
+    /// The document root; never a child of another draft.
+    Root,
     Heading(u8, String, usize),
     Paragraph(String),
     Code(String, String),
@@ -74,7 +75,7 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
         text
     };
     let mut drafts = vec![Draft {
-        node: DraftNode::Container,
+        node: DraftNode::Root,
         children: Vec::new(),
     }];
     let mut stack = vec![0usize];
@@ -99,10 +100,7 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
                 } else {
                     0
                 };
-                let id = start_tag(&mut drafts, current, tag, source_line);
-                // Containers stay leaves so their inline text folds into the
-                // enclosing block.
-                if !matches!(drafts[id].node, DraftNode::Container) {
+                if let Some(id) = start_tag(&mut drafts, current, tag, source_line) {
                     stack.push(id);
                 }
             }
@@ -141,7 +139,15 @@ pub fn parse(text: &str) -> Arc<MarkdownDocument> {
     Arc::new(document)
 }
 
-fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag, source_line: usize) -> usize {
+/// Open a draft block for `tag` under `parent`. Inline and uncommon tags
+/// (emphasis, links, ...) open nothing: their text folds into the
+/// enclosing block.
+fn start_tag(
+    drafts: &mut Vec<Draft>,
+    parent: usize,
+    tag: Tag,
+    source_line: usize,
+) -> Option<usize> {
     let node = match tag {
         Tag::Paragraph => DraftNode::Paragraph(String::new()),
         Tag::Heading { level, .. } => DraftNode::Heading(
@@ -170,8 +176,7 @@ fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag, source_line: usiz
         Tag::BlockQuote(_) => DraftNode::Quote,
         Tag::List(start) => DraftNode::List(start.is_some()),
         Tag::Item => DraftNode::Item(String::new()),
-        // Uncommon containers are flattened into paragraph text.
-        _ => DraftNode::Container,
+        _ => return None,
     };
     drafts.push(Draft {
         node,
@@ -179,7 +184,7 @@ fn start_tag(drafts: &mut Vec<Draft>, parent: usize, tag: Tag, source_line: usiz
     });
     let id = drafts.len() - 1;
     drafts[parent].children.push(id);
-    id
+    Some(id)
 }
 
 fn end_tag_pops(tag: TagEnd) -> bool {
@@ -202,7 +207,7 @@ fn append_inline(drafts: &mut [Draft], id: usize, value: &str) {
         | DraftNode::Item(text) => {
             text.push_str(value);
         }
-        DraftNode::Quote | DraftNode::List(_) | DraftNode::Container => {}
+        DraftNode::Quote | DraftNode::List(_) | DraftNode::Root => {}
     }
 }
 
@@ -221,13 +226,7 @@ fn append_children(
         }
         *count += 1;
         let block = match &drafts[child].node {
-            DraftNode::Container => {
-                let mut nested = Vec::new();
-                append_children(drafts, child, &mut nested, count, truncated, anchors);
-                MarkdownBlock::Paragraph(
-                    nested.iter().map(block_text).collect::<Vec<_>>().join(" "),
-                )
-            }
+            DraftNode::Root => continue,
             DraftNode::Item(text) => {
                 let mut nested = Vec::new();
                 if !text.trim().is_empty() {
@@ -372,6 +371,26 @@ mod tests {
                     text: "fn main() {}".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn inline_formatting_in_tight_list_items_adds_no_empty_blocks() {
+        let document = parse(
+            "- **bold** item
+- [link](https://example.com)
+",
+        );
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownBlock::List {
+                ordered: false,
+                items: vec![
+                    vec![MarkdownBlock::Paragraph("bold item".into())],
+                    vec![MarkdownBlock::Paragraph("link".into())],
+                ],
+            }]
         );
     }
 
