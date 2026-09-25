@@ -55,6 +55,10 @@ fn is_known_gap(d: &DroppedDeclaration) -> bool {
 #[test]
 fn stylesheet_has_no_unknown_engine_gaps() {
     let sheet = CompiledStylesheet::parse(STYLES);
+    assert!(
+        sheet.keyframes.contains_key("agent-attention"),
+        "agent-attention keyframes must parse for needs-attention tabs"
+    );
 
     // Custom-property definitions on non-:root selectors (every `.app.theme-*`
     // block, etc.) are a separate, known gap (cascade-aware custom properties),

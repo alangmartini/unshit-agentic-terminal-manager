@@ -44,6 +44,18 @@ For code changes, run the smallest useful verification locally, then broaden bas
 
 Bug fixes should include a regression test when the behavior can be tested without excessive scaffolding.
 
+## Implementation PR Workflow
+
+For every implementation or bug fix, use this sequence:
+
+1. Create a new isolated worktree and branch with `$create-worktree`. Keep uncommitted work in the original checkout untouched.
+2. Make a small, meaningful initial commit, push the branch, and open a **draft PR** against the repository's current default branch before substantive implementation. If a PR already exists for that branch, continue in it.
+3. Implement and verify the change in the worktree. Commit the finished work with conventional commit messages and push it to the same PR.
+4. Mark the PR **ready for review** once the implementation and local checks are complete. Verify that the PR targets the default branch and that CI checks are queued or running.
+5. Finish by reporting the PR URL and that it is going through CI. Do not wait for CI or merge the PR unless the user asks; the user may later request either action.
+
+If GitHub or CI prevents a step, report the concrete blocker and leave the PR state accurate.
+
 ## Git And Review Rules
 
 - Keep commits atomic and use conventional prefixes such as `feat:`, `fix:`, `test:`, `refactor:`, `docs:`, `style:`, or `chore:`.

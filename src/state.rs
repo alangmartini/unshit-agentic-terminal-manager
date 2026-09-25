@@ -596,6 +596,9 @@ pub fn push_notification_toast(
     pane_id: u32,
 ) -> unshit::core::toast::ToastId {
     let id = state.toasts.push(message);
+    if pane_id != state.active_pane.0 {
+        state.attention_pane_ids.insert(pane_id);
+    }
     state.toast_meta.insert(
         id,
         NotificationToastMeta {
@@ -766,6 +769,10 @@ pub enum ToggleKey {
     /// Look for a newer release a few seconds after launch and offer it
     /// once per version (Settings ▸ Updates). Defaults on; persisted.
     CheckUpdatesOnStartup,
+    /// Prefer the renderer's CPU/software adapter on the next app launch.
+    /// This is a compatibility escape hatch for machines with unreliable
+    /// hardware graphics drivers, so it defaults off and is persisted.
+    ForceSoftwareRenderer,
 }
 
 impl ToggleKey {
@@ -778,6 +785,7 @@ impl ToggleKey {
             ToggleKey::StartAtLogin => "start-at-login",
             ToggleKey::StartAtLoginStale => "start-at-login-stale",
             ToggleKey::CheckUpdatesOnStartup => "check-updates-on-startup",
+            ToggleKey::ForceSoftwareRenderer => "force-software-renderer",
         }
     }
 }
@@ -1099,6 +1107,9 @@ pub struct AppState {
     /// guest title stops matching. `agent_restarts` takes precedence when
     /// both know a pane.
     pub pane_agents: std::collections::HashMap<u32, crate::agents::AgentTag>,
+    /// Panes with an unacknowledged agent notification. Cleared when the
+    /// user focuses the pane; intentionally never persisted.
+    pub attention_pane_ids: std::collections::HashSet<u32>,
     /// Panes whose title was set by the user (rename dialog). A pane in
     /// this set keeps its manual name; titles reported by the guest
     /// program via OSC 0/2 are ignored until the rename is cleared.
@@ -1383,6 +1394,7 @@ impl AppState {
                 }
             }
         }
+        let attention_pane_ids = self.attention_pane_ids.clone();
         let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
             self.terminals
                 .get(&self.active_pane.0)
@@ -1433,6 +1445,7 @@ impl AppState {
             col_ratios: self.col_ratios.clone(),
             ctx_menu: self.ctx_menu.clone(),
             agent_pane_ids,
+            attention_pane_ids,
             keybinds: self.keybinds.clone(),
             drag: self.drag.clone(),
             tabbar_rect: self.tabbar_rect,
@@ -1591,6 +1604,9 @@ pub struct UiSnapshot {
     /// Every pane currently classified as an agent pane, across all
     /// workspaces. The tab strip marks tabs whose panes appear here.
     pub agent_pane_ids: BTreeSet<u32>,
+    /// Panes with pending notifications. Both tab surfaces render an
+    /// attention indicator from this set.
+    pub attention_pane_ids: std::collections::HashSet<u32>,
     pub keybinds: crate::keybinds::KeybindsState,
     pub drag: crate::drag::DragState,
     pub tabbar_rect: crate::drag::Rect,
@@ -1777,6 +1793,7 @@ pub fn seed_state() -> AppState {
     toggles.insert(ToggleKey::StartAtLogin, false);
     toggles.insert(ToggleKey::StartAtLoginStale, false);
     toggles.insert(ToggleKey::CheckUpdatesOnStartup, true);
+    toggles.insert(ToggleKey::ForceSoftwareRenderer, false);
 
     AppState {
         workspaces,
@@ -1830,6 +1847,7 @@ pub fn seed_state() -> AppState {
         agent_resume_preflights: std::collections::HashMap::new(),
         restore_correlation_id: crate::agent_restore::generate_session_id(),
         pane_agents: std::collections::HashMap::new(),
+        attention_pane_ids: std::collections::HashSet::new(),
         custom_titled_panes: std::collections::HashSet::new(),
         scale_factor: 1.0,
         cell_width_ratio: 0.6,
@@ -1978,6 +1996,10 @@ pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
+    let pane_ids: Vec<u32> = state.panes.iter().flatten().map(|pane| pane.id.0).collect();
+    state
+        .attention_pane_ids
+        .retain(|pane_id| !pane_ids.contains(pane_id));
     // A mixed split may have last focused the other group.
     if is_agent_pane(state, state.active_pane.0) != agents {
         if let Some(pane) = state
@@ -2070,6 +2092,7 @@ fn focus_workspace_pane_by_index(state: &mut AppState, workspace_idx: usize, pan
     if let Some(tab) = state.tabs.get_mut(state.active_tab) {
         tab.active_pane = target;
     }
+    state.attention_pane_ids.remove(&target.0);
     true
 }
 
@@ -3506,7 +3529,8 @@ pub fn open_external_target(
 ) -> bool {
     match target {
         crate::launch_target::LaunchTarget::Folder(path) => open_terminal_here(state, path.clone()),
-        crate::launch_target::LaunchTarget::TextFile(path) => {
+        crate::launch_target::LaunchTarget::TextFile(_)
+        | crate::launch_target::LaunchTarget::PatchFile(_) => {
             let Some(root) = target.workspace_root() else {
                 return false;
             };
@@ -3515,30 +3539,30 @@ pub fn open_external_target(
             }
             state.settings_open = false;
             state.palette_open = false;
-            state.diff_review = None;
             state.ctx_menu = None;
-            let opened = dispatch_editor_open_path_buf(state, path);
+            let opened = open_document(state, target);
             if opened {
                 crate::persist::save_workspaces(state);
             }
             opened
+        }
+    }
+}
+
+/// Apply the target-specific effect of opening a text or patch document.
+/// Callers are responsible for selecting its workspace and clearing overlays
+/// first; a `Folder` target never reaches here since neither caller passes
+/// one in.
+fn open_document(state: &mut AppState, target: &crate::launch_target::LaunchTarget) -> bool {
+    match target {
+        crate::launch_target::LaunchTarget::TextFile(path) => {
+            state.diff_review = None;
+            dispatch_editor_open_path_buf(state, path)
         }
         crate::launch_target::LaunchTarget::PatchFile(path) => {
-            let Some(root) = target.workspace_root() else {
-                return false;
-            };
-            if !activate_or_create_workspace_for_path(state, &root) {
-                return false;
-            }
-            state.settings_open = false;
-            state.palette_open = false;
-            state.ctx_menu = None;
-            let opened = crate::diff_review::open_patch_file(state, path.clone());
-            if opened {
-                crate::persist::save_workspaces(state);
-            }
-            opened
+            crate::diff_review::open_patch_file(state, path.clone())
         }
+        crate::launch_target::LaunchTarget::Folder(_) => false,
     }
 }
 
@@ -3552,16 +3576,7 @@ pub fn open_file_with_terminal_manager(state: &mut AppState, path: PathBuf) -> b
     state.settings_open = false;
     state.palette_open = false;
     state.ctx_menu = None;
-    match target {
-        crate::launch_target::LaunchTarget::TextFile(path) => {
-            state.diff_review = None;
-            dispatch_editor_open_path_buf(state, &path)
-        }
-        crate::launch_target::LaunchTarget::PatchFile(path) => {
-            crate::diff_review::open_patch_file(state, path)
-        }
-        crate::launch_target::LaunchTarget::Folder(_) => false,
-    }
+    open_document(state, &target)
 }
 
 /// Allocate a stable, non-zero workspace routing id without overflow.
@@ -5590,6 +5605,7 @@ fn prune_pane_from_layouts(state: &mut AppState, pane_id: u32) {
 fn forget_agent_restore(state: &mut AppState, pane_id: u32) {
     forget_flow_launch(state, pane_id);
     state.pane_agents.remove(&pane_id);
+    state.attention_pane_ids.remove(&pane_id);
     state.agent_restarts.remove(&pane_id);
     state.pending_agent_resumes.remove(&pane_id);
     state.agent_resume_attempts.remove(&pane_id);
@@ -6021,6 +6037,7 @@ fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
     let mut candidate = state.palette_query.clone();
     candidate.push(ch);
     state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    reset_palette_selection(state);
     ensure_file_index_for_query(state);
     true
 }
@@ -6251,6 +6268,9 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
+            | "agent.new"
+            | "agent.new:claude"
+            | "agent.new:codex"
             | "editor.open"
             | "editor.save"
             | "review.open"
@@ -9261,6 +9281,19 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "update.open_release_page" => crate::updater::open_release_page(state),
         "update.startup_check.toggle" => crate::updater::toggle_startup_check(state),
         "update.show_dialog" => crate::updater::show_prompt(state),
+        "renderer.software.toggle" => {
+            let now_on = !toggle_on(state, ToggleKey::ForceSoftwareRenderer);
+            state
+                .toggles
+                .insert(ToggleKey::ForceSoftwareRenderer, now_on);
+            if !crate::persist::save_workspaces(state) {
+                push_error_toast(
+                    state,
+                    "Software renderer preference could not be saved. Check the config file permissions.",
+                );
+            }
+            true
+        }
         // Open settings on a named section (`settings.section:sessions`).
         // Scriptable through TM_STARTUP_DISPATCH so e2e shots can land on a
         // panel without synthesized clicks.
@@ -9436,6 +9469,8 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
             }
             true
         }
+        "notifications.hooks.install" => dispatch_agent_notification_hooks_install(state),
+        "notifications.hooks.remove" => dispatch_agent_notification_hooks_remove(state),
         other if other.starts_with("session.kill:") => {
             if let Ok(sid) = other["session.kill:".len()..].parse::<u64>() {
                 mutate_kill_session_id(state, sid);
@@ -10714,6 +10749,36 @@ fn dispatch_agent_auto_resume_toggle(state: &mut AppState) -> bool {
     true
 }
 
+fn dispatch_agent_notification_hooks_install(state: &mut AppState) -> bool {
+    if install_agent_notification_hooks(state) {
+        push_error_toast(
+            state,
+            "Agent notification hooks are installed. Codex may ask you to trust them from /hooks.",
+        );
+    } else {
+        push_error_toast(
+            state,
+            "One or more agent notification hooks could not be installed. Any hook installed successfully remains active; no unmarked hook entries were changed.",
+        );
+    }
+    true
+}
+
+fn dispatch_agent_notification_hooks_remove(state: &mut AppState) -> bool {
+    if remove_agent_notification_hooks(state) {
+        push_error_toast(
+            state,
+            "Terminal Manager agent notification hooks were removed. Recovery hooks and unmarked provider hooks were not changed.",
+        );
+    } else {
+        push_error_toast(
+            state,
+            "One or more agent notification hooks could not be removed. No unmarked hook entries were changed.",
+        );
+    }
+    true
+}
+
 /// Refresh only on settings navigation/actions; rendering reads the snapshot.
 fn refresh_flow_skills(state: &mut AppState) {
     use crate::flow_explorer::skills::{
@@ -11015,6 +11080,16 @@ fn install_agent_recovery_hooks(state: &mut AppState) -> bool {
     }
 }
 
+#[cfg(test)]
+fn install_agent_notification_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn install_agent_notification_hooks(_state: &mut AppState) -> bool {
+    crate::agent_restore::hooks::install_agent_notification_hooks().all_succeeded()
+}
+
 fn dispatch_agent_recovery_hooks_remove(state: &mut AppState) -> bool {
     if !persist_auto_resume_preference(state, false) {
         push_error_toast(
@@ -11063,6 +11138,16 @@ fn remove_agent_recovery_hooks(state: &mut AppState) -> bool {
         crate::agent_restore::telemetry::record(&event);
     }
     report.all_succeeded()
+}
+
+#[cfg(test)]
+fn remove_agent_notification_hooks(_state: &mut AppState) -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn remove_agent_notification_hooks(_state: &mut AppState) -> bool {
+    crate::agent_restore::hooks::uninstall_agent_notification_hooks().all_succeeded()
 }
 
 fn record_manual_resume_winner(
@@ -11848,6 +11933,7 @@ pub(crate) mod tests {
             agent_resume_preflights: std::collections::HashMap::new(),
             restore_correlation_id: crate::agent_restore::generate_session_id(),
             pane_agents: std::collections::HashMap::new(),
+            attention_pane_ids: std::collections::HashSet::new(),
             custom_titled_panes: std::collections::HashSet::new(),
             scale_factor: 1.0,
             cell_width_ratio: 0.6,
@@ -14116,6 +14202,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn software_renderer_toggle_is_off_by_default_and_flips() {
+        let mut state = test_state();
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+
+        assert!(dispatch(&mut state, "renderer.software.toggle"));
+        assert!(!toggle_on(&state, ToggleKey::ForceSoftwareRenderer));
+    }
+
+    #[test]
     fn dispatch_tab_new_with_worktree_mode_falls_back_silently_without_repo() {
         let mut state = test_state();
         state.toggles.insert(ToggleKey::WorktreeTabs, true);
@@ -14830,6 +14928,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_enabled_palette_action_dispatch_is_safe() {
+        for action in crate::command_palette::SAFE_ACTIONS {
+            if !action.enabled {
+                continue;
+            }
+            let dispatch = action.dispatch;
+            assert!(
+                is_palette_safe_dispatch(dispatch),
+                "palette action '{}' dispatches unsafe command '{dispatch}'",
+                action.label
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_palette_navigation_ids_must_come_from_real_snapshot_rows() {
         let mut state = two_workspace_state();
         state.palette_open = true;
@@ -15000,6 +15113,36 @@ pub(crate) mod tests {
         ));
         assert_eq!(state.palette_query, "renam>");
         assert!(state.palette_open);
+    }
+
+    #[test]
+    fn palette_query_growth_resets_selection_and_enter_launches_agent() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        // A stale index can be left behind by arrow-key navigation or mouse
+        // hover. Typing narrows the result list, so the selection must return
+        // to the first row instead of letting Enter index past the end.
+        state.palette_active = 999;
+        for ch in "agent".chars() {
+            assert!(dispatch_palette_key(
+                &mut state,
+                &KeyCombo::plain(Key::Char(ch))
+            ));
+        }
+        assert_eq!(state.palette_query, "agent");
+        assert_eq!(state.palette_active, 0);
+        let tabs_before = state.tabs.len();
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Enter)
+        ));
+
+        assert!(!state.palette_open);
+        assert_eq!(state.tabs.len(), tabs_before + 1);
+        assert!(state.pane_agents.contains_key(&state.active_pane.0));
     }
 
     #[test]
@@ -16033,6 +16176,30 @@ pub(crate) mod tests {
                 pane_id
             })
         );
+    }
+
+    #[test]
+    fn pane_notification_marks_attention_until_focus() {
+        let mut state = test_state();
+        let workspace_id = active_workspace_num(&state);
+        let attended_pane = state.tabs[0].panes[0][0].id.0;
+        mutate_add_tab(&mut state);
+
+        push_notification_toast(
+            &mut state,
+            "Claude Code finished",
+            "The agent finished its turn.",
+            workspace_id,
+            attended_pane,
+        );
+
+        assert!(state.attention_pane_ids.contains(&attended_pane));
+        let workspace_index = state.active_workspace;
+        assert!(dispatch(
+            &mut state,
+            &format!("terminal.focus:{workspace_index}:{attended_pane}")
+        ));
+        assert!(!state.attention_pane_ids.contains(&attended_pane));
     }
 
     #[test]

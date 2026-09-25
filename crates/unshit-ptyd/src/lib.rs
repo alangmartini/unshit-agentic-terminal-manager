@@ -6,6 +6,7 @@
 //! arrive in slice 3.
 
 pub mod client;
+pub mod compatibility;
 pub mod daemon;
 pub mod memory;
 pub mod protocol;
@@ -31,6 +32,9 @@ pub enum ParsedArgs {
     Shutdown {
         socket: Option<PathBuf>,
         force: bool,
+    },
+    CheckCompatible {
+        socket: Option<PathBuf>,
     },
     Status,
     Help,
@@ -78,6 +82,7 @@ impl std::error::Error for ArgError {}
 enum Mode {
     Run,
     Shutdown,
+    CheckCompatible,
     Status,
     Help,
     Version,
@@ -88,6 +93,7 @@ impl Mode {
         match self {
             Mode::Run => "(default run)",
             Mode::Shutdown => "--shutdown",
+            Mode::CheckCompatible => "--check-compatible",
             Mode::Status => "--status",
             Mode::Help => "--help",
             Mode::Version => "--version",
@@ -95,7 +101,7 @@ impl Mode {
     }
 
     fn accepts_socket(self) -> bool {
-        matches!(self, Mode::Run | Mode::Shutdown)
+        matches!(self, Mode::Run | Mode::Shutdown | Mode::CheckCompatible)
     }
 }
 
@@ -120,6 +126,7 @@ where
             "--help" | "-h" => Some(Mode::Help),
             "--version" | "-V" => Some(Mode::Version),
             "--shutdown" => Some(Mode::Shutdown),
+            "--check-compatible" => Some(Mode::CheckCompatible),
             "--force" => {
                 force = true;
                 None
@@ -165,6 +172,7 @@ where
     Ok(match resolved {
         Mode::Run => ParsedArgs::Run { socket },
         Mode::Shutdown => ParsedArgs::Shutdown { socket, force },
+        Mode::CheckCompatible => ParsedArgs::CheckCompatible { socket },
         Mode::Status => ParsedArgs::Status,
         Mode::Help => ParsedArgs::Help,
         Mode::Version => ParsedArgs::Version,
@@ -190,6 +198,7 @@ FLAGS:
     --status           Print a one-line health banner and exit
     --help, -h         Print this help and exit
     --version, -V      Print version and exit
+    --check-compatible Check whether the running daemon supports this UI (read-only)
     --shutdown         Connect to a running daemon and ask it to shut down
     --force            With --shutdown: kill live sessions instead of refusing
     --socket <path>    Override the default pipe / socket path

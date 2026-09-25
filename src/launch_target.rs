@@ -115,23 +115,13 @@ where
     }
 }
 
-/// Top-level command names owned by the notification/agent CLI. Keep these
-/// out of Finder's raw-positional fallback so their own parser can emit the
-/// correct behavior and diagnostics.
+/// Keep names owned by the notification/agent CLI out of Finder's
+/// raw-positional fallback so their own parser can emit the correct behavior
+/// and diagnostics. Defers to [`crate::notifications::is_top_level_cli_command`]
+/// so this list cannot drift from the one the CLI parser actually dispatches on.
 fn is_notification_cli_command(arg: &OsStr) -> bool {
-    matches!(
-        arg.to_str(),
-        Some(
-            "flow"
-                | "notify"
-                | "--notify"
-                | "activate"
-                | "--activate"
-                | "session-hook"
-                | "agent"
-                | "new-agent"
-        )
-    )
+    arg.to_str()
+        .is_some_and(crate::notifications::is_top_level_cli_command)
 }
 
 /// Validate an absolute filesystem path received over local IPC or from an
@@ -317,6 +307,7 @@ mod tests {
             "activate",
             "--activate",
             "session-hook",
+            "agent-notify",
         ] {
             assert_eq!(
                 parse_args_from_dir([command], &root),

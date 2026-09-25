@@ -85,16 +85,9 @@
   --accent-a70:  rgba(232, 185, 85, 0.7);
   --accent-a72:  rgba(232, 185, 85, 0.72);
 
-  /* Command-palette accent tokens. These MUST live in :root: the framework
-   * resolves var() at stylesheet-parse time and only collects custom
-   * properties declared on :root/* (see unshit-core style/parse.rs
-   * extract_custom_properties). Declaring them on .cp-scrim left every
-   * `var(--cp-*)` consumer (active-row background/rail, row padding, prompt
-   * color, keycap accents) unresolved, so those declarations were dropped. */
+  /* Shared command-palette aliases resolve against the active theme. */
   --cp-accent:        var(--amber-300);
-  --cp-accent-soft:   rgba(212, 163, 72, 0.12);
-  --cp-accent-bright: var(--amber-100);
-  --cp-glow:          0.55;
+  --cp-accent-soft:   var(--accent-a12);
   --cp-row-py:        4px;
 
 
@@ -196,6 +189,37 @@
 .app.theme-catppuccin {
   background: #1e1e2e;
   color: #cdd6f4;
+  --bg-void:       #11111b;
+  --bg-base:       #1e1e2e;
+  --bg-subtle:     #181825;
+  --bg-elevated:   #313244;
+  --bg-hover:      #45475a;
+  --bg-selected:   #585b70;
+  --bg-overlay:    rgba(17, 17, 27, 0.72);
+  --border-hair:    #232238;
+  --border-soft:    #313244;
+  --border-default: #45475a;
+  --border-strong:  #585b70;
+  --border-focus:   #cba6f7;
+  --fg-primary:   #cdd6f4;
+  --fg-secondary: #bac2de;
+  --fg-tertiary:  #a6adc8;
+  --fg-muted:     #6c7086;
+  --fg-ghost:     #45475a;
+  --amber-50:  #f5e0dc;
+  --amber-100: #b4befe;
+  --amber-200: #cba6f7;
+  --amber-300: #cba6f7;
+  --amber-400: #b4befe;
+  --amber-500: #6c7086;
+  --amber-600: #45475a;
+  --ember:  #fab387;
+  --sage:   #a6e3a1;
+  --rust:   #f38ba8;
+  --azure:  #89dceb;
+  --violet: #cba6f7;
+  --glow-sage:    0 0 6px rgba(166, 227, 161, 0.45);
+  --glow-rust:    0 0 6px rgba(243, 139, 168, 0.45);
   --glow-amber:   0 0 18px rgba(203, 166, 247, 0.18);
   --glow-amber-s: 0 0 8px rgba(203, 166, 247, 0.25);
   --accent-a015: rgba(203, 166, 247, 0.015);
@@ -256,6 +280,8 @@
   --violet: #bb9af7;
   --glow-amber:   0 0 18px rgba(122, 162, 247, 0.18);
   --glow-amber-s: 0 0 8px rgba(122, 162, 247, 0.25);
+  --glow-sage: 0 0 6px rgba(158, 206, 106, 0.45);
+  --glow-rust: 0 0 6px rgba(247, 118, 142, 0.45);
   --accent-a015: rgba(122, 162, 247, 0.015);
   --accent-a06:  rgba(122, 162, 247, 0.06);
   --accent-a08:  rgba(122, 162, 247, 0.08);
@@ -314,6 +340,8 @@
   --violet: #b48ead;
   --glow-amber:   0 0 18px rgba(136, 192, 208, 0.18);
   --glow-amber-s: 0 0 8px rgba(136, 192, 208, 0.25);
+  --glow-sage: 0 0 6px rgba(163, 190, 140, 0.45);
+  --glow-rust: 0 0 6px rgba(191, 97, 106, 0.45);
   --accent-a015: rgba(136, 192, 208, 0.015);
   --accent-a06:  rgba(136, 192, 208, 0.06);
   --accent-a08:  rgba(136, 192, 208, 0.08);
@@ -372,6 +400,8 @@
   --violet: #bd93f9;
   --glow-amber:   0 0 18px rgba(189, 147, 249, 0.18);
   --glow-amber-s: 0 0 8px rgba(189, 147, 249, 0.25);
+  --glow-sage: 0 0 6px rgba(80, 250, 123, 0.45);
+  --glow-rust: 0 0 6px rgba(255, 85, 85, 0.45);
   --accent-a015: rgba(189, 147, 249, 0.015);
   --accent-a06:  rgba(189, 147, 249, 0.06);
   --accent-a08:  rgba(189, 147, 249, 0.08);
@@ -430,6 +460,8 @@
   --violet: #d699b6;
   --glow-amber:   0 0 18px rgba(167, 192, 128, 0.18);
   --glow-amber-s: 0 0 8px rgba(167, 192, 128, 0.25);
+  --glow-sage: 0 0 6px rgba(167, 192, 128, 0.45);
+  --glow-rust: 0 0 6px rgba(230, 126, 128, 0.45);
   --accent-a015: rgba(167, 192, 128, 0.015);
   --accent-a06:  rgba(167, 192, 128, 0.06);
   --accent-a08:  rgba(167, 192, 128, 0.08);
@@ -488,6 +520,8 @@
   --violet: #c4a7e7;
   --glow-amber:   0 0 18px rgba(196, 167, 231, 0.18);
   --glow-amber-s: 0 0 8px rgba(196, 167, 231, 0.25);
+  --glow-sage: 0 0 6px rgba(156, 207, 216, 0.45);
+  --glow-rust: 0 0 6px rgba(235, 111, 146, 0.45);
   --accent-a015: rgba(196, 167, 231, 0.015);
   --accent-a06:  rgba(196, 167, 231, 0.06);
   --accent-a08:  rgba(196, 167, 231, 0.08);
@@ -546,6 +580,25 @@
   --violet: #d3869b;
   --glow-amber:   0 0 18px rgba(250, 189, 47, 0.18);
   --glow-amber-s: 0 0 8px rgba(250, 189, 47, 0.25);
+  --glow-sage: 0 0 6px rgba(184, 187, 38, 0.45);
+  --glow-rust: 0 0 6px rgba(251, 73, 52, 0.45);
+  --accent-a015: rgba(250, 189, 47, 0.015);
+  --accent-a06: rgba(250, 189, 47, 0.06);
+  --accent-a08: rgba(250, 189, 47, 0.08);
+  --accent-a10: rgba(250, 189, 47, 0.1);
+  --accent-a12: rgba(250, 189, 47, 0.12);
+  --accent-a16: rgba(250, 189, 47, 0.16);
+  --accent-a18: rgba(250, 189, 47, 0.18);
+  --accent-a20: rgba(250, 189, 47, 0.2);
+  --accent-a24: rgba(250, 189, 47, 0.24);
+  --accent-a25: rgba(250, 189, 47, 0.25);
+  --accent-a35: rgba(250, 189, 47, 0.35);
+  --accent-a40: rgba(250, 189, 47, 0.4);
+  --accent-a45: rgba(250, 189, 47, 0.45);
+  --accent-a50: rgba(250, 189, 47, 0.5);
+  --accent-a60: rgba(250, 189, 47, 0.6);
+  --accent-a70: rgba(250, 189, 47, 0.7);
+  --accent-a72: rgba(250, 189, 47, 0.72);
   --theme-chip-accent: #fabd2f;
   --theme-chip-preview-bg: #3c3836;
   --theme-chip-border: #504945;
@@ -587,6 +640,25 @@
   --violet: #957fb8;
   --glow-amber:   0 0 18px rgba(126, 156, 216, 0.18);
   --glow-amber-s: 0 0 8px rgba(126, 156, 216, 0.25);
+  --glow-sage: 0 0 6px rgba(152, 187, 108, 0.45);
+  --glow-rust: 0 0 6px rgba(228, 104, 118, 0.45);
+  --accent-a015: rgba(126, 156, 216, 0.015);
+  --accent-a06: rgba(126, 156, 216, 0.06);
+  --accent-a08: rgba(126, 156, 216, 0.08);
+  --accent-a10: rgba(126, 156, 216, 0.1);
+  --accent-a12: rgba(126, 156, 216, 0.12);
+  --accent-a16: rgba(126, 156, 216, 0.16);
+  --accent-a18: rgba(126, 156, 216, 0.18);
+  --accent-a20: rgba(126, 156, 216, 0.2);
+  --accent-a24: rgba(126, 156, 216, 0.24);
+  --accent-a25: rgba(126, 156, 216, 0.25);
+  --accent-a35: rgba(126, 156, 216, 0.35);
+  --accent-a40: rgba(126, 156, 216, 0.4);
+  --accent-a45: rgba(126, 156, 216, 0.45);
+  --accent-a50: rgba(126, 156, 216, 0.5);
+  --accent-a60: rgba(126, 156, 216, 0.6);
+  --accent-a70: rgba(126, 156, 216, 0.7);
+  --accent-a72: rgba(126, 156, 216, 0.72);
   --theme-chip-accent: #7e9cd8;
   --theme-chip-preview-bg: #363646;
   --theme-chip-border: #54546d;
@@ -628,6 +700,25 @@
   --violet: #957fb8;
   --glow-amber:   0 0 18px rgba(125, 211, 252, 0.18);
   --glow-amber-s: 0 0 8px rgba(125, 211, 252, 0.25);
+  --glow-sage: 0 0 6px rgba(152, 187, 108, 0.45);
+  --glow-rust: 0 0 6px rgba(228, 104, 118, 0.45);
+  --accent-a015: rgba(125, 211, 252, 0.015);
+  --accent-a06: rgba(125, 211, 252, 0.06);
+  --accent-a08: rgba(125, 211, 252, 0.08);
+  --accent-a10: rgba(125, 211, 252, 0.1);
+  --accent-a12: rgba(125, 211, 252, 0.12);
+  --accent-a16: rgba(125, 211, 252, 0.16);
+  --accent-a18: rgba(125, 211, 252, 0.18);
+  --accent-a20: rgba(125, 211, 252, 0.2);
+  --accent-a24: rgba(125, 211, 252, 0.24);
+  --accent-a25: rgba(125, 211, 252, 0.25);
+  --accent-a35: rgba(125, 211, 252, 0.35);
+  --accent-a40: rgba(125, 211, 252, 0.4);
+  --accent-a45: rgba(125, 211, 252, 0.45);
+  --accent-a50: rgba(125, 211, 252, 0.5);
+  --accent-a60: rgba(125, 211, 252, 0.6);
+  --accent-a70: rgba(125, 211, 252, 0.7);
+  --accent-a72: rgba(125, 211, 252, 0.72);
   --theme-chip-accent: #7dd3fc;
   --theme-chip-preview-bg: #16202c;
   --theme-chip-border: #26384b;
@@ -1447,12 +1538,12 @@ input, select {
 }
 
 .win-btn:hover {
-  background: rgba(235, 220, 182, 0.08);
+  background: var(--accent-a08);
   color: var(--fg-primary);
 }
 
 .win-btn:active {
-  background: rgba(235, 220, 182, 0.04);
+  background: var(--accent-a06);
 }
 
 .win-close:hover {
@@ -1475,8 +1566,8 @@ input, select {
   width: 11px;
   height: 11px;
   border-radius: 999px;
-  background: #2a241a;
-  border: 1px solid #1a1610;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hair);
 }
 
 .tl-close {
@@ -1523,7 +1614,7 @@ input, select {
 .settings-titlebar .brand-term {
   position: relative;
   left: 6px;
-  color: #e4d2a6;
+  color: var(--fg-primary);
 }
 
 .titlebar-breadcrumb {
@@ -2014,6 +2105,11 @@ input, select {
   50% { opacity: 0.4; }
 }
 
+@keyframes agent-attention {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
 .subtab.disabled {
   opacity: 0.35;
   cursor: default;
@@ -2059,6 +2155,33 @@ input, select {
   background: var(--bg-elevated);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300), inset 0 0 12px var(--accent-a06);
+}
+
+.terminal-entry.needs-attention::before,
+.tab.needs-attention::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--amber-300);
+  box-shadow: var(--glow-amber);
+  animation: agent-attention 1.1s ease-in-out infinite;
+}
+
+.terminal-entry.needs-attention .terminal-entry-name {
+  color: var(--amber-100);
+}
+
+.terminal-entry.needs-attention {
+  position: relative;
+}
+
+.tab.needs-attention .tab-status {
+  background: var(--amber-300);
+  box-shadow: var(--glow-amber);
+  animation: agent-attention 1.1s ease-in-out infinite;
 }
 
 /* Two-class selector: must out-rank `.sb-row .sb-label`'s `flex: 1`
@@ -3283,11 +3406,11 @@ body.dragging-pane {
   min-width: 180px;
   max-height: 92vh;
   overflow: auto;
-  background: linear-gradient(180deg, #2b251b, #221d15);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
   border: 1px solid var(--border-default);
   border-radius: var(--r-md);
   padding: 5px;
-  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
+  box-shadow: var(--shadow-lg), 0 0 28px var(--accent-a06);
   z-index: 201;
 }
 
@@ -3417,7 +3540,7 @@ body.dragging-pane {
   flex-shrink: 0;
 }
 .m-row.active {
-  background: rgba(212, 163, 72, 0.12);
+  background: var(--accent-a12);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300);
 }
@@ -3461,7 +3584,7 @@ body.dragging-pane {
    amber active treatment, matching the design. Scoped to the dedicated
    trigger class so the shell rows inside the flyout are unaffected. */
 .m-sub-anchor:hover .m-sub-trigger {
-  background: rgba(212, 163, 72, 0.12);
+  background: var(--accent-a12);
   color: var(--amber-100);
   box-shadow: inset 2px 0 0 var(--amber-300);
 }
@@ -3478,10 +3601,10 @@ body.dragging-pane {
   width: 198px;
   display: none;
   flex-direction: column;
-  background: linear-gradient(180deg, #2b251b, #221d15);
+  background: linear-gradient(180deg, var(--bg-elevated), var(--bg-subtle));
   border: 1px solid var(--border-default);
   border-radius: var(--r-md);
-  box-shadow: var(--shadow-lg), 0 0 28px rgba(212, 163, 72, 0.07);
+  box-shadow: var(--shadow-lg), 0 0 28px var(--accent-a06);
   padding: 5px;
   z-index: 5;
 }
@@ -3656,11 +3779,6 @@ body.dragging-pane {
 }
 
 .cp-scrim {
-  --cp-accent: var(--amber-300);
-  --cp-accent-soft: rgba(212, 163, 72, 0.12);
-  --cp-accent-bright: var(--amber-100);
-  --cp-glow: 0.55;
-  --cp-row-py: 7px;
   position: fixed;
   inset: 0;
   z-index: 340;
@@ -3668,7 +3786,7 @@ body.dragging-pane {
   align-items: flex-start;
   justify-content: center;
   padding-top: 12vh;
-  background: rgba(10, 8, 6, 0.62);
+  background: var(--bg-overlay);
   backdrop-filter: blur(5px);
 }
 
@@ -3689,11 +3807,7 @@ body.dragging-pane {
   box-shadow:
     var(--shadow-lg),
     0 0 0 1px rgba(0, 0, 0, 0.30),
-    0 0 40px rgba(212, 163, 72, 0.054);
-}
-
-.cp.compact {
-  --cp-row-py: 4px;
+    0 0 40px var(--accent-a06);
 }
 
 .cp-input {
@@ -3710,7 +3824,7 @@ body.dragging-pane {
   font-family: var(--font-mono);
   font-size: 14px;
   font-weight: 700;
-  text-shadow: 0 0 8px rgba(212, 163, 72, 0.32);
+  text-shadow: 0 0 8px var(--accent-a35);
   flex-shrink: 0;
 }
 
@@ -3754,8 +3868,8 @@ body.dragging-pane {
 }
 
 .cp-mode-chip.m-actions {
-  background: rgba(212, 163, 72, 0.12);
-  border-color: rgba(212, 163, 72, 0.32);
+  background: var(--accent-a12);
+  border-color: var(--accent-a35);
 }
 
 .cp-mode-chip.m-agents {
@@ -3906,7 +4020,7 @@ body.dragging-pane {
   /* Only the color is overridden; the 2px width comes from `.cp-item`'s
    * `border-left: 2px solid transparent`. */
   border-left-color: var(--cp-accent);
-  box-shadow: inset 0 0 22px rgba(212, 163, 72, 0.03);
+  box-shadow: inset 0 0 22px var(--accent-a015);
 }
 
 .cp-ic {
@@ -3918,7 +4032,7 @@ body.dragging-pane {
 
 .cp-item.active .cp-ic {
   color: var(--cp-accent);
-  filter: drop-shadow(0 0 5px rgba(212, 163, 72, 0.28));
+  filter: drop-shadow(0 0 5px var(--accent-a25));
 }
 
 .cp-main {
@@ -4028,7 +4142,7 @@ body.dragging-pane {
   flex-direction: column;
   overflow: hidden;
   background:
-    radial-gradient(ellipse 70% 50% at 50% 0%, rgba(212, 163, 72, 0.02), transparent 70%),
+    radial-gradient(ellipse 70% 50% at 50% 0%, var(--accent-a015), transparent 70%),
     var(--bg-base);
 }
 
@@ -5312,7 +5426,7 @@ body.dragging-pane {
 }
 
 .settings-titlebar .tl-min {
-  background: #e8b955;
+  background: var(--amber-200);
 }
 
 .settings-titlebar .tl-zoom {
@@ -5341,7 +5455,7 @@ body.dragging-pane {
   display: flex;
   flex-direction: row;
   gap: 0;
-  color: #d1bd94;
+  color: var(--fg-primary);
   font-size: 14px;
   font-weight: 700;
   line-height: 1;
@@ -5433,7 +5547,7 @@ body.dragging-pane {
 
 .settings-statusbar .statusbar-right .sb-cell.amber {
   padding-right: 11px;
-  color: #e0a342;
+  color: var(--amber-200);
 }
 
 .settings-page {
@@ -6609,6 +6723,34 @@ body.dragging-pane {
   border-color: var(--rust);
 }
 
+.agent-notification-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.notification-provider-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-1);
+  max-width: 420px;
+  color: var(--fg-muted);
+  font: var(--type-meta);
+  text-align: right;
+}
+
+.notification-provider-note .provider-command {
+  color: var(--fg-secondary);
+  background: var(--bg-void);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--r-sm);
+  padding: var(--sp-1) var(--sp-2);
+  font-family: var(--font-mono);
+  max-width: 100%;
+}
+
 .preview-tile {
   overflow: hidden;
   background: var(--bg-base);
@@ -6747,9 +6889,9 @@ body.dragging-pane {
   min-height: 28px;
   min-width: 0;
   padding: 5px 16px;
-  background: #1c1812;
-  border-color: #342b1e;
-  color: #ebdcb6;
+  background: var(--bg-base);
+  border-color: var(--border-soft);
+  color: var(--fg-primary);
   font-family: var(--font-mono);
   font-size: var(--t-xs);
   font-weight: 600;
@@ -6769,16 +6911,16 @@ body.dragging-pane {
   left: -1px;
   background: transparent;
   border-color: transparent;
-  color: #b8a275;
+  color: var(--fg-secondary);
 }
 
 .set-page-savebar .btn.primary {
   min-height: 27px;
-  background: #d4a348;
-  border-color: #d4a348;
-  color: #746445;
+  background: var(--amber-300);
+  border-color: var(--amber-300);
+  color: var(--bg-void);
   border-radius: 4px;
-  box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);
+  box-shadow: 0 0 6px var(--accent-a20);
 }
 
 .modal-footer {

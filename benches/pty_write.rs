@@ -37,6 +37,13 @@ mod profile;
 #[path = "../src/renderer_telemetry.rs"]
 mod renderer_telemetry;
 
+// The bridge's daemon handshake lives in `crate::daemon`
+// (`connect_ui_client`), which `pty.rs` calls when the reader task starts.
+// The bench never starts one, but the reference must resolve.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/daemon.rs"]
+mod daemon;
+
 // Bring the bin's pty module in via a path attribute so the bench can
 // reach the public `DaemonPty` API without making the whole package a
 // library. The included module's `#[cfg(test)]` block compiles but is

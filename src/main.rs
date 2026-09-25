@@ -54,6 +54,7 @@ use unshit::core::style::types::{Background, Dimension};
 use unshit::core::trace::{
     append_terminal_trace_line, terminal_trace_enabled, terminal_trace_file_path,
 };
+use unshit::renderer::gpu::RenderTierPreference;
 
 use crate::state::{
     dispatch, mutate_with, record_diagnostic_pty_event, record_diagnostic_renderer_frame,
@@ -722,6 +723,14 @@ fn apply_native_open_paths(shared: &SharedState, paths: &[std::path::PathBuf]) -
     changed
 }
 
+fn renderer_tier_preference(force_software_renderer: bool) -> RenderTierPreference {
+    if force_software_renderer {
+        RenderTierPreference::SoftwareOnly
+    } else {
+        RenderTierPreference::Auto
+    }
+}
+
 fn main() {
     // First statement in the process: everything after this point is time the
     // user spends waiting for a window, and the recorder back-dates its epoch
@@ -759,6 +768,13 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Read the one startup-only renderer preference before prewarming. The
+    // regular workspace load below remains responsible for diagnostics and
+    // restoring all state; this small best-effort read just ensures the
+    // prewarm and window context agree on their adapter tier.
+    let render_tier_preference =
+        renderer_tier_preference(persist::force_software_renderer_from_default_config());
+
     // Start the GPU before anything else needs it. Adapter and device creation
     // are the longest single stretch of startup -- over a second here, most of
     // it D3D12 enumerating adapters this machine will not use -- and they need
@@ -768,7 +784,7 @@ fn main() {
     //
     // Placed after the notification CLI so `--notify`-style invocations, which
     // exit without ever opening a window, do not spin up a GPU thread.
-    unshit::app::prewarm_window_gpu();
+    unshit::app::prewarm_window_gpu(render_tier_preference);
 
     #[cfg(feature = "profiling")]
     init_profiler();
@@ -854,6 +870,10 @@ fn main() {
         initial_state.toggles.insert(
             crate::state::ToggleKey::AutoResumeAgents,
             persisted.auto_resume_agents,
+        );
+        initial_state.toggles.insert(
+            crate::state::ToggleKey::ForceSoftwareRenderer,
+            persisted.force_software_renderer,
         );
         // Self-update: the startup check defaults on (an upgrader without
         // the key starts getting offers), and the last version the offer
@@ -1519,6 +1539,7 @@ fn main() {
             )
         },
     );
+    app.set_render_tier_preference(render_tier_preference);
     let _ = window_event_sink.set(app.event_sink());
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone(), window_event_sink.clone());
@@ -1673,6 +1694,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use unshit::core::style::types::{Background, Color};
     use unshit_test::TestHarness;
+
+    #[test]
+    fn renderer_tier_preference_uses_software_only_when_persisted() {
+        assert_eq!(
+            renderer_tier_preference(true),
+            RenderTierPreference::SoftwareOnly
+        );
+        assert_eq!(renderer_tier_preference(false), RenderTierPreference::Auto);
+    }
 
     #[test]
     fn terminal_content_visibility_skips_routes_that_replace_the_workspace() {
@@ -2849,6 +2879,245 @@ mod tests {
             Background::Color(Color::rgb(0x21, 0x22, 0x2c)),
             "changing AppState.theme should visibly restyle the sidebar"
         );
+    }
+
+    #[test]
+    fn catppuccin_restyles_main_chrome_after_theme_switch() {
+        let shared: SharedState = Arc::new(Mutex::new(seed_state()));
+        let build_shared = shared.clone();
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &build_shared, &Default::default(), None)
+            },
+            1280.0,
+            800.0,
+        );
+        for theme in ["catppuccin", "amber", "catppuccin"] {
+            shared.lock().unwrap().theme = theme.to_string();
+            let rebuild_shared = shared.clone();
+            harness.rebuild(move || {
+                let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+                build_tree(&snap, &rebuild_shared, &Default::default(), None)
+            });
+            let catppuccin = theme == "catppuccin";
+            for (selector, themed, amber) in [
+                (
+                    ".tab.active",
+                    Color::rgb(0x1e, 0x1e, 0x2e),
+                    Color::rgb(0x1c, 0x18, 0x12),
+                ),
+                (
+                    ".tm-search",
+                    Color::rgb(0x1e, 0x1e, 0x2e),
+                    Color::rgb(0x1c, 0x18, 0x12),
+                ),
+                (
+                    ".explorer-action.active",
+                    Color::rgb(0x31, 0x32, 0x44),
+                    Color::rgb(0x29, 0x23, 0x1a),
+                ),
+            ] {
+                let element = harness.query(selector).expect(selector);
+                assert_eq!(
+                    element.computed_style.background,
+                    Background::Color(if catppuccin { themed } else { amber }),
+                    "{theme}: {selector}"
+                );
+            }
+            let crumb = harness
+                .query(".titlebar-breadcrumb .amber")
+                .expect("workspace breadcrumb");
+            assert_eq!(
+                crumb.computed_style.color,
+                if catppuccin {
+                    Color::rgb(0xcb, 0xa6, 0xf7)
+                } else {
+                    Color::rgb(0xe8, 0xb9, 0x55)
+                }
+            );
+        }
+    }
+
+    /// Rebuilds from `shared`'s live state on every render, so `switch_theme`
+    /// can mutate `shared` and call `TestHarness::rebuild` to re-render.
+    fn theme_probe_harness(shared: &SharedState) -> TestHarness {
+        let build_shared = shared.clone();
+        TestHarness::new(
+            STYLES,
+            move || {
+                let snap = build_shared.lock().unwrap().ui_snapshot();
+                build_tree(
+                    &snap,
+                    &build_shared,
+                    &std::collections::HashMap::new(),
+                    None,
+                )
+            },
+            1024.0,
+            768.0,
+        )
+    }
+
+    fn switch_theme(harness: &mut TestHarness, shared: &SharedState, theme: &str) {
+        shared.lock().unwrap().theme = theme.to_string();
+        let rebuild_shared = shared.clone();
+        harness.rebuild(move || {
+            let snap = rebuild_shared.lock().unwrap().ui_snapshot();
+            build_tree(
+                &snap,
+                &rebuild_shared,
+                &std::collections::HashMap::new(),
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn theme_settings_menu_and_palette_surfaces_follow_theme_switch() {
+        // Set TM_THEME_SURFACES_VISUAL_DUMP to capture six GPU-rendered PNGs
+        // while keeping the computed-style checks useful on headless CI.
+        let dump_dir = std::env::var_os("TM_THEME_SURFACES_VISUAL_DUMP");
+        let capture = |harness: &mut TestHarness, name: &str| {
+            if let Some(dir) = &dump_dir {
+                std::fs::create_dir_all(std::path::Path::new(dir))
+                    .expect("create theme capture directory");
+                assert!(harness.try_with_gpu(), "GPU required for visual capture");
+                harness.step();
+                harness
+                    .screenshot()
+                    .save(std::path::Path::new(dir).join(name))
+                    .expect("save theme surface screenshot");
+            }
+        };
+        let assert_gradient = |harness: &TestHarness, selector: &str, top, bottom| {
+            let node = harness.query(selector).expect("themed node exists");
+            let Background::LinearGradient(gradient) = node.computed_style.background else {
+                panic!("{selector} should have a themed gradient");
+            };
+            assert_eq!(gradient.stops.first().expect("top stop").color, top);
+            assert_eq!(gradient.stops.last().expect("bottom stop").color, bottom);
+        };
+        let assert_settings = |harness: &TestHarness, save_accent, label_accent, brand| {
+            assert_eq!(
+                harness
+                    .query(".set-page-savebar .btn.primary")
+                    .expect("save button exists")
+                    .computed_style
+                    .background,
+                Background::Color(save_accent)
+            );
+            assert_eq!(
+                harness
+                    .query(".settings-statusbar .sb-cell.amber")
+                    .expect("settings section label exists")
+                    .computed_style
+                    .color,
+                label_accent
+            );
+            assert_eq!(
+                harness
+                    .query(".settings-titlebar .brand-name")
+                    .expect("settings brand exists")
+                    .computed_style
+                    .color,
+                brand
+            );
+        };
+
+        let mut settings_state = seed_state();
+        settings_state.settings_open = true;
+        settings_state.settings_section = SettingsSection::Appearance;
+        settings_state.theme = "catppuccin".to_string();
+        let settings_shared: SharedState = Arc::new(Mutex::new(settings_state));
+        let mut settings = theme_probe_harness(&settings_shared);
+        assert_settings(
+            &settings,
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgb(0xcd, 0xd6, 0xf4),
+        );
+        capture(&mut settings, "settings-catppuccin.png");
+
+        switch_theme(&mut settings, &settings_shared, "dracula");
+        assert_settings(
+            &settings,
+            Color::rgb(0xbd, 0x93, 0xf9),
+            Color::rgb(0x8b, 0xe9, 0xfd),
+            Color::rgb(0xf8, 0xf8, 0xf2),
+        );
+        capture(&mut settings, "settings-dracula.png");
+
+        let mut menu_state = seed_state();
+        menu_state.theme = "catppuccin".to_string();
+        menu_state.window_width = 1024.0;
+        menu_state.window_height = 768.0;
+        menu_state.scale_factor = 1.0;
+        menu_state.ctx_menu = Some(crate::state::CtxMenu {
+            x: 280.0,
+            y: 120.0,
+            target: crate::state::CtxMenuTarget::Workspace { idx: 0 },
+        });
+        let menu_shared: SharedState = Arc::new(Mutex::new(menu_state));
+        let mut menu = theme_probe_harness(&menu_shared);
+        assert_gradient(
+            &menu,
+            ".ctx-menu",
+            Color::rgb(0x31, 0x32, 0x44),
+            Color::rgb(0x18, 0x18, 0x25),
+        );
+        capture(&mut menu, "menu-catppuccin.png");
+
+        switch_theme(&mut menu, &menu_shared, "dracula");
+        assert_gradient(
+            &menu,
+            ".ctx-menu",
+            Color::rgb(0x34, 0x37, 0x46),
+            Color::rgb(0x21, 0x22, 0x2c),
+        );
+        capture(&mut menu, "menu-dracula.png");
+
+        let assert_palette = |harness: &TestHarness, accent, overlay, top, bottom| {
+            let scrim = harness.query(".cp-scrim").expect("palette scrim exists");
+            assert_eq!(scrim.computed_style.background, Background::Color(overlay));
+            let prompt = harness.query(".cp-prompt").expect("palette prompt exists");
+            assert_eq!(prompt.computed_style.color, accent);
+            let row = harness
+                .query(".cp-item.active")
+                .expect("active palette result exists");
+            assert_eq!(row.computed_style.padding.top, 4.0);
+            assert_eq!(row.computed_style.padding.bottom, 4.0);
+            assert_eq!(
+                row.computed_style.background,
+                Background::Color(Color::rgba(accent.r, accent.g, accent.b, 30))
+            );
+            assert_gradient(harness, ".cp", top, bottom);
+        };
+        let mut palette_state = seed_state();
+        palette_state.theme = "catppuccin".to_string();
+        palette_state.palette_open = true;
+        palette_state.palette_query = ">".to_string();
+        let palette_shared: SharedState = Arc::new(Mutex::new(palette_state));
+        let mut palette = theme_probe_harness(&palette_shared);
+        assert_palette(
+            &palette,
+            Color::rgb(0xcb, 0xa6, 0xf7),
+            Color::rgba(0x11, 0x11, 0x1b, 183),
+            Color::rgb(0x31, 0x32, 0x44),
+            Color::rgb(0x18, 0x18, 0x25),
+        );
+        capture(&mut palette, "palette-catppuccin.png");
+
+        switch_theme(&mut palette, &palette_shared, "dracula");
+        assert_palette(
+            &palette,
+            Color::rgb(0xbd, 0x93, 0xf9),
+            Color::rgba(0x19, 0x1a, 0x21, 188),
+            Color::rgb(0x34, 0x37, 0x46),
+            Color::rgb(0x21, 0x22, 0x2c),
+        );
+        capture(&mut palette, "palette-dracula.png");
     }
 
     #[test]

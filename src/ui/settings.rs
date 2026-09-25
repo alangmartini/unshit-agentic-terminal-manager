@@ -50,7 +50,7 @@ pub const SETTINGS_GLYPH_PREWARM: &[UiGlyphPrewarm] = &[
     settings_prewarm!("settings · Appearance", FontWeight::Normal, 10.0, 1.4, 0.0),
     settings_prewarm!("Appearance", FontWeight::W(600), 16.0, 1.3, 0.0),
     settings_prewarm!(
-        "Themes, density, and the visual feel of the terminal. Changes apply immediately.",
+        "Themes, density, and rendering preferences. Most changes apply immediately.",
         FontWeight::Normal,
         10.0,
         1.4,
@@ -132,6 +132,16 @@ pub const SETTINGS_GLYPH_PREWARM: &[UiGlyphPrewarm] = &[
         0.0
     ),
     settings_prewarm!("pick your own", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!("Rendering", FontWeight::W(700), 11.0, 1.4, 0.2),
+    settings_prewarm!("restart required", FontWeight::W(600), 10.0, 1.35, 0.0),
+    settings_prewarm!("Prefer software renderer", FontWeight::W(700), 11.0, 1.4, 0.2),
+    settings_prewarm!(
+        "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+        FontWeight::Normal,
+        10.0,
+        1.4,
+        0.2
+    ),
     settings_prewarm!("✓❯+", FontWeight::W(600), 24.0, 1.0, 0.0),
 ];
 
@@ -341,7 +351,7 @@ fn build_settings_page_header(active: SettingsSection) -> ElementDef {
 fn settings_section_desc(active: SettingsSection) -> &'static str {
     match active {
         SettingsSection::Appearance => {
-            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+            "Themes, density, and rendering preferences. Most changes apply immediately."
         }
         SettingsSection::Shell => "Default shell, font, scrollback.",
         SettingsSection::Keybinds => {
@@ -479,6 +489,16 @@ fn build_appearance_page_section(state: &UiSnapshot, shared: &SharedState) -> El
                     state.config_font_size_pt,
                 )),
         )
+        .with_child(
+            set_card("rendering", Some("restart required")).with_child(settings_page_field(
+                "Prefer software renderer",
+                Some(
+                    "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+                ),
+                software_renderer_toggle(state, shared),
+                state.config_font_size_pt,
+            )),
+        )
         .with_child(set_card("preview", None).with_child(build_appearance_preview(state)))
 }
 
@@ -514,6 +534,26 @@ fn build_tabs_card(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         tab_row_mode_segmented(state.tab_row_mode, shared),
         state.config_font_size_pt,
     ))
+}
+
+fn software_renderer_toggle(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
+    let software_renderer = is_on(state, ToggleKey::ForceSoftwareRenderer);
+    let toggle_shared = shared.clone();
+    let mut toggle = ElementDef::new(Tag::Button)
+        .with_class("login-startup-toggle")
+        .with_class("settings-software-renderer-toggle")
+        .with_id("settings-software-renderer-toggle")
+        .with_tab_index(0)
+        .with_text(if software_renderer { "on" } else { "off" })
+        .on_click(move || {
+            mutate_with(&toggle_shared, |st| {
+                dispatch(st, "renderer.software.toggle");
+            });
+        });
+    if software_renderer {
+        toggle = toggle.with_class("on");
+    }
+    toggle
 }
 
 fn tab_width_mode_segmented(
@@ -1416,6 +1456,11 @@ fn build_appearance_section(state: &UiSnapshot, shared: &SharedState) -> Element
                 shared,
             ),
         ))
+        .with_child(setting_row(
+            "Prefer software renderer",
+            "After restart, uses the CPU/software renderer when available. Falls back to the default renderer if unavailable.",
+            software_renderer_toggle(state, shared),
+        ))
 }
 
 fn build_shell_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
@@ -1786,11 +1831,69 @@ fn build_notifications_section(shared: &SharedState) -> ElementDef {
             });
         });
 
-    section_shell("notifications").with_child(setting_row(
-        "test notification",
-        "sends a notification targeted at the active workspace and terminal",
-        test_notification,
-    ))
+    let install_shared = shared.clone();
+    let install_hooks = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-agent-notification-hooks-install")
+        .with_text("install hooks")
+        .on_click(move || {
+            mutate_with(&install_shared, |st| {
+                dispatch(st, "notifications.hooks.install");
+            });
+        });
+
+    let remove_shared = shared.clone();
+    let remove_hooks = ElementDef::new(Tag::Button)
+        .with_class("btn")
+        .with_class("ghost")
+        .with_id("settings-agent-notification-hooks-remove")
+        .with_text("remove hooks")
+        .on_click(move || {
+            mutate_with(&remove_shared, |st| {
+                dispatch(st, "notifications.hooks.remove");
+            });
+        });
+
+    let hook_controls = ElementDef::new(Tag::Div)
+        .with_class("agent-notification-controls")
+        .with_child(install_hooks)
+        .with_child(remove_hooks);
+
+    let other_agents = ElementDef::new(Tag::Div)
+        .with_class("notification-provider-note")
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-supported")
+                .with_text("supported: Claude Code, Codex"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-manual")
+                .with_text("manual: Gemini, OpenCode, Aider, Copilot, OpenRouter-backed agents"),
+        )
+        .with_child(
+            ElementDef::new(Tag::Span)
+                .with_class("provider-command")
+                .with_text("terminal-manager notify --title 'Agent needs attention' --text '...'"),
+        );
+
+    section_shell("notifications")
+        .with_child(setting_row(
+            "test notification",
+            "sends a notification targeted at the active workspace and terminal",
+            test_notification,
+        ))
+        .with_child(setting_row(
+            "agent notification hooks",
+            "Claude Code uses Stop and Notification; Codex uses Stop and PermissionRequest. Removal touches only Terminal Manager-marked entries.",
+            hook_controls,
+        ))
+        .with_child(setting_row(
+            "other agent harnesses",
+            "There is no common OpenRouter/Gemini/OpenCode/Aider/Copilot hook contract. Call the notify command from the harness when it finishes or needs input.",
+            other_agents,
+        ))
 }
 
 /// Settings ▸ Updates: current version + check button, the newer release
@@ -1874,7 +1977,7 @@ fn build_updates_section(state: &UiSnapshot, shared: &SharedState) -> ElementDef
                 install = install.with_class("busy");
             }
             (
-                "Downloads the installer, closes every terminal session, installs the new version and reopens Terminal Manager. Workspaces and tabs come back with fresh shells.",
+                "Downloads the installer and restarts Terminal Manager. Your terminal sessions keep running and reconnect when the app reopens.",
                 install,
             )
         } else {
@@ -2917,7 +3020,7 @@ mod tests {
         let shared = make_shared();
         let el = build_settings_page(&snap, &shared);
 
-        assert_eq!(count_with_class(&el, "set-card"), 5);
+        assert_eq!(count_with_class(&el, "set-card"), 6);
         assert!(has_class_anywhere(&el, "stepper"));
         assert!(has_class_anywhere(&el, "set-inline-control"));
         assert!(has_class_anywhere(&el, "input-num"));
@@ -2933,7 +3036,7 @@ mod tests {
         let text = collect_text_recursive(&el);
         assert!(text.contains("Theme"));
         assert!(text.contains(
-            "Themes, density, and the visual feel of the terminal. Changes apply immediately."
+            "Themes, density, and rendering preferences. Most changes apply immediately."
         ));
         assert!(text.contains("ptyd up · session"));
         assert!(text.contains("\u{2318}"));
@@ -2955,6 +3058,8 @@ mod tests {
         assert!(text.contains("Terminal output size"));
         assert!(text.contains("Sidebar width"));
         assert!(text.contains("Width of the workspace sidebar"));
+        assert!(text.contains("Prefer software renderer"));
+        assert!(text.contains("CPU/software renderer when available"));
         // Tabs card: sizing mode, fixed width stepper, and row mode.
         assert!(text.contains("Tab sizing"));
         assert!(text.contains("fit content"));
@@ -2973,6 +3078,35 @@ mod tests {
                 "settings page should not render unapplied/fake setting {stripped:?}"
             );
         }
+    }
+
+    #[test]
+    fn appearance_software_renderer_toggle_is_in_page_and_modal_and_dispatches() {
+        let shared = make_shared();
+        let page = build_settings_page(&shared.lock().unwrap().ui_snapshot(), &shared);
+        let page_toggle = find_by_id(&page, "settings-software-renderer-toggle")
+            .expect("software renderer page toggle");
+        assert_eq!(page_toggle.tab_index, Some(0));
+        assert_eq!(text_of(page_toggle), Some("off"));
+        assert!(!page_toggle.classes.contains(&"on".to_string()));
+
+        (page_toggle.on_click.as_ref().expect("page toggle click"))();
+        assert!(is_on(
+            &shared.lock().unwrap().ui_snapshot(),
+            ToggleKey::ForceSoftwareRenderer
+        ));
+
+        let modal = build_settings_modal(&shared.lock().unwrap().ui_snapshot(), &shared);
+        let modal_toggle = find_by_id(&modal, "settings-software-renderer-toggle")
+            .expect("software renderer modal toggle");
+        assert_eq!(text_of(modal_toggle), Some("on"));
+        assert!(modal_toggle.classes.contains(&"on".to_string()));
+
+        (modal_toggle.on_click.as_ref().expect("modal toggle click"))();
+        assert!(!is_on(
+            &shared.lock().unwrap().ui_snapshot(),
+            ToggleKey::ForceSoftwareRenderer
+        ));
     }
 
     #[test]
@@ -3424,9 +3558,15 @@ mod tests {
             (vertical.track_x - 913.0).abs() <= 1.0
                 && (vertical.track_y - 52.0).abs() <= 1.0
                 && (vertical.track_w - 12.0).abs() <= 0.1
-                && vertical.thumb_h >= 120.0,
+                && vertical.thumb_h >= unshit::core::scroll::MIN_THUMB_SIZE,
             "target viewport scrollbar should match the browser-like right edge, got {:?}",
             vertical
+        );
+        assert!(
+            (vertical.thumb_h / vertical.track_h - vertical.container_size / vertical.content_size)
+                .abs()
+                < 0.0001,
+            "settings thumb should represent the visible fraction of content"
         );
     }
 
@@ -4169,9 +4309,9 @@ mod tests {
         assert!(css.contains("margin-top: 0;"));
         assert!(css.contains("letter-spacing: 0.2px;"));
         assert!(css_lf.contains(
-            ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: #d4a348;\n  border-color: #d4a348;\n  color: #746445;\n  border-radius: 4px;"
+            ".set-page-savebar .btn.primary {\n  min-height: 27px;\n  background: var(--amber-300);\n  border-color: var(--amber-300);\n  color: var(--bg-void);\n  border-radius: 4px;"
         ));
-        assert!(css.contains("box-shadow: 0 0 6px rgba(212, 163, 72, 0.2);"));
+        assert!(css.contains("box-shadow: 0 0 6px var(--accent-a20);"));
         assert!(css.contains(".settings-titlebar .titlebar-left"));
         assert!(css.contains("top: -1px;"));
         assert!(css.contains(".settings-tb-breadcrumb"));
@@ -4194,11 +4334,11 @@ mod tests {
             ".set-page-nav-item.nav-keybinds span {\n  position: relative;\n  top: 1px;"
         ));
         assert!(css.contains(".brand-term"));
-        assert!(css.contains(".settings-titlebar .brand-term"));
-        assert!(css.contains("left: 6px;"));
-        assert!(css.contains("color: #e4d2a6;"));
+        assert!(css_lf.contains(
+            ".settings-titlebar .brand-term {\n  position: relative;\n  left: 6px;\n  color: var(--fg-primary);"
+        ));
         assert!(
-            css_lf.contains(".settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: #d1bd94;")
+            css_lf.contains(".settings-titlebar .brand-name {\n  display: flex;\n  flex-direction: row;\n  gap: 0;\n  color: var(--fg-primary);")
         );
         assert!(css_lf.contains(
             ".settings-titlebar .brand-name .dot {\n  position: relative;\n  left: 4px;"
@@ -4221,7 +4361,7 @@ mod tests {
         assert!(css.contains("padding-right: 16px;"));
         assert!(css.contains(".settings-statusbar .statusbar-right .sb-cell.amber"));
         assert!(css.contains("padding-right: 11px;"));
-        assert!(css.contains("color: #e0a342;"));
+        assert!(css_lf.contains(".settings-statusbar .statusbar-right .sb-cell.amber {\n  padding-right: 11px;\n  color: var(--amber-200);"));
         assert!(css.contains(".settings-page .set-label"));
         assert!(css.contains("left: 2px;"));
         assert!(css_lf.contains(
@@ -4458,8 +4598,8 @@ mod tests {
         let snap = make_snapshot();
         let shared = make_shared();
         let el = build_appearance_section(&snap, &shared);
-        // title + separate config and terminal font rows.
-        assert_eq!(el.children.len(), 3);
+        // title + config font, terminal font, and renderer rows.
+        assert_eq!(el.children.len(), 4);
         assert_eq!(
             text_of(&el.children[1].children[0].children[0]),
             Some("Config font size")
@@ -4467,6 +4607,10 @@ mod tests {
         assert_eq!(
             text_of(&el.children[2].children[0].children[0]),
             Some("Terminal font size")
+        );
+        assert_eq!(
+            text_of(&el.children[3].children[0].children[0]),
+            Some("Prefer software renderer")
         );
     }
 
@@ -4733,6 +4877,22 @@ mod tests {
     }
 
     #[test]
+    fn keybinds_section_exposes_editable_agent_rows() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        for label in ["New agent", "New Claude Code agent", "New Codex agent"] {
+            let row = find_kb_row(&el, label).unwrap_or_else(|| panic!("{label} keybind row"));
+            let binding = row
+                .children
+                .iter()
+                .find(|child| child.classes.contains(&"kb-binding".to_string()))
+                .unwrap_or_else(|| panic!("{label} binding is editable"));
+            assert!(find_first_with_class(binding, "edit-pencil").is_some());
+        }
+    }
+
+    #[test]
     fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
         let css = include_str!("../../assets/styles.css");
         // Pins the chosen structure: the "+" separators are real spans
@@ -4918,6 +5078,31 @@ mod tests {
                 pane_id: state.active_pane.0,
             })
         );
+    }
+
+    #[test]
+    fn notifications_section_installs_and_removes_agent_hooks() {
+        let shared = make_shared();
+        let el = build_notifications_section(&shared);
+        let install =
+            find_by_id(&el, "settings-agent-notification-hooks-install").expect("install");
+        let remove = find_by_id(&el, "settings-agent-notification-hooks-remove").expect("remove");
+
+        (install.on_click.as_ref().unwrap())();
+        assert!(shared
+            .lock()
+            .unwrap()
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("notification hooks are installed")));
+
+        (remove.on_click.as_ref().unwrap())();
+        assert!(shared
+            .lock()
+            .unwrap()
+            .toasts
+            .iter()
+            .any(|toast| toast.message.contains("notification hooks were removed")));
     }
 
     // -- build_modal_footer -----------------------------------------------------
@@ -5627,7 +5812,7 @@ mod tests {
         let text = collect_text_recursive(&section);
         assert!(text.contains("99.0.0"));
         assert!(text.contains("ninety-nine"));
-        assert!(text.contains("closes every terminal session"));
+        assert!(text.contains("terminal sessions keep running"));
         assert!(has_class_anywhere(&section, "update-phase-available"));
         // Text stacks above the two wide buttons instead of sharing a grid row.
         let release = find_by_id(&section, "settings-update-release").expect("release row");
