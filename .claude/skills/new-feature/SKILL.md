@@ -80,7 +80,7 @@ gates:
   migration: false       # true if surface_persistence
 docs:
   rustdoc: true
-  changelog: true        # if changelog/unreleased/ exists
+  changelog: true        # if changelog.d/unreleased/ exists
 ```
 
 ### User override
@@ -188,7 +188,7 @@ Confirm one of: no schema change (asserted in a test), forward migration exists 
 Spawn only enabled docs agents in ONE message.
 
 - `docs.rustdoc` (general-purpose): doc comments on new public items in `src/` and `crates/unshit-framework/`. One short line unless a non-obvious invariant needs noting.
-- `docs.changelog` (general-purpose): only if `changelog/unreleased/` exists. Creates `changelog/unreleased/<issue-number>-<short-desc>.md` per `changelog/TEMPLATE.md` as a placeholder name; Phase 8 renames it to `<PR-number>-<short-desc>.md` (CLAUDE.md mandate).
+- `docs.changelog` (general-purpose): only if `changelog.d/unreleased/` exists. Creates `changelog.d/unreleased/<issue-number>-<short-desc>.md` with Keep a Changelog sections, following an existing fragment (there is no `TEMPLATE.md`), as a placeholder name; Phase 8 renames it to `<PR-number>-<short-desc>.md` (CLAUDE.md mandate).
 
 This phase does not touch CLAUDE.md, `.claude/`, or project memory.
 
