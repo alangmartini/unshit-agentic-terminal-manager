@@ -6015,6 +6015,7 @@ fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
     let mut candidate = state.palette_query.clone();
     candidate.push(ch);
     state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    reset_palette_selection(state);
     ensure_file_index_for_query(state);
     true
 }
@@ -6245,6 +6246,9 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
+            | "agent.new"
+            | "agent.new:claude"
+            | "agent.new:codex"
             | "editor.open"
             | "editor.save"
             | "review.open"
@@ -14891,6 +14895,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_enabled_palette_action_dispatch_is_safe() {
+        for action in crate::command_palette::SAFE_ACTIONS {
+            if !action.enabled {
+                continue;
+            }
+            let dispatch = action.dispatch;
+            assert!(
+                is_palette_safe_dispatch(dispatch),
+                "palette action '{}' dispatches unsafe command '{dispatch}'",
+                action.label
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_palette_navigation_ids_must_come_from_real_snapshot_rows() {
         let mut state = two_workspace_state();
         state.palette_open = true;
@@ -15061,6 +15080,36 @@ pub(crate) mod tests {
         ));
         assert_eq!(state.palette_query, "renam>");
         assert!(state.palette_open);
+    }
+
+    #[test]
+    fn palette_query_growth_resets_selection_and_enter_launches_agent() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        // A stale index can be left behind by arrow-key navigation or mouse
+        // hover. Typing narrows the result list, so the selection must return
+        // to the first row instead of letting Enter index past the end.
+        state.palette_active = 999;
+        for ch in "agent".chars() {
+            assert!(dispatch_palette_key(
+                &mut state,
+                &KeyCombo::plain(Key::Char(ch))
+            ));
+        }
+        assert_eq!(state.palette_query, "agent");
+        assert_eq!(state.palette_active, 0);
+        let tabs_before = state.tabs.len();
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Enter)
+        ));
+
+        assert!(!state.palette_open);
+        assert_eq!(state.tabs.len(), tabs_before + 1);
+        assert!(state.pane_agents.contains_key(&state.active_pane.0));
     }
 
     #[test]

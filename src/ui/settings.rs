@@ -4877,6 +4877,22 @@ mod tests {
     }
 
     #[test]
+    fn keybinds_section_exposes_editable_agent_rows() {
+        let snap = make_snapshot();
+        let shared = make_shared();
+        let el = build_keybinds_section(&snap, &shared);
+        for label in ["New agent", "New Claude Code agent", "New Codex agent"] {
+            let row = find_kb_row(&el, label).unwrap_or_else(|| panic!("{label} keybind row"));
+            let binding = row
+                .children
+                .iter()
+                .find(|child| child.classes.contains(&"kb-binding".to_string()))
+                .unwrap_or_else(|| panic!("{label} binding is editable"));
+            assert!(find_first_with_class(binding, "edit-pencil").is_some());
+        }
+    }
+
+    #[test]
     fn keybind_plus_separator_is_a_real_element_not_a_pseudo() {
         let css = include_str!("../../assets/styles.css");
         // Pins the chosen structure: the "+" separators are real spans
