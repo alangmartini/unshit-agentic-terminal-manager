@@ -15,12 +15,24 @@ pub fn devices() -> Result<Vec<String>, String> {
         .collect()
 }
 
-pub struct Capture {
-    _stream: cpal::Stream,
-    pub samples: Arc<Mutex<Vec<i16>>>,
+/// State shared between the capture callback and the recording loop.
+#[derive(Clone)]
+pub struct Shared {
+    samples: Arc<Mutex<Vec<i16>>>,
     pub peak: Arc<AtomicU32>,
     pub failed: Arc<AtomicBool>,
     pub full: Arc<AtomicBool>,
+}
+
+impl Shared {
+    fn take(&self) -> Vec<i16> {
+        std::mem::take(&mut *self.samples.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+pub struct Capture {
+    _stream: cpal::Stream,
+    pub shared: Shared,
 }
 
 impl Capture {
@@ -38,35 +50,16 @@ impl Capture {
             .default_input_config()
             .map_err(|e| format!("Cannot open microphone: {e}"))?;
         let config: cpal::StreamConfig = supported.clone().into();
-        let samples = Arc::new(Mutex::new(Vec::with_capacity(RATE as usize * 30)));
-        let peak = Arc::new(AtomicU32::new(0));
-        let failed = Arc::new(AtomicBool::new(false));
-        let full = Arc::new(AtomicBool::new(false));
+        let shared = Shared {
+            samples: Arc::new(Mutex::new(Vec::with_capacity(RATE as usize * 30))),
+            peak: Arc::default(),
+            failed: Arc::default(),
+            full: Arc::default(),
+        };
         let stream = match supported.sample_format() {
-            cpal::SampleFormat::F32 => input::<f32>(
-                &device,
-                &config,
-                samples.clone(),
-                peak.clone(),
-                failed.clone(),
-                full.clone(),
-            ),
-            cpal::SampleFormat::I16 => input::<i16>(
-                &device,
-                &config,
-                samples.clone(),
-                peak.clone(),
-                failed.clone(),
-                full.clone(),
-            ),
-            cpal::SampleFormat::U16 => input::<u16>(
-                &device,
-                &config,
-                samples.clone(),
-                peak.clone(),
-                failed.clone(),
-                full.clone(),
-            ),
+            cpal::SampleFormat::F32 => input::<f32>(&device, &config, shared.clone()),
+            cpal::SampleFormat::I16 => input::<i16>(&device, &config, shared.clone()),
+            cpal::SampleFormat::U16 => input::<u16>(&device, &config, shared.clone()),
             _ => return Err("Unsupported microphone sample format".into()),
         }?;
         stream
@@ -74,35 +67,34 @@ impl Capture {
             .map_err(|e| format!("Cannot start microphone: {e}"))?;
         Ok(Self {
             _stream: stream,
-            samples,
-            peak,
-            failed,
-            full,
+            shared,
         })
     }
     /// Stop the input stream before draining its final samples.
     pub fn finish(self) -> Vec<i16> {
-        let samples = self.samples.clone();
-        drop(self);
-        let mut samples = samples.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *samples)
+        let Self { _stream, shared } = self;
+        drop(_stream);
+        shared.take()
     }
     pub fn take(&self) -> Vec<i16> {
-        std::mem::take(&mut *self.samples.lock().unwrap_or_else(|e| e.into_inner()))
+        self.shared.take()
     }
 }
 
 fn input<T: cpal::SizedSample + cpal::Sample>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<i16>>>,
-    peak: Arc<AtomicU32>,
-    failed: Arc<AtomicBool>,
-    full: Arc<AtomicBool>,
+    shared: Shared,
 ) -> Result<cpal::Stream, String>
 where
     f32: cpal::FromSample<T>,
 {
+    let Shared {
+        samples,
+        peak,
+        failed,
+        full,
+    } = shared;
     let channels = config.channels as usize;
     let source_rate = config.sample_rate.0;
     let mut phase: u64 = 0;

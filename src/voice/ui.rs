@@ -72,6 +72,14 @@ fn section(title: &str) -> ElementDef {
 
 pub fn settings(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
     let v = &snap.voice;
+    ElementDef::new(Tag::Div)
+        .with_class("voice-settings")
+        .with_child(provider_section(v, shared))
+        .with_child(microphone_section(v, shared))
+        .with_child(dictation_section(v, shared))
+        .with_child(history(v, shared))
+}
+fn provider_section(v: &VoiceState, shared: &SharedState) -> ElementDef {
     let cfg = &v.settings;
     let mut provider = section("Transcription provider")
         .with_child(
@@ -107,6 +115,10 @@ pub fn settings(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(text("Light personal use can be around US$1/month. At US$0.006/min for gpt-4o-transcribe, about 167 min costs US$1. This is an estimate, not a monthly plan. Check actual charges in your OpenAI account."))
         .with_child(row().with_child(link("OpenAI usage","https://platform.openai.com/usage"))
             .with_child(link("Current pricing","https://developers.openai.com/api/docs/pricing")));
+    provider
+}
+fn microphone_section(v: &VoiceState, shared: &SharedState) -> ElementDef {
+    let cfg = &v.settings;
     let mut mic = section("Microphone lab")
         .with_child(text(format!(
             "Selected: {}",
@@ -145,7 +157,11 @@ pub fn settings(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
             .with_child(button("Listen to sample","voice.play",shared))
             .with_child(button("Test transcription","voice.test",shared)))
         .with_child(controls(v,shared));
-    let behavior=section("Dictation")
+    mic
+}
+fn dictation_section(v: &VoiceState, shared: &SharedState) -> ElementDef {
+    let cfg = &v.settings;
+    section("Dictation")
         .with_child(row().with_child(toggle("Copy final text to clipboard",cfg.clipboard,shared,|s|s.clipboard = !s.clipboard)))
         .with_child(row().with_child(toggle("Press to start / press to stop",!cfg.hold,shared,|s|s.hold=false))
             .with_child(toggle("Hold to talk",cfg.hold,shared,|s|s.hold=true)))
@@ -159,13 +175,7 @@ pub fn settings(snap: &UiSnapshot, shared: &SharedState) -> ElementDef {
         .with_child(text(&v.hotkey_status))
         .with_child(row().with_child(button("Start dictation","voice.toggle",shared))
             .with_child(button("Open history popup","voice.history",shared))
-            .with_child(button("Save voice settings","voice.save",shared)));
-    ElementDef::new(Tag::Div)
-        .with_class("voice-settings")
-        .with_child(provider)
-        .with_child(mic)
-        .with_child(behavior)
-        .with_child(history(v, shared))
+            .with_child(button("Save voice settings","voice.save",shared)))
 }
 fn link(label: &str, url: &'static str) -> ElementDef {
     ElementDef::new(Tag::Button)

@@ -6,12 +6,16 @@ use std::time::Duration;
 
 pub const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 
-pub fn validate(settings: &Settings) -> Result<(), String> {
-    let url = if settings.custom {
+fn endpoint(settings: &Settings) -> &str {
+    if settings.custom {
         &settings.endpoint
     } else {
         OPENAI_ENDPOINT
-    };
+    }
+}
+
+pub fn validate(settings: &Settings) -> Result<(), String> {
+    let url = endpoint(settings);
     let uri: ureq::http::Uri = url.parse().map_err(|_| "Invalid endpoint URL")?;
     let local = matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if uri.scheme_str() != Some("https") && !(uri.scheme_str() == Some("http") && local) {
@@ -26,13 +30,13 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
     if settings.custom {
         let headers: Value =
             serde_json::from_str(&settings.headers).map_err(|_| "Headers must be a JSON object")?;
-        if !headers
+        let Some(headers) = headers
             .as_object()
-            .is_some_and(|o| o.values().all(Value::is_string))
-        {
+            .filter(|o| o.values().all(Value::is_string))
+        else {
             return Err("Headers must be a JSON object of strings".into());
-        }
-        for (name, val) in headers.as_object().unwrap() {
+        };
+        for (name, val) in headers {
             ureq::http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| "Invalid header name")?;
             ureq::http::HeaderValue::from_str(val.as_str().unwrap())
@@ -47,10 +51,10 @@ pub fn validate(settings: &Settings) -> Result<(), String> {
         }
         let body: Value =
             serde_json::from_str(&settings.body).map_err(|_| "Body must be valid JSON")?;
-        if !body.is_object() {
+        let Some(body) = body.as_object() else {
             return Err("Body must be a JSON object".into());
-        }
-        if !settings.json_body && !body.as_object().unwrap().values().all(Value::is_string) {
+        };
+        if !settings.json_body && !body.values().all(Value::is_string) {
             return Err("Multipart extra fields must be strings".into());
         }
         if !settings.response_pointer.is_empty() && !settings.response_pointer.starts_with('/') {
@@ -139,11 +143,6 @@ pub fn transcribe(
     if audio.len() > 24_000_000 {
         return Err("Recording exceeds the 24 MB upload limit".into());
     }
-    let url = if settings.custom {
-        settings.endpoint.as_str()
-    } else {
-        OPENAI_ENDPOINT
-    };
     let boundary = format!("tm-voice-{}", super::now_ms());
     let (body, content_type) = if settings.custom && settings.json_body {
         let mut body: Value = serde_json::from_str(&settings.body).map_err(|_| "Invalid body")?;
@@ -167,21 +166,21 @@ pub fn transcribe(
         .max_redirects(0)
         .build()
         .into();
-    let headers: Value = if settings.custom {
+    let headers: serde_json::Map<String, Value> = if settings.custom {
         serde_json::from_str(&settings.headers).map_err(|_| "Invalid headers")?
     } else {
-        serde_json::json!({})
+        Default::default()
     };
     let custom_authorization = headers
-        .as_object()
-        .unwrap()
         .keys()
         .any(|name| name.eq_ignore_ascii_case("authorization"));
-    let mut req = agent.post(url).header("Content-Type", &content_type);
+    let mut req = agent
+        .post(endpoint(settings))
+        .header("Content-Type", &content_type);
     if !key.is_empty() && !custom_authorization {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
-    for (name, val) in headers.as_object().unwrap() {
+    for (name, val) in &headers {
         req = req.header(name, val.as_str().unwrap().replace("{{api_key}}", key));
     }
     let mut response = req.send(body.as_slice()).map_err(|e| match e {

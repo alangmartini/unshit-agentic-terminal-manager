@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -193,6 +194,28 @@ fn persist(h: &Hooks) -> Result<(), String> {
     save(&stored)
 }
 
+fn hotkeys(settings: &Settings) -> Result<(HotKey, HotKey), String> {
+    let record: HotKey = settings
+        .hotkey
+        .parse()
+        .map_err(|_| "Invalid recording hotkey")?;
+    let history: HotKey = settings
+        .history_hotkey
+        .parse()
+        .map_err(|_| "Invalid history hotkey")?;
+    if record.id() == history.id() {
+        return Err("Recording and history hotkeys must differ".into());
+    }
+    Ok((record, history))
+}
+
+/// Runs `f` on a worker thread with the voice hooks, if the service is running.
+fn spawn_with_hooks(f: impl FnOnce(Arc<Hooks>) + Send + 'static) {
+    if let Some(h) = HOOKS.get().cloned() {
+        std::thread::spawn(move || f(h));
+    }
+}
+
 /// Called on the event-loop thread; global-hotkey requires this on macOS/Windows.
 /// Keep the manager alive until the application exits.
 pub fn start(hooks: Hooks) -> Option<GlobalHotKeyManager> {
@@ -217,17 +240,7 @@ pub fn start(hooks: Hooks) -> Option<GlobalHotKeyManager> {
     let settings = h.shared.lock_recover().voice.settings.clone();
     let registration = (|| -> Result<_, String> {
         let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
-        let record: HotKey = settings
-            .hotkey
-            .parse()
-            .map_err(|_| "Invalid recording hotkey")?;
-        let history: HotKey = settings
-            .history_hotkey
-            .parse()
-            .map_err(|_| "Invalid history hotkey")?;
-        if record.id() == history.id() {
-            return Err("Recording and history hotkeys must differ".into());
-        }
+        let (record, history) = hotkeys(&settings)?;
         manager
             .register(record)
             .map_err(|e| format!("Recording hotkey unavailable: {e}"))?;
@@ -316,9 +329,8 @@ pub fn history_key(state: &mut AppState, combo: &unshit::core::shortcut::KeyComb
         }
         Key::ArrowUp => state.voice.selected = state.voice.selected.saturating_sub(1),
         Key::Enter => {
-            if let Some(entry) = state.voice.history.get(state.voice.selected) {
-                let command = format!("voice.copy:{}", entry.id);
-                dispatch(state, &command);
+            if let Some(id) = state.voice.history.get(state.voice.selected).map(|e| e.id) {
+                copy_entry(state, id);
                 state.voice.history_open = false;
             }
         }
@@ -356,189 +368,256 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         "voice.toggle" if state.voice.recording => {
             state.voice.stop.store(true, Ordering::Relaxed);
         }
-        "voice.toggle" | "voice.test" | "voice.mic" => {
-            if state.voice.busy {
-                return true;
-            }
-            let Some(h) = HOOKS.get().cloned() else {
-                state.voice.status = "Voice service is not running".into();
-                return true;
-            };
-            let debug = command == "voice.mic";
-            let mut settings = state.voice.settings.clone();
-            if command == "voice.test" || debug {
-                settings.live = false;
-            }
-            if !debug {
-                if let Err(e) = provider::validate(&settings) {
-                    state.voice.status = e;
-                    return true;
-                }
-            }
-            let target = if settings.live {
-                let pane = state.active_pane.0;
-                match state.pty_manager.session_id(pane) {
-                    Some(session) => Some((pane, session)),
-                    None => {
-                        state.voice.status =
-                            "Focus a terminal or Codex CLI pane before starting live dictation"
-                                .into();
-                        return true;
-                    }
-                }
-            } else {
-                None
-            };
-            state.voice.stop = Arc::new(AtomicBool::new(false));
-            state.voice.cancel = Arc::new(AtomicBool::new(false));
-            let stop = state.voice.stop.clone();
-            let cancel = state.voice.cancel.clone();
-            state.voice.busy = true;
-            state.voice.recording = true;
-            state.voice.seconds = 0;
-            state.voice.preview.clear();
-            state.voice.status = if debug {
-                "Recording locally; no audio is sent"
-            } else {
-                "Opening microphone…"
-            }
-            .into();
-            std::thread::spawn(move || {
-                let result = record(&h, settings, target, debug, stop, cancel.clone());
-                update(&h, |s| {
-                    s.voice.recording = false;
-                    s.voice.busy = false;
-                    s.voice.peak = 0;
-                    if cancel.load(Ordering::Relaxed) {
-                        s.voice.status = "Cancelled. Text already inserted is kept.".into();
-                    } else if let Err(e) = result {
-                        s.voice.status = e;
-                    }
-                });
-            });
-        }
+        "voice.toggle" | "voice.test" | "voice.mic" => start_recording(state, command),
         "voice.refresh" => {
             if let Some(h) = HOOKS.get() {
                 refresh(h.clone());
             }
         }
-        "voice.save" => {
-            if let Err(e) = provider::validate(&state.voice.settings) {
-                state.voice.status = e;
-                return true;
-            }
-            let parsed = (
-                state.voice.settings.hotkey.parse::<HotKey>(),
-                state.voice.settings.history_hotkey.parse::<HotKey>(),
-            );
-            match parsed {
-                (Ok(a), Ok(b)) if a.id() != b.id() => (),
-                _ => {
-                    state.voice.status =
-                        "Use two distinct valid global hotkeys, e.g. Control+Alt+Space".into();
-                    return true;
-                }
-            }
-            let draft = std::mem::take(&mut state.voice.api_key_draft);
-            state.voice.key_revision += 1;
-            let custom = state.voice.settings.custom;
-            if let Some(h) = HOOKS.get().cloned() {
-                std::thread::spawn(move || {
-                    let result = (|| {
-                        if !draft.is_empty() {
-                            credential(custom)?
-                                .set_password(&draft)
-                                .map_err(|_| "Cannot save key in system credential store")?;
-                        }
-                        persist(&h)
-                    })();
-                    update(&h, |s| match result {
-                        Ok(()) => {
-                            s.voice.status =
-                                "Saved. Restart the app to apply global hotkey changes.".into();
-                            if !draft.is_empty() {
-                                s.voice.key_saved = true;
-                            }
-                        }
-                        Err(e) => s.voice.status = e,
-                    });
-                });
-            }
-        }
-        "voice.forget_key" => {
-            if let Some(h) = HOOKS.get().cloned() {
-                let custom = state.voice.settings.custom;
-                state.voice.api_key_draft.clear();
-                state.voice.key_revision += 1;
-                std::thread::spawn(move || {
-                    let result = credential(custom).and_then(|e| match e.delete_credential() {
-                        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                        Err(_) => Err("Cannot remove key from credential store".into()),
-                    });
-                    update(&h, |s| match result {
-                        Ok(()) => {
-                            s.voice.key_saved = false;
-                            s.voice.status = "API key removed".into();
-                        }
-                        Err(e) => s.voice.status = e,
-                    });
-                });
-            }
-        }
+        "voice.save" => save_settings(state),
+        "voice.forget_key" => forget_key(state),
         "voice.clear" => {
             state.voice.history = Arc::default();
             state.voice.selected = 0;
-            if let Some(h) = HOOKS.get().cloned() {
-                std::thread::spawn(move || {
-                    if let Err(e) = persist(&h) {
-                        update(&h, |s| s.voice.status = e);
-                    }
-                });
-            }
-        }
-        "voice.play" => {
-            if state.voice.busy || state.voice.debug_audio.is_empty() {
-                return true;
-            }
-            if let Some(h) = HOOKS.get().cloned() {
-                state.voice.busy = true;
-                state.voice.cancel = Arc::new(AtomicBool::new(false));
-                let cancel = state.voice.cancel.clone();
-                let audio = state.voice.debug_audio.clone();
-                std::thread::spawn(move || {
-                    let result = audio::playback(audio, cancel);
-                    update(&h, |s| {
-                        s.voice.busy = false;
-                        s.voice.status = result
-                            .map(|_| "Playback complete".into())
-                            .unwrap_or_else(|e| e);
-                    });
-                });
-            }
-        }
-        _ => {
-            if let Some(id) = command
-                .strip_prefix("voice.copy:")
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                if let Some(entry) = state.voice.history.iter().find(|e| e.id == id) {
-                    state.voice.status = match state.clipboard.write_text(&entry.text) {
-                        Ok(()) => "Copied to clipboard".into(),
-                        Err(_) => "Clipboard unavailable; transcript remains in history".into(),
-                    };
+            spawn_with_hooks(|h| {
+                if let Err(e) = persist(&h) {
+                    update(&h, |s| s.voice.status = e);
                 }
-            } else {
-                return false;
-            }
+            });
         }
+        "voice.play" => play_sample(state),
+        _ => match command
+            .strip_prefix("voice.copy:")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(id) => copy_entry(state, id),
+            None => return false,
+        },
     }
     true
+}
+
+fn copy_entry(state: &mut AppState, id: u64) {
+    if let Some(entry) = state.voice.history.iter().find(|e| e.id == id) {
+        state.voice.status = match state.clipboard.write_text(&entry.text) {
+            Ok(()) => "Copied to clipboard".into(),
+            Err(_) => "Clipboard unavailable; transcript remains in history".into(),
+        };
+    }
+}
+
+fn start_recording(state: &mut AppState, command: &str) {
+    if state.voice.busy {
+        return;
+    }
+    let Some(h) = HOOKS.get().cloned() else {
+        state.voice.status = "Voice service is not running".into();
+        return;
+    };
+    let debug = command == "voice.mic";
+    let mut settings = state.voice.settings.clone();
+    if command == "voice.test" || debug {
+        settings.live = false;
+    }
+    if !debug {
+        if let Err(e) = provider::validate(&settings) {
+            state.voice.status = e;
+            return;
+        }
+    }
+    let target = if settings.live {
+        let pane = state.active_pane.0;
+        match state.pty_manager.session_id(pane) {
+            Some(session) => Some((pane, session)),
+            None => {
+                state.voice.status =
+                    "Focus a terminal or Codex CLI pane before starting live dictation".into();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    state.voice.stop = Arc::new(AtomicBool::new(false));
+    state.voice.cancel = Arc::new(AtomicBool::new(false));
+    let stop = state.voice.stop.clone();
+    let cancel = state.voice.cancel.clone();
+    state.voice.busy = true;
+    state.voice.recording = true;
+    state.voice.seconds = 0;
+    state.voice.preview.clear();
+    state.voice.status = if debug {
+        "Recording locally; no audio is sent"
+    } else {
+        "Opening microphone…"
+    }
+    .into();
+    std::thread::spawn(move || {
+        let result = record(&h, settings, target, debug, stop, cancel.clone());
+        update(&h, |s| {
+            s.voice.recording = false;
+            s.voice.busy = false;
+            s.voice.peak = 0;
+            if cancel.load(Ordering::Relaxed) {
+                s.voice.status = "Cancelled. Text already inserted is kept.".into();
+            } else if let Err(e) = result {
+                s.voice.status = e;
+            }
+        });
+    });
+}
+
+fn save_settings(state: &mut AppState) {
+    if let Err(e) = provider::validate(&state.voice.settings) {
+        state.voice.status = e;
+        return;
+    }
+    if hotkeys(&state.voice.settings).is_err() {
+        state.voice.status = "Use two distinct valid global hotkeys, e.g. Control+Alt+Space".into();
+        return;
+    }
+    let draft = std::mem::take(&mut state.voice.api_key_draft);
+    state.voice.key_revision += 1;
+    let custom = state.voice.settings.custom;
+    spawn_with_hooks(move |h| {
+        let result = (|| {
+            if !draft.is_empty() {
+                credential(custom)?
+                    .set_password(&draft)
+                    .map_err(|_| "Cannot save key in system credential store")?;
+            }
+            persist(&h)
+        })();
+        update(&h, |s| match result {
+            Ok(()) => {
+                s.voice.status = "Saved. Restart the app to apply global hotkey changes.".into();
+                if !draft.is_empty() {
+                    s.voice.key_saved = true;
+                }
+            }
+            Err(e) => s.voice.status = e,
+        });
+    });
+}
+
+fn forget_key(state: &mut AppState) {
+    if HOOKS.get().is_none() {
+        return;
+    }
+    let custom = state.voice.settings.custom;
+    state.voice.api_key_draft.clear();
+    state.voice.key_revision += 1;
+    spawn_with_hooks(move |h| {
+        let result = credential(custom).and_then(|e| match e.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Cannot remove key from credential store".into()),
+        });
+        update(&h, |s| match result {
+            Ok(()) => {
+                s.voice.key_saved = false;
+                s.voice.status = "API key removed".into();
+            }
+            Err(e) => s.voice.status = e,
+        });
+    });
+}
+
+fn play_sample(state: &mut AppState) {
+    if state.voice.busy || state.voice.debug_audio.is_empty() {
+        return;
+    }
+    let Some(h) = HOOKS.get().cloned() else {
+        return;
+    };
+    state.voice.busy = true;
+    state.voice.cancel = Arc::new(AtomicBool::new(false));
+    let cancel = state.voice.cancel.clone();
+    let audio = state.voice.debug_audio.clone();
+    std::thread::spawn(move || {
+        let result = audio::playback(audio, cancel);
+        update(&h, |s| {
+            s.voice.busy = false;
+            s.voice.status = result
+                .map(|_| "Playback complete".into())
+                .unwrap_or_else(|e| e);
+        });
+    });
 }
 
 fn terminal_text(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Transcribes each recorded chunk, mirrors the text into the preview and, for live
+/// dictation, types it into the target terminal session.
+fn transcribe_chunks(
+    h: &Hooks,
+    settings: &Settings,
+    key: &str,
+    target: Option<(u32, u64)>,
+    cancel: &AtomicBool,
+    chunks: Receiver<Vec<i16>>,
+) -> Result<String, String> {
+    let mut text = String::new();
+    for samples in chunks {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let part = provider::transcribe(settings, key, &samples, audio::RATE)?;
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&part);
+        let mut typed = Ok(());
+        update(h, |s| {
+            s.voice.preview = text.clone();
+            if let Some((pane, session)) = target {
+                typed = type_into(s, pane, session, &part);
+            }
+        });
+        typed?;
+    }
+    Ok(text)
+}
+
+fn type_into(s: &mut AppState, pane: u32, session: u64, part: &str) -> Result<(), String> {
+    if s.pty_manager.session_id(pane) != Some(session) {
+        return Err("Dictation destination closed or changed; text remains in preview".into());
+    }
+    // Never send control characters or a newline that could execute a shell command.
+    let bytes = format!("{} ", terminal_text(part)).into_bytes();
+    s.pty_manager
+        .write(pane, &bytes)
+        .map_err(|_| "Cannot write to dictation destination; text remains in preview".to_string())
+}
+
+fn save_transcript(h: &Hooks, clipboard: bool, text: &str, seconds: u64) -> Result<(), String> {
+    update(h, |s| {
+        let history = Arc::make_mut(&mut s.voice.history);
+        history.insert(
+            0,
+            Entry {
+                id: now_ms(),
+                text: text.to_string(),
+                seconds,
+            },
+        );
+        history.truncate(100);
+        s.voice.status = if clipboard {
+            match s.clipboard.write_text(text) {
+                Ok(()) => "Copied to clipboard and saved to history".into(),
+                Err(_) => "Saved to history; clipboard unavailable".into(),
+            }
+        } else {
+            "Saved to history (clipboard off)".into()
+        };
+    });
+    persist(h)
 }
 
 fn record(
@@ -561,58 +640,18 @@ fn record(
     let start = Instant::now();
     let mut last_chunk = Instant::now();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<i16>>(8);
-    let th = h.clone();
-    let ts = settings.clone();
-    let tc = cancel.clone();
-    let transcriber = std::thread::spawn(move || -> Result<String, String> {
-        let mut text = String::new();
-        for samples in rx {
-            if tc.load(Ordering::Relaxed) {
-                break;
-            }
-            let part = provider::transcribe(&ts, &key, &samples, audio::RATE)?;
-            if tc.load(Ordering::Relaxed) {
-                break;
-            }
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(&part);
-            let mut write_error = None;
-            update(&th, |s| {
-                s.voice.preview = text.clone();
-                if let Some((pane, session)) = target {
-                    if s.pty_manager.session_id(pane) != Some(session) {
-                        write_error = Some(
-                            "Dictation destination closed or changed; text remains in preview"
-                                .to_string(),
-                        );
-                    } else {
-                        // Never send control characters or a newline that could execute a shell command.
-                        let safe = terminal_text(&part);
-                        let bytes = format!("{safe} ").into_bytes();
-                        if s.pty_manager.write(pane, &bytes).is_err() {
-                            write_error = Some(
-                                "Cannot write to dictation destination; text remains in preview"
-                                    .into(),
-                            );
-                        }
-                    }
-                }
-            });
-            if let Some(e) = write_error {
-                return Err(e);
-            }
-        }
-        Ok(text)
-    });
+    let transcriber = {
+        let (h, settings, cancel) = (h.clone(), settings.clone(), cancel.clone());
+        std::thread::spawn(move || transcribe_chunks(&h, &settings, &key, target, &cancel, rx))
+    };
+    let cancelled = || cancel.load(Ordering::Relaxed);
     let mut error = None;
-    while !stop.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !cancelled() {
         std::thread::sleep(Duration::from_millis(100));
         let seconds = start.elapsed().as_secs();
         update(h, |s| {
             s.voice.seconds = seconds;
-            s.voice.peak = capture.peak.load(Ordering::Relaxed);
+            s.voice.peak = capture.shared.peak.load(Ordering::Relaxed);
             s.voice.status = if debug {
                 "Local microphone test (15s maximum)"
             } else {
@@ -620,7 +659,7 @@ fn record(
             }
             .into();
         });
-        if capture.failed.load(Ordering::Relaxed) {
+        if capture.shared.failed.load(Ordering::Relaxed) {
             error = Some("Microphone disconnected or permission was revoked".into());
             break;
         }
@@ -635,7 +674,7 @@ fn record(
             last_chunk = Instant::now();
         }
         if seconds >= if debug { 15 } else { audio::MAX_SECONDS as u64 }
-            || capture.full.load(Ordering::Relaxed)
+            || capture.shared.full.load(Ordering::Relaxed)
         {
             break;
         }
@@ -648,20 +687,12 @@ fn record(
         s.voice.status = "Transcribing…".into();
     });
     if debug {
-        let samples = if cancel.load(Ordering::Relaxed) {
-            Vec::new()
-        } else {
-            samples
-        };
+        let samples = if cancelled() { Vec::new() } else { samples };
         update(h, |s| {
             s.voice.debug_audio = Arc::new(samples);
             s.voice.status = "Local sample ready. Press Listen to hear your microphone.".into();
         });
-    } else if !cancel.load(Ordering::Relaxed)
-        && error.is_none()
-        && !samples.is_empty()
-        && tx.send(samples).is_err()
-    {
+    } else if !cancelled() && error.is_none() && !samples.is_empty() && tx.send(samples).is_err() {
         error = Some("Transcription worker stopped".into());
     }
     drop(tx);
@@ -675,30 +706,10 @@ fn record(
             h.shared.lock_recover().voice.preview.clone()
         }
     };
-    if !debug && !cancel.load(Ordering::Relaxed) && !text.is_empty() {
-        update(h, |s| {
-            let history = Arc::make_mut(&mut s.voice.history);
-            history.insert(
-                0,
-                Entry {
-                    id: now_ms(),
-                    text: text.clone(),
-                    seconds: recorded_seconds,
-                },
-            );
-            history.truncate(100);
-            s.voice.status = if settings.clipboard {
-                match s.clipboard.write_text(&text) {
-                    Ok(()) => "Copied to clipboard and saved to history".into(),
-                    Err(_) => "Saved to history; clipboard unavailable".into(),
-                }
-            } else {
-                "Saved to history (clipboard off)".into()
-            };
-        });
-        persist(h)?;
+    if !debug && !cancelled() && !text.is_empty() {
+        save_transcript(h, settings.clipboard, &text, recorded_seconds)?;
     }
-    if !debug && text.is_empty() && error.is_none() && !cancel.load(Ordering::Relaxed) {
+    if !debug && text.is_empty() && error.is_none() && !cancelled() {
         error =
             Some("No microphone audio was transcribed. Check the microphone and try again.".into());
     }
