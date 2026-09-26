@@ -222,6 +222,7 @@ fn build_settings_page_rail(state: &UiSnapshot, shared: &SharedState) -> Element
                     active,
                     shared,
                 ))
+                .with_child(settings_nav_item(SettingsSection::Voice, active, shared))
                 .with_child(settings_nav_item(SettingsSection::Keybinds, active, shared))
                 .with_child(settings_nav_item(
                     SettingsSection::Notifications,
@@ -262,6 +263,7 @@ fn settings_section_title(section: SettingsSection) -> &'static str {
         SettingsSection::Notifications => "Notifications",
         SettingsSection::Updates => "Updates",
         SettingsSection::AgentSkills => "Agent skills",
+        SettingsSection::Voice => "Voice to text",
         SettingsSection::DangerZone => "Danger Zone",
     }
 }
@@ -301,6 +303,7 @@ fn settings_nav_class(section: SettingsSection) -> &'static str {
         SettingsSection::Notifications => "nav-notifications",
         SettingsSection::Updates => "nav-updates",
         SettingsSection::AgentSkills => "nav-agent-skills",
+        SettingsSection::Voice => "nav-voice",
         SettingsSection::DangerZone => "nav-danger-zone",
     }
 }
@@ -314,6 +317,7 @@ fn settings_nav_icon(section: SettingsSection) -> SvgNode {
         SettingsSection::Notifications => icon_bell(),
         SettingsSection::Updates => icon_download(),
         SettingsSection::AgentSkills => icon_chevrons(),
+        SettingsSection::Voice => icon_bell(),
         SettingsSection::DangerZone => icon_settings_nav_close(),
     }
 }
@@ -355,6 +359,7 @@ fn settings_section_desc(active: SettingsSection) -> &'static str {
             "Check GitHub Releases for a newer build, install it in place, and choose whether to look at startup."
         }
         SettingsSection::AgentSkills => "Create interactive flows from concepts, explanations, and code in your agent conversations.",
+        SettingsSection::Voice => "Microphone, transcription providers, global dictation shortcuts and voice history.",
         SettingsSection::DangerZone => "Destructive session and close behavior.",
     }
 }
@@ -374,6 +379,7 @@ fn build_settings_page_body(state: &UiSnapshot, shared: &SharedState) -> Element
         SettingsSection::Notifications => body.with_child(build_notifications_section(shared)),
         SettingsSection::Updates => body.with_child(build_updates_section(state, shared)),
         SettingsSection::AgentSkills => body.with_child(build_agent_skills_section(state, shared)),
+        SettingsSection::Voice => body.with_child(crate::voice::ui::settings(state, shared)),
         SettingsSection::DangerZone => body.with_child(build_danger_zone_section(state, shared)),
     };
     body
@@ -1258,6 +1264,7 @@ fn build_settings_page_savebar(section: SettingsSection, shared: &SharedState) -
     // Per-section reset affordance: keybinds restore their defaults; other
     // sections reset appearance settings.
     let (reset_label, reset_cmd) = match section {
+        SettingsSection::Voice => ("save voice settings", "voice.save"),
         SettingsSection::Keybinds => ("restore defaults", "keybind.reset_all"),
         SettingsSection::AgentSkills => ("refresh status", "flow.skill.refresh"),
         _ => ("reset", "appearance.reset"),
@@ -1272,7 +1279,13 @@ fn build_settings_page_savebar(section: SettingsSection, shared: &SharedState) -
                         .with_class("saved-dot")
                         .with_class("status-running"),
                 )
-                .with_child(ElementDef::new(Tag::Span).with_text("changes apply immediately")),
+                .with_child(ElementDef::new(Tag::Span).with_text(
+                    if section == SettingsSection::Voice {
+                        "save key and settings · restart for hotkey changes"
+                    } else {
+                        "changes apply immediately"
+                    },
+                )),
         )
         .with_child(ElementDef::new(Tag::Span).with_class("spacer"))
         .with_child(
@@ -1370,6 +1383,7 @@ fn build_modal_body(state: &UiSnapshot, shared: &SharedState) -> ElementDef {
         SettingsSection::Notifications => build_notifications_section(shared),
         SettingsSection::Updates => build_updates_section(state, shared),
         SettingsSection::AgentSkills => build_agent_skills_section(state, shared),
+        SettingsSection::Voice => crate::voice::ui::settings(state, shared),
         SettingsSection::DangerZone => build_danger_zone_section(state, shared),
     };
     ElementDef::new(Tag::Div)

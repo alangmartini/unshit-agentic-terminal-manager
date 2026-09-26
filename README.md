@@ -18,11 +18,35 @@ Unshit Terminal Manager is a native macOS and Windows terminal multiplexer built
 - **Agent conversation recovery** — if the PTY daemon is lost in a reboot or crash, a saved pane with an exact or unambiguous provider conversation id offers a provider-specific **Resume Claude/Codex** button the next time Terminal Manager is opened. Automatic recovery and **Start at Windows sign-in** are separate, default-off controls under **Settings → Sessions**; enable both for unattended recovery after a PC restart. A normal UI-only restart still reattaches to the already-running agent instead of launching a duplicate.
 - **Git awareness** — the sidebar detects the current branch for terminals whose working directory lives inside a repository.
 - **Themes** — bundled palettes (Amber, Catppuccin, Tokyo Night, Nord, Dracula, Everforest, Rosé Pine, Gruvbox, and more) plus a customizable accent/surface/foreground theme.
+- **Voice to text** — dictate from any app with a global hotkey, then paste into your chat. OpenAI by default or your own POST endpoint; microphone selection and playback tests, optional clipboard delivery, local history, and live dictation into a terminal or Codex CLI. See [Voice to text](#voice-to-text).
 - **Configurable keybindings** — every action has an editable default key combo, persisted as JSON and editable from Settings.
 - **Scrollback navigation** — scroll back through terminal history and search it from the palette.
 - **GPU rendering** — text and UI are drawn through wgpu, with cursor blink and resizes handled as renderer-side redraws rather than full rebuilds.
 
 ![Split panes](preview-split.png)
+
+## Voice to text
+
+Open **Settings › Voice to text**, select your microphone, paste an OpenAI API key, and click **Save voice settings**. The default model is `gpt-4o-transcribe`; you can change it. Keys are stored in the OS credential vault, separately for OpenAI and custom providers.
+
+1. **Check your mic:** record a local sample, stop, and click **Listen to sample**. The level meter helps catch muted or clipping input. Local samples are never uploaded. **Test transcription** records a new sample and sends it to the selected provider when you stop.
+2. **Dictate anywhere:** `Ctrl+Alt+Space` starts recording and a second press stops it. Alternatively enable **Hold to talk**. Recording continues while you browse other apps; the terminal manager must remain running. Stop within eight minutes, or recording finishes automatically.
+3. **Paste your words:** by default the final transcript is copied to the clipboard and saved in a local history. Paste into your chat with `Cmd+V` on macOS or `Ctrl+V` on Windows. You can disable automatic clipboard writes.
+4. **Recall a transcript:** `Ctrl+Alt+V` brings up voice history in the terminal manager. Copy any entry again, or browse and clear history in Voice settings. The latest 100 transcripts survive restarts.
+
+The two global shortcuts are configurable in Voice settings; restart after saving new combinations. Registration conflicts are shown in the panel. macOS asks for microphone permission when you first record; Windows microphone access must be enabled for desktop apps.
+
+**Final-only is the default.** Optional **live dictation** sends successive audio chunks approximately every six seconds, plus provider/network latency, and inserts each result into the terminal session focused when recording started. This also works with Codex CLI and other chats running in that terminal. Switching windows does not change the destination. It never presses Enter; external chat applications use clipboard paste. Live mode uses ordinary transcription POST requests, not the OpenAI Realtime API, and may split words at chunk boundaries. Costs depend on model and audio duration; final-only is not guaranteed to be cheaper.
+
+**Bring your own endpoint:** choose Custom POST endpoint and set its URL and model. Use multipart for an OpenAI-compatible API (`file=voice.wav`, `model`, and optional extra string fields), or JSON with `{{audio_base64}}` and `{{model}}` placeholders. For example:
+
+```json
+{"audio": "{{audio_base64}}", "model": "{{model}}"}
+```
+
+Configure additional headers as a JSON object (for example `{"X-API-Key":"{{api_key}}"}`) and the response JSON pointer (`/text`, `/result/text`, or empty for a plain-text response). The saved key is also sent as a Bearer token unless you provide your own `Authorization` header. HTTPS is required except for local HTTP endpoints. Redirects are not followed. Only explicitly selected transcription modes upload audio; raw audio is not saved to disk. Transcripts and provider settings live in your instance profile's `voice.json`; the temporary microphone playback sample remains in memory until replaced or the app closes.
+
+**Cost:** light personal use can be around **US$1/month**. At the published `gpt-4o-transcribe` estimate of **US$0.006/min**, that is about **167 minutes**; this is usage-based billing, not a monthly plan or cap. Check [current OpenAI pricing](https://developers.openai.com/api/docs/pricing) and [your account usage](https://platform.openai.com/usage). Custom providers set their own prices. API behavior follows the [OpenAI transcription documentation](https://developers.openai.com/api/docs/guides/speech-to-text).
 
 ## Development
 
@@ -216,6 +240,29 @@ The Windows background monitor reloads this file once per second. Changes apply 
 - `args_prefix` matches consecutive, complete arguments immediately after the executable. Shells and runtimes require it; include enough arguments to identify the harness, not just generic runtime flags. Quoted spaces are supported. Arguments containing `/` or `\` ignore slash style and ASCII case; all other arguments are case-sensitive. No substring search, environment expansion or command execution occurs.
 - For each process, built-in detection wins over custom rules; otherwise, the first matching rule wins. The outermost detected harness wins when agents launch other agents. Rules classify panes only; they do not add launch commands or conversation recovery. Process tags clear when a successful scan no longer finds a match; explicit launches and hooks retain priority.
 - Files are limited to 64 KiB and 64 rules. Each executable is at most 128 bytes; each prefix has at most 16 arguments of at most 1024 bytes each. Unknown JSON fields are rejected so typos do not silently broaden a rule.
+
+## Voice to text
+
+Open **Settings › Voice to text**, select your microphone, paste an OpenAI API key, and click **Save voice settings**. The default model is `gpt-4o-transcribe`; you can change it. Keys are stored in the OS credential vault, separately for OpenAI and custom providers.
+
+1. **Check your mic:** record a local sample, stop, and click **Listen to sample**. The level meter helps catch muted or clipping input. Local samples are never uploaded. **Test transcription** records a new sample and sends it to the selected provider when you stop.
+2. **Dictate anywhere:** `Ctrl+Alt+Space` starts recording and a second press stops it. Alternatively enable **Hold to talk**. Recording continues while you browse other apps; the terminal manager must remain running. Stop within eight minutes, or recording finishes automatically.
+3. **Paste your words:** by default the final transcript is copied to the clipboard and saved in a local history. Paste into your chat with `Cmd+V` on macOS or `Ctrl+V` on Windows. You can disable automatic clipboard writes.
+4. **Recall a transcript:** `Ctrl+Alt+V` brings up voice history in the terminal manager. Copy any entry again, or browse and clear history in Voice settings. The latest 100 transcripts survive restarts.
+
+The two global shortcuts are configurable in Voice settings; restart after saving new combinations. Registration conflicts are shown in the panel. macOS asks for microphone permission when you first record; Windows microphone access must be enabled for desktop apps.
+
+**Final-only is the default.** Optional **live dictation** sends successive audio chunks approximately every six seconds, plus provider/network latency, and inserts each result into the terminal session focused when recording started. This also works with Codex CLI and other chats running in that terminal. Switching windows does not change the destination. It never presses Enter; external chat applications use clipboard paste. Live mode uses ordinary transcription POST requests, not the OpenAI Realtime API, and may split words at chunk boundaries. Costs depend on model and audio duration; final-only is not guaranteed to be cheaper.
+
+**Bring your own endpoint:** choose Custom POST endpoint and set its URL and model. Use multipart for an OpenAI-compatible API (`file=voice.wav`, `model`, and optional extra string fields), or JSON with `{{audio_base64}}` and `{{model}}` placeholders. For example:
+
+```json
+{"audio": "{{audio_base64}}", "model": "{{model}}"}
+```
+
+Configure additional headers as a JSON object (for example `{"X-API-Key":"{{api_key}}"}`) and the response JSON pointer (`/text`, `/result/text`, or empty for a plain-text response). The saved key is also sent as a Bearer token unless you provide your own `Authorization` header. HTTPS is required except for local HTTP endpoints. Redirects are not followed. Only explicitly selected transcription modes upload audio; raw audio is not saved to disk. Transcripts and provider settings live in your instance profile's `voice.json`; the temporary microphone playback sample remains in memory until replaced or the app closes.
+
+**Cost:** light personal use can be around **US$1/month**. At the published `gpt-4o-transcribe` estimate of **US$0.006/min**, that is about **167 minutes**; this is usage-based billing, not a monthly plan or cap. Check [current OpenAI pricing](https://developers.openai.com/api/docs/pricing) and [your account usage](https://platform.openai.com/usage). Custom providers set their own prices. API behavior follows the [OpenAI transcription documentation](https://developers.openai.com/api/docs/guides/speech-to-text).
 
 ## Development
 

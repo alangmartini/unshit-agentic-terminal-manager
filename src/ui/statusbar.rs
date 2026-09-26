@@ -300,6 +300,7 @@ mod tests {
 
     fn minimal_snapshot() -> UiSnapshot {
         UiSnapshot {
+            voice: crate::voice::VoiceState::default(),
             diff_review: None,
             workspaces: vec![],
             active_workspace: 0,

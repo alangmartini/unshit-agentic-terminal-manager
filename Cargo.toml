@@ -142,6 +142,11 @@ ureq = { version = "3", default-features = false, features = ["native-tls"] }
 sha2 = "0.10"
 semver = "1"
 
+cpal = "0.15"
+global-hotkey = "0.7"
+base64 = "0.22"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 unshit-test = { path = "crates/unshit-framework/crates/unshit-test" }
