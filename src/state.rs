@@ -370,6 +370,7 @@ enum CloseChoice {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
+    Voice,
     Appearance,
     Shell,
     Keybinds,
@@ -383,6 +384,7 @@ pub enum SettingsSection {
 impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
+            SettingsSection::Voice => "voice",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
@@ -394,7 +396,7 @@ impl SettingsSection {
         }
     }
 
-    pub fn all() -> [SettingsSection; 8] {
+    pub fn all() -> [SettingsSection; 9] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
@@ -403,6 +405,7 @@ impl SettingsSection {
             SettingsSection::Notifications,
             SettingsSection::AgentSkills,
             SettingsSection::Updates,
+            SettingsSection::Voice,
             SettingsSection::DangerZone,
         ]
     }
@@ -1009,6 +1012,7 @@ pub struct AppState {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub voice: crate::voice::VoiceState,
     pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
@@ -1410,6 +1414,7 @@ impl AppState {
             active_pane: self.active_pane,
             settings_open: self.settings_open,
             settings_section: self.settings_section,
+            voice: self.voice.clone(),
             flow_skill_installations: self.flow_skill_installations.clone(),
             theme: self.theme.clone(),
             custom_theme: self.custom_theme,
@@ -1557,6 +1562,7 @@ pub struct UiSnapshot {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub voice: crate::voice::VoiceState,
     pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
@@ -1795,6 +1801,7 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
+        voice: crate::voice::VoiceState::default(),
         flow_skill_installations: Vec::new(),
         theme: theme::default_theme_id().to_string(),
         custom_theme: theme::default_custom_theme(),
@@ -8402,6 +8409,13 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command.starts_with("voice.") {
+        return crate::voice::dispatch(state, command);
+    }
+    if command == "modal.close" && state.voice.history_open {
+        state.voice.history_open = false;
+        return true;
+    }
     if command == "review.patch_open" {
         let start_dir = active_workspace_cwd(state);
         return spawn_file_picker(
@@ -11877,6 +11891,7 @@ pub(crate) mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            voice: crate::voice::VoiceState::default(),
             flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().to_string(),
             custom_theme: crate::theme::default_custom_theme(),
@@ -12020,7 +12035,7 @@ pub(crate) mod tests {
     #[test]
     fn settings_section_all_includes_agent_skills_and_updates() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
@@ -12028,7 +12043,8 @@ pub(crate) mod tests {
         assert_eq!(all[4], SettingsSection::Notifications);
         assert_eq!(all[5], SettingsSection::AgentSkills);
         assert_eq!(all[6], SettingsSection::Updates);
-        assert_eq!(all[7], SettingsSection::DangerZone);
+        assert_eq!(all[7], SettingsSection::Voice);
+        assert_eq!(all[8], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
