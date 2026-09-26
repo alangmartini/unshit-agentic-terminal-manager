@@ -1905,7 +1905,11 @@ pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
     save_tab_state(state);
     state.active_tab = new_index;
     load_tab_state(state);
-    // A mixed split may have last focused the other group.
+    focus_tab_group(state, agents);
+}
+
+/// Keep the current group when loading a mixed split.
+fn focus_tab_group(state: &mut AppState, agents: bool) {
     if is_agent_pane(state, state.active_pane.0) != agents {
         if let Some(pane) = state
             .panes
@@ -1914,9 +1918,27 @@ pub fn mutate_switch_tab(state: &mut AppState, new_index: usize) {
             .find(|pane| is_agent_pane(state, pane.id.0) == agents)
         {
             state.active_pane = pane.id;
-            state.tabs[new_index].active_pane = pane.id;
+            state.tabs[state.active_tab].active_pane = pane.id;
         }
     }
+}
+
+/// After removal, prefer the current slot, then later tabs, then earlier
+/// tabs in the same group. Fall back to the current slot only if none remain.
+fn load_tab_after_close(state: &mut AppState, agents: bool) {
+    let start = state.active_tab.min(state.tabs.len() - 1);
+    state.active_tab = (start..state.tabs.len())
+        .chain((0..start).rev())
+        .find(|&index| {
+            state.tabs[index]
+                .panes
+                .iter()
+                .flatten()
+                .any(|pane| is_agent_pane(state, pane.id.0) == agents)
+        })
+        .unwrap_or(start);
+    load_tab_state(state);
+    focus_tab_group(state, agents);
 }
 
 fn save_workspace_state(state: &mut AppState) {
@@ -2788,6 +2810,7 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
     }
 
     let is_active = state.active_tab == index;
+    let agents = is_agent_pane(state, state.active_pane.0);
     let pane_ids = tab_pane_ids(state, index);
 
     for id in &pane_ids {
@@ -2801,6 +2824,7 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
         }
         state.pty_manager.destroy(*id);
         state.terminals.remove(id);
+        state.custom_titled_panes.remove(id);
         forget_agent_restore(state, *id);
     }
 
@@ -2820,7 +2844,7 @@ pub fn mutate_close_tab(state: &mut AppState, index: usize) {
 
     if is_active {
         state.active_tab = index.min(state.tabs.len() - 1);
-        load_tab_state(state);
+        load_tab_after_close(state, agents);
     } else if state.active_tab > index {
         state.active_tab -= 1;
     }
@@ -3706,6 +3730,14 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         return;
     };
 
+    // Delegate before teardown so the closing pane still identifies its group.
+    if state.panes.iter().map(Vec::len).sum::<usize>() == 1 {
+        mutate_close_tab(state, state.active_tab);
+        return;
+    }
+    let agents = is_agent_pane(state, state.active_pane.0);
+    let closing_active = state.active_pane == target;
+
     if let Some(editor) = state.editors.remove(&target.0) {
         // Editor pane: no PTY/terminal state to tear down.
         record_editor_closed(&editor);
@@ -3738,20 +3770,15 @@ pub fn mutate_close_pane(state: &mut AppState, target: PaneId) {
         }
         state.panes.remove(row_idx);
     }
-    if state.panes.is_empty() {
-        // Last pane of the active tab is gone: close the whole tab so the
-        // tab bar and sidebar reflect the loss. When this was the last tab
-        // the workspace falls back to its empty state canvas.
-        let active_tab = state.active_tab;
-        mutate_close_tab(state, active_tab);
-        return;
-    }
     if state.active_pane == target {
         let new_row = row_idx.min(state.panes.len() - 1);
         let new_col = col_idx.min(state.panes[new_row].len() - 1);
         state.active_pane = state.panes[new_row][new_col].id;
     }
     sync_live_tab_from_panes(state);
+    if closing_active {
+        load_tab_after_close(state, agents);
+    }
 }
 
 /// Move focus to the pane immediately left of the active pane in the
@@ -14044,6 +14071,92 @@ pub(crate) mod tests {
         state.active_tab = 1;
         assert!(dispatch(&mut state, "tab.close.active"));
         assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn tab_groups_close_stays_in_group_until_exhausted() {
+        for agents in [false, true] {
+            for command in ["tab.close.active", "pane.close"] {
+                let mut state = test_state();
+                for _ in 0..3 {
+                    mutate_add_tab(&mut state);
+                }
+                for index in 0..4 {
+                    if (index % 2 == 0) == agents {
+                        let id = state.tabs[index].active_pane.0;
+                        classify_pane_title(&mut state, id, "Claude Code");
+                    }
+                }
+                mutate_switch_tab(&mut state, 0);
+                let same_group = state.tabs[2].active_pane;
+                assert!(dispatch(&mut state, command));
+                assert_eq!(state.active_pane, same_group);
+                assert_eq!(is_agent_pane(&state, state.active_pane.0), agents);
+                assert!(dispatch(&mut state, command));
+                assert_eq!(is_agent_pane(&state, state.active_pane.0), !agents);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_groups_close_prefers_previous_group_tab_over_next_shell() {
+        let mut state = test_state();
+        classify_pane_title(&mut state, 1, "Claude Code");
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        classify_pane_title(&mut state, id, "Claude Code");
+        mutate_add_tab(&mut state);
+        mutate_switch_tab(&mut state, 1);
+        mutate_close_tab(&mut state, 1);
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_pane, PaneId(1));
+    }
+
+    #[test]
+    fn tab_groups_close_focuses_matching_pane_in_mixed_tab() {
+        let mut state = test_state();
+        mutate_split_right(&mut state, PaneId(1));
+        let agent = state.active_pane;
+        classify_pane_title(&mut state, agent.0, "Claude Code");
+        state.active_pane = PaneId(1);
+        mutate_add_tab(&mut state);
+        let id = state.active_pane.0;
+        classify_pane_title(&mut state, id, "Claude Code");
+        mutate_close_tab(&mut state, 1);
+        assert_eq!(state.active_pane, agent);
+        assert_eq!(state.tabs[0].active_pane, agent);
+    }
+
+    #[test]
+    fn tab_groups_close_pane_keeps_group_in_current_or_other_tab() {
+        let mut state = test_state();
+        classify_pane_title(&mut state, 1, "Claude Code");
+        mutate_add_tab(&mut state);
+        let shell = state.active_pane;
+        mutate_split_right(&mut state, shell);
+        let first_agent = state.active_pane;
+        classify_pane_title(&mut state, first_agent.0, "Claude Code");
+        mutate_split_right(&mut state, first_agent);
+        let second_agent = state.active_pane;
+        classify_pane_title(&mut state, second_agent.0, "Claude Code");
+        mutate_close_pane(&mut state, second_agent);
+        assert_eq!(state.active_tab, 1);
+        assert_eq!(state.active_pane, first_agent);
+        mutate_close_pane(&mut state, first_agent);
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.active_pane, PaneId(1));
+        assert_eq!(state.tabs[1].panes[0][0].id, shell);
+    }
+
+    #[test]
+    fn tab_groups_close_background_tab_preserves_focus() {
+        let mut state = test_state();
+        mutate_add_tab(&mut state);
+        let agent = state.active_pane;
+        classify_pane_title(&mut state, agent.0, "Claude Code");
+        mutate_close_tab(&mut state, 0);
+        assert_eq!(state.active_pane, agent);
+        assert_eq!(state.active_tab, 0);
     }
 
     #[test]
