@@ -24,6 +24,7 @@ pub mod git;
 pub mod git_watch;
 pub mod keybinds;
 pub mod launch_target;
+pub mod markdown;
 pub mod notifications;
 pub mod pane_restore;
 pub mod persist;
@@ -42,6 +43,7 @@ pub mod terminal;
 pub mod theme;
 pub mod ui;
 pub mod updater;
+pub mod voice;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -397,6 +399,7 @@ fn build_tree(
             .with_child(crate::quick_prompt::build_quick_prompt_overlay(
                 snap, shared,
             ))
+            .with_child(crate::voice::ui::overlay(snap, shared))
             .with_child(build_toast_overlay(snap, shared))
             .with_child(crate::ui::fps_overlay::build_fps_overlay()),
     }
@@ -1247,6 +1250,9 @@ fn main() {
                     // plain Escape closes settings directly so repeated
                     // settings open/close cycles do not depend on shortcut
                     // resolver state.
+                    if crate::voice::history_key(&mut guard, combo) {
+                        return true;
+                    }
                     if let Some(action) = guard.keybinds.recording {
                         if combo.key == Key::Escape && combo.modifiers.is_empty() {
                             dispatch(&mut guard, "keybind.cancel_record");
@@ -1544,6 +1550,17 @@ fn main() {
         crate::bench::start(cfg, shared.clone(), window_event_sink.clone());
     }
     crate::diff_review::start(shared.clone(), app.event_sink());
+    let voice_sink = app.event_sink();
+    let voice_activate = app.event_sink();
+    let _voice_hotkeys = crate::voice::start(crate::voice::Hooks {
+        shared: shared.clone(),
+        activate: Box::new(move || {
+            let _ = voice_activate.send(unshit::app::ExternalEvent::ActivateWindow);
+        }),
+        rebuild: Box::new(move || {
+            let _ = voice_sink.send(unshit::app::ExternalEvent::RequestRebuild);
+        }),
+    });
 
     // Folder targets have already seeded the eager initial terminal above.
     // Documents wait until the patch-review worker exists, then open through
@@ -2814,7 +2831,10 @@ mod tests {
 
         let mut state = seed_state();
         state.settings_open = true;
-        state.settings_section = SettingsSection::Appearance;
+        state.settings_section = std::env::var("TM_SETTINGS_ROUTE_VISUAL_SECTION")
+            .ok()
+            .and_then(|name| SettingsSection::from_label(&name))
+            .unwrap_or(SettingsSection::Appearance);
         state.theme = "amber".to_string();
         state.active_tab = 2;
         let shared: SharedState = Arc::new(Mutex::new(state));
@@ -3085,6 +3105,8 @@ mod tests {
             let row = harness
                 .query(".cp-item.active")
                 .expect("active palette result exists");
+            assert_eq!(row.computed_style.padding.top, 4.0);
+            assert_eq!(row.computed_style.padding.bottom, 4.0);
             assert_eq!(
                 row.computed_style.background,
                 Background::Color(Color::rgba(accent.r, accent.g, accent.b, 30))

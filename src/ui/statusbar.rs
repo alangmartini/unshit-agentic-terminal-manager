@@ -300,6 +300,7 @@ mod tests {
 
     fn minimal_snapshot() -> UiSnapshot {
         UiSnapshot {
+            voice: crate::voice::VoiceState::default(),
             diff_review: None,
             workspaces: vec![],
             active_workspace: 0,
@@ -373,6 +374,7 @@ mod tests {
             terminal_link_hover: None,
             pending_agent_resumes: BTreeMap::new(),
             editor_panes: std::collections::HashSet::new(),
+            markdown_panes: std::collections::HashMap::new(),
             flow_panes: std::collections::HashMap::new(),
             file_index: None,
             file_index_building: false,

@@ -1180,9 +1180,51 @@ impl SmoothScroll {
 #[derive(Default)]
 pub struct ScrollGridPatch {
     pub grid: Option<unshit_core::cell_grid::CellGrid>,
+    /// Scroll one or more ordinary overflow containers to a fractional
+    /// position. This is separate from the handling node's grid so composite
+    /// surfaces (for example an editor plus a rich preview) can synchronize
+    /// without rebuilding their trees.
+    pub scroll_fractions: Vec<ScrollFractionPatch>,
     /// Registers (or replaces) a framework-driven animation on the handling
     /// node. `None` leaves any in-flight animation untouched.
     pub animation: Option<GridAnimationHook>,
+}
+
+/// Set an overflow container's scroll position from a normalized `0..=1`
+/// fraction of its scrollable extent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollFractionPatch {
+    pub id: String,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+}
+
+/// Apply fraction patches by stable element id. Returns true when any visual
+/// scroll offset changed; callers schedule a redraw when it does.
+pub fn apply_scroll_fraction_patches(
+    arena: &mut NodeArena,
+    taffy: &taffy::TaffyTree<TextMeasureCtx>,
+    patches: &[ScrollFractionPatch],
+) -> bool {
+    let mut changed = false;
+    for patch in patches {
+        let Some(node_id) = arena
+            .iter()
+            .find(|(_, element)| element.id.as_deref() == Some(patch.id.as_str()))
+            .map(|(node_id, _)| node_id)
+        else {
+            continue;
+        };
+        let Some(element) = arena.get(node_id) else {
+            continue;
+        };
+        let (current_x, current_y) = (element.scroll_x, element.scroll_y);
+        let (max_x, max_y) = scroll::compute_max_scroll(arena, taffy, node_id);
+        let next_x = patch.x.map(|fraction| fraction.clamp(0.0, 1.0) * max_x).unwrap_or(current_x);
+        let next_y = patch.y.map(|fraction| fraction.clamp(0.0, 1.0) * max_y).unwrap_or(current_y);
+        changed |= scroll::set_scroll_position(arena, node_id, next_x, next_y);
+    }
+    changed
 }
 
 /// A node-scoped grid animation driven by the framework's animation tick.
@@ -5436,6 +5478,13 @@ impl ApplicationHandler for AppHandler {
                                             state.needs_rebuild = true;
                                             state.window.request_redraw();
                                         }
+                                    }
+                                    if apply_scroll_fraction_patches(
+                                        &mut state.arena,
+                                        &state.taffy,
+                                        &patch.scroll_fractions,
+                                    ) {
+                                        state.window.request_redraw();
                                     }
                                     // `grid: None`: consumed with no visual
                                     // change; schedule nothing (unless an

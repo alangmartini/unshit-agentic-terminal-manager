@@ -1,5 +1,5 @@
 use std::time::Instant;
-use unshit_app::app::{apply_scroll_grid_patch, ScrollGridPatch};
+use unshit_app::app::{apply_scroll_fraction_patches, apply_scroll_grid_patch, ScrollGridPatch};
 use unshit_core::element::{ElementContent, InputType, Tag};
 use unshit_core::event::{
     dispatch_click, dispatch_context_menu, drag_autorepeat_event, find_drag_handler,
@@ -491,6 +491,11 @@ impl TestHarness {
                         // to a full rebuild; the harness has no rebuild.
                         apply_scroll_grid_patch(&mut self.arena, node, grid);
                     }
+                    apply_scroll_fraction_patches(
+                        &mut self.arena,
+                        &self.taffy,
+                        &patch.scroll_fractions,
+                    );
                     // `patch.animation` is intentionally dropped: see the
                     // fidelity notes above.
                 }

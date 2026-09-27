@@ -852,8 +852,11 @@ fn wheel_handler_scroll_grid_patch_updates_node_grid() {
                         // path rather than the app's rebuild fallback.
                         let mut grid = CellGrid::new(ROWS, COLS);
                         grid.set_cell(0, 0, Cell::with_char('Z'));
-                        Some(Box::new(ScrollGridPatch { grid: Some(grid), animation: None })
-                            as Box<dyn Any>)
+                        Some(Box::new(ScrollGridPatch {
+                            grid: Some(grid),
+                            scroll_fractions: Vec::new(),
+                            animation: None,
+                        }) as Box<dyn Any>)
                     }),
             ),
         },

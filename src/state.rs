@@ -370,6 +370,7 @@ enum CloseChoice {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsSection {
+    Voice,
     Appearance,
     Shell,
     Keybinds,
@@ -383,6 +384,7 @@ pub enum SettingsSection {
 impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
+            SettingsSection::Voice => "voice",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Shell => "shell",
             SettingsSection::Keybinds => "keybinds",
@@ -394,7 +396,7 @@ impl SettingsSection {
         }
     }
 
-    pub fn all() -> [SettingsSection; 8] {
+    pub fn all() -> [SettingsSection; 9] {
         [
             SettingsSection::Appearance,
             SettingsSection::Shell,
@@ -403,6 +405,7 @@ impl SettingsSection {
             SettingsSection::Notifications,
             SettingsSection::AgentSkills,
             SettingsSection::Updates,
+            SettingsSection::Voice,
             SettingsSection::DangerZone,
         ]
     }
@@ -1009,6 +1012,7 @@ pub struct AppState {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub voice: crate::voice::VoiceState,
     pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
@@ -1379,6 +1383,15 @@ impl AppState {
             .chain(self.agent_restarts.keys())
             .copied()
             .collect();
+        let markdown_panes = self
+            .panes
+            .iter()
+            .flatten()
+            .filter_map(|pane| {
+                let view = self.editors.get(&pane.id.0)?.markdown_view()?;
+                Some((pane.id.0, view))
+            })
+            .collect();
         let attention_pane_ids = self.attention_pane_ids.clone();
         let (active_terminal_cols, active_terminal_rows) = if include_workspace_entries {
             self.terminals
@@ -1401,6 +1414,7 @@ impl AppState {
             active_pane: self.active_pane,
             settings_open: self.settings_open,
             settings_section: self.settings_section,
+            voice: self.voice.clone(),
             flow_skill_installations: self.flow_skill_installations.clone(),
             theme: self.theme.clone(),
             custom_theme: self.custom_theme,
@@ -1472,6 +1486,7 @@ impl AppState {
                 .map(|(&pane_id, candidate)| (pane_id, candidate.agent))
                 .collect(),
             editor_panes: self.editors.keys().copied().collect(),
+            markdown_panes,
             diff_review: self.diff_review.clone(),
             editor_find_bars: self
                 .editors
@@ -1547,6 +1562,7 @@ pub struct UiSnapshot {
     pub active_pane: PaneId,
     pub settings_open: bool,
     pub settings_section: SettingsSection,
+    pub voice: crate::voice::VoiceState,
     pub flow_skill_installations: Vec<crate::flow_explorer::skills::SkillInstallation>,
     pub theme: String,
     pub custom_theme: theme::CustomTheme,
@@ -1648,6 +1664,9 @@ pub struct UiSnapshot {
     pub pending_agent_resumes: BTreeMap<u32, crate::agent_restore::AgentKind>,
     /// Pane ids rendered by the file editor instead of a terminal.
     pub editor_panes: std::collections::HashSet<u32>,
+    /// Markdown editor panes in the active tab; the view carries the rendered
+    /// document while the side preview is open.
+    pub markdown_panes: std::collections::HashMap<u32, crate::markdown::MarkdownView>,
     pub diff_review: Option<crate::diff_review::Review>,
     /// Find bars that are currently open, by pane id. Only what the bar
     /// renders, so the tree build never reaches into a live pane.
@@ -1782,6 +1801,7 @@ pub fn seed_state() -> AppState {
         active_pane: PaneId(1),
         settings_open: false,
         settings_section: SettingsSection::Appearance,
+        voice: crate::voice::VoiceState::default(),
         flow_skill_installations: Vec::new(),
         theme: theme::default_theme_id().to_string(),
         custom_theme: theme::default_custom_theme(),
@@ -6015,6 +6035,7 @@ fn palette_push_query_char(state: &mut AppState, ch: char) -> bool {
     let mut candidate = state.palette_query.clone();
     candidate.push(ch);
     state.palette_query = crate::command_palette::sanitize_palette_query(&candidate);
+    reset_palette_selection(state);
     ensure_file_index_for_query(state);
     true
 }
@@ -6245,6 +6266,9 @@ fn is_palette_safe_dispatch(command: &str) -> bool {
             | "explorer.toggle"
             | "modal.open"
             | "quick_prompt.open"
+            | "agent.new"
+            | "agent.new:claude"
+            | "agent.new:codex"
             | "editor.open"
             | "editor.save"
             | "review.open"
@@ -8385,6 +8409,13 @@ pub fn apply_flow_poll(
 }
 
 pub fn dispatch(state: &mut AppState, command: &str) -> bool {
+    if command.starts_with("voice.") {
+        return crate::voice::dispatch(state, command);
+    }
+    if command == "modal.close" && state.voice.history_open {
+        state.voice.history_open = false;
+        return true;
+    }
     if command == "review.patch_open" {
         let start_dir = active_workspace_cwd(state);
         return spawn_file_picker(
@@ -8862,6 +8893,13 @@ pub fn dispatch(state: &mut AppState, command: &str) -> bool {
         }
         "dialog.goto_commit" => dispatch_goto_commit(state),
         "editor.find" => dispatch_editor_find(state, FindCommand::Open),
+        "editor.markdown_preview.toggle" => {
+            let pane_id = state.active_pane.0;
+            state
+                .editors
+                .get_mut(&pane_id)
+                .is_some_and(|editor| editor.toggle_markdown_preview())
+        }
         "editor.find_close" => dispatch_editor_find(state, FindCommand::Close),
         "editor.find_next" => dispatch_editor_find(state, FindCommand::Next),
         "editor.find_prev" => dispatch_editor_find(state, FindCommand::Prev),
@@ -11853,6 +11891,7 @@ pub(crate) mod tests {
             active_pane: PaneId(1),
             settings_open: false,
             settings_section: SettingsSection::Appearance,
+            voice: crate::voice::VoiceState::default(),
             flow_skill_installations: Vec::new(),
             theme: crate::theme::default_theme_id().to_string(),
             custom_theme: crate::theme::default_custom_theme(),
@@ -11996,7 +12035,7 @@ pub(crate) mod tests {
     #[test]
     fn settings_section_all_includes_agent_skills_and_updates() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         assert_eq!(all[0], SettingsSection::Appearance);
         assert_eq!(all[1], SettingsSection::Shell);
         assert_eq!(all[2], SettingsSection::Keybinds);
@@ -12004,7 +12043,8 @@ pub(crate) mod tests {
         assert_eq!(all[4], SettingsSection::Notifications);
         assert_eq!(all[5], SettingsSection::AgentSkills);
         assert_eq!(all[6], SettingsSection::Updates);
-        assert_eq!(all[7], SettingsSection::DangerZone);
+        assert_eq!(all[7], SettingsSection::Voice);
+        assert_eq!(all[8], SettingsSection::DangerZone);
     }
 
     // -- Tab mutations --------------------------------------------------------
@@ -14891,6 +14931,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_enabled_palette_action_dispatch_is_safe() {
+        for action in crate::command_palette::SAFE_ACTIONS {
+            if !action.enabled {
+                continue;
+            }
+            let dispatch = action.dispatch;
+            assert!(
+                is_palette_safe_dispatch(dispatch),
+                "palette action '{}' dispatches unsafe command '{dispatch}'",
+                action.label
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_palette_navigation_ids_must_come_from_real_snapshot_rows() {
         let mut state = two_workspace_state();
         state.palette_open = true;
@@ -15061,6 +15116,36 @@ pub(crate) mod tests {
         ));
         assert_eq!(state.palette_query, "renam>");
         assert!(state.palette_open);
+    }
+
+    #[test]
+    fn palette_query_growth_resets_selection_and_enter_launches_agent() {
+        use unshit::core::event::Key;
+        use unshit::core::shortcut::KeyCombo;
+
+        let mut state = seed_state();
+        assert!(dispatch(&mut state, "palette.toggle"));
+        // A stale index can be left behind by arrow-key navigation or mouse
+        // hover. Typing narrows the result list, so the selection must return
+        // to the first row instead of letting Enter index past the end.
+        state.palette_active = 999;
+        for ch in "agent".chars() {
+            assert!(dispatch_palette_key(
+                &mut state,
+                &KeyCombo::plain(Key::Char(ch))
+            ));
+        }
+        assert_eq!(state.palette_query, "agent");
+        assert_eq!(state.palette_active, 0);
+        let tabs_before = state.tabs.len();
+        assert!(dispatch_palette_key(
+            &mut state,
+            &KeyCombo::plain(Key::Enter)
+        ));
+
+        assert!(!state.palette_open);
+        assert_eq!(state.tabs.len(), tabs_before + 1);
+        assert!(state.pane_agents.contains_key(&state.active_pane.0));
     }
 
     #[test]
