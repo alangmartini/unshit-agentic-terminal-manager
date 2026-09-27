@@ -448,7 +448,9 @@ mod tests {
         assert_eq!(fmt, copy);
     }
 
-    // --- Integration tests (best-effort; allowed to skip on headless CI) ---
+    // --- Opt-in system clipboard tests (may skip on headless CI) ---
+    // These replace desktop clipboard contents. See CLIPBOARD_TESTS.md at the
+    // framework root for explicit commands; default test runs must not run them.
     //
     // The system clipboard is a process global, single owner resource on every
     // desktop OS.  On Windows specifically, concurrent callers of
@@ -496,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn set_content_text_roundtrip() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -508,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn set_content_html_does_not_error() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -521,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn get_html_returns_ok() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -538,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn available_formats_returns_text_after_write() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -565,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn read_image_round_trips() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -590,6 +597,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn read_image_returns_none_when_text_only() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -604,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn available_formats_includes_image_after_write() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -623,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn read_file_list_round_trips() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -644,6 +654,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn read_file_list_returns_none_when_text_only() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -657,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn available_formats_includes_file_list_after_write() {
         let _lock = clipboard_access_guard();
         let Some(ctx) = try_context() else { return };
@@ -695,6 +707,7 @@ mod tests {
     /// The loop bound is conservative so the test finishes in well under a
     /// second on developer hardware.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn concurrent_clipboard_access_does_not_corrupt_heap() {
         // Probe once while holding the guard.  If the clipboard is
         // unavailable (headless CI) we skip without touching threads at all.
