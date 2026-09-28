@@ -12813,6 +12813,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_quick_prompt_image_paste_sets_error_when_clipboard_empty() {
         // The test clipboard is uninitialized so read_image returns
         // Ok(None); the dispatch arm surfaces a friendly hint.
@@ -12852,6 +12853,7 @@ pub(crate) mod tests {
     /// copied image file like a drag-and-drop instead of falling
     /// through to the "No image on clipboard" hint.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_quick_prompt_image_paste_attaches_copied_image_file() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -14090,6 +14092,7 @@ pub(crate) mod tests {
     /// failed: no terminal in focus", making paste impossible in an
     /// editor pane. It must reach the buffer instead.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn terminal_paste_in_an_editor_pane_inserts_into_the_buffer() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -14118,6 +14121,7 @@ pub(crate) mod tests {
     /// paste must not, or a multi-line clipboard payload would collapse
     /// into one line.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn terminal_paste_in_an_editor_pane_keeps_multiple_lines() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -14136,6 +14140,7 @@ pub(crate) mod tests {
     /// Ctrl+Shift+C is a registered system binding too, so `terminal.copy`
     /// has to serve editor panes.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn terminal_copy_in_an_editor_pane_copies_the_selection() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -14514,6 +14519,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn explorer_copy_uses_context_path_instead_of_current_selection() {
         let _lock = clipboard_access_guard();
         let mut state = seed_state();
@@ -20302,6 +20308,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_paste_is_a_recognised_command() {
         // The keybind registry registers Ctrl+V / Ctrl+Shift+V to
         // dispatch this exact command name. If `dispatch` returned
@@ -20314,6 +20321,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_paste_no_terminal_in_focus_pushes_toast() {
         // No PTY is registered for the active pane in `test_state`.
         // Paste must surface a user-visible toast rather than panic
@@ -20333,6 +20341,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_paste_empty_clipboard_is_silent() {
         // Empty clipboard should not toast: a stray Ctrl+V right after
         // the user copied a non-text selection (image, file path
@@ -20400,11 +20409,9 @@ pub(crate) mod tests {
             paste_targets.contains(&"Ctrl+Shift+V"),
             "Ctrl+Shift+V must dispatch terminal.paste; got {paste_targets:?}"
         );
-        // And the dispatch handler must accept it. Together these
-        // guarantee end-to-end the keybind reaches a live arm.
-        let _lock = clipboard_access_guard();
-        let mut state = test_state();
-        assert!(dispatch(&mut state, "terminal.paste"));
+        // Dispatch is covered by the opt-in
+        // dispatch_terminal_paste_is_a_recognised_command test. Keep this
+        // registry contract test independent of the system clipboard.
     }
 
     /// Image-on-clipboard paste (Windows Terminal parity): with a bitmap
@@ -20413,6 +20420,7 @@ pub(crate) mod tests {
     /// which only fires once a non-empty payload was produced. A
     /// regression back to text-only paste would silently no-op instead.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_paste_image_clipboard_reaches_focus_check() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -20452,6 +20460,7 @@ pub(crate) mod tests {
     /// proven, like the image test above, by the "no terminal in
     /// focus" toast that only fires once a non-empty payload exists.
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_paste_file_list_clipboard_reaches_focus_check() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -20515,6 +20524,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_export_info_copies_pointer_json_and_writes_export_file() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -20563,6 +20573,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_export_info_can_target_specific_pane() {
         let _lock = clipboard_access_guard();
         let mut state = test_state();
@@ -21230,6 +21241,7 @@ mod tests_mouse_selection_copy_paste {
     // -------- dispatch_terminal_copy (via dispatch) --------
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_copy_returns_true_with_selection_and_terminal() {
         let _lock = clipboard_access_guard();
         let mut st = test_state();
@@ -21287,6 +21299,7 @@ mod tests_mouse_selection_copy_paste {
     }
 
     #[test]
+    #[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
     fn dispatch_terminal_copy_clears_selection_after_success() {
         let _lock = clipboard_access_guard();
         let mut st = test_state();
