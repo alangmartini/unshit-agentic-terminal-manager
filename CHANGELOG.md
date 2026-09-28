@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-28
+
+Voice dictation arrives: press a global shortcut in any application, speak,
+and the transcript lands on the clipboard and in a local history, or streams
+into a terminal or Codex CLI session. Markdown files open beside a live
+rendered preview, and file editors move to a tab strip of their own.
+Switching themes now recolours every surface instead of leaving Amber
+accents behind, agents launch from the command palette and from dedicated
+shortcuts, and closing an agent tab keeps you among your agents.
+
+### Added
+
+- **Voice to text.** Global shortcuts work while any application is
+  focused: `Ctrl+Alt+Space` starts and stops a recording (or hold to talk)
+  and `Ctrl+Alt+V` opens the voice history. Transcripts go to the clipboard
+  and to a local history of the latest 100 entries. An optional live mode
+  writes successive six-second chunks into the terminal or Codex CLI session
+  that was focused when recording started, without submitting a command.
+  **Settings › Voice to text** selects the microphone, shows a level meter,
+  records and plays back a test sample, runs a test transcription and
+  configures the provider: OpenAI (`gpt-4o-transcribe` by default) or a
+  custom HTTPS POST endpoint with a multipart or templated JSON body. API
+  keys are kept in the OS credential vault, raw audio is never written to
+  disk, and a recording stops after eight minutes. Both shortcuts are
+  configurable and take effect after a restart. Transcription is billed by
+  the provider; the README covers setup, privacy and cost.
+- **Markdown preview.** Markdown files open in the editor next to a live
+  rendered preview that follows edits and can be hidden or reopened from the
+  editor toolbar. Scrolling either side scrolls the other, and clicking a
+  preview heading moves the editor to that heading's source line.
+- **File tab strip.** Open file editors get their own horizontal tab strip
+  instead of sharing the terminal and agent strip. The explorer highlights
+  the hovered row immediately, with a clearer background.
+- **Agent launch shortcuts.** `Ctrl+Shift+L` starts Claude Code and
+  `Ctrl+Shift+X` starts Codex, next to `Ctrl+Shift+A` for the default agent
+  (`Shift+Cmd` on macOS). All three are editable in Settings and shown on
+  their command palette rows.
+- **macOS disk image.** `scripts/create-macos-dmg.sh` packages the app
+  bundle as a drag-to-Applications DMG, and the macOS quality gate uploads
+  it next to the zip.
+
+### Fixed
+
+- **Theme switching.** Changing the theme no longer leaves tabs, workspace
+  labels, search controls, Settings, workspace menus or the command palette
+  in Amber colours. Every catalog palette now defines all of its tokens
+  (Catppuccin was incomplete), and those surfaces read the selected theme.
+- **Launching agents from the command palette.** The *New agent*, *Claude*
+  and *Codex* palette commands now start the agent; before, they did
+  nothing. Enter also no longer seems dead after typing extends the query,
+  because the selection resets as the query grows.
+- **Sidebar scrollbar.** When the sidebar overflows only slightly, the
+  scrollbar thumb no longer fills the whole track and stands still. Thumbs
+  are sized from the visible share of the content and follow the scroll
+  position.
+- **Closing agent tabs.** Closing an agent tab, or the last agent pane in a
+  tab, now selects another agent tab instead of the adjacent terminal tab,
+  and closing a terminal tab stays among terminals the same way. Focus moves
+  to the other group only when no tab of the current group remains in the
+  workspace.
+
 ## [0.7.0] - 2026-09-22
 
 Three headline features land together: folders and files open straight from
@@ -1043,7 +1104,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.4.0...v0.5.0

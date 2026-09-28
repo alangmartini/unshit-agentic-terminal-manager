@@ -152,7 +152,7 @@ cargo build --release -p unshit-ptyd --bin unshit-ptyd
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.7.0-setup.exe`.
+The result is `dist\terminal-manager-0.8.0-setup.exe`.
 
 ## Usage
 
