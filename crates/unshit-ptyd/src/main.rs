@@ -54,6 +54,22 @@ fn main() -> ExitCode {
             let path = socket.unwrap_or_else(transport::default_socket_path);
             run_shutdown_client(&path, force)
         }
+        Ok(ParsedArgs::CheckCompatible { socket }) => {
+            let path = socket.unwrap_or_else(transport::default_socket_path);
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .and_then(|rt| {
+                    rt.block_on(unshit_ptyd::compatibility::check_running_daemon(&path))
+                });
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("unshit-ptyd: update deferred: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         Ok(ParsedArgs::Status) => {
             println!("{}", status_line());
             ExitCode::SUCCESS

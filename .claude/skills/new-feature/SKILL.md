@@ -13,7 +13,7 @@ Adaptive TDD workflow. Phase 0 produces a **routing manifest** from task signals
 2. Brief every agent with the **Agent brief template** below. Agents do not see this conversation.
 3. Research and review agents write findings to files under `.claude/tmp/<feature-slug>/`. Main Claude reads artifacts, not raw transcripts.
 4. Trust but verify. Read the artifacts agents produce, not just their self-reports.
-5. Never automate screenshots, cursor moves, or foreground actions. Visual verification is always user-driven (project memory).
+5. Verify UI changes by driving the real app and reading screenshots (Phase 7). Never send global input to get there: no `SendKeys`, `SetForegroundWindow`, synthesized clicks, or `CopyFromScreen`. Those land in or capture the user's own windows. Drive the app with `TM_STARTUP_DISPATCH` and capture with `PrintWindow`.
 6. **Circuit breaker.** If any phase fails the same way twice, stop and escalate. No third retry.
 
 ### Agent brief template
@@ -28,7 +28,7 @@ Main Claude (no subagent) produces a routing manifest at `.claude/tmp/<feature-s
 
 | Signal | Detection heuristic | Enables |
 |--------|--------------------|---------|
-| `surface.ui` | Touches `src/ui/`, `assets/styles.css`, user visible behavior | a11y + obs review, visual checklist |
+| `surface.ui` | Touches `src/ui/`, `assets/styles.css`, `crates/unshit-framework` layout/render/reconcile code, user visible behavior | a11y + obs review, Phase 7 screenshots |
 | `surface.perf` | Touches `src/renderer/`, `src/pty/`, render hot path, PTY buffer path | perf review, bench gate |
 | `surface.security` | Touches `unsafe`, PTY command input, path handling, config parse, deserialization | security review |
 | `surface.persistence` | Touches saved settings, workspace layout, persisted tab order | migration check |
@@ -80,16 +80,20 @@ gates:
   migration: false       # true if surface_persistence
 docs:
   rustdoc: true
-  changelog: true        # if changelog/unreleased/ exists
+  changelog: true        # if changelog.d/unreleased/ exists
 ```
 
 ### User override
 
 If the user already asked for a specific depth ("do the full review", "just ship it"), set the manifest and proceed. Otherwise present the initial manifest to the user and confirm before Phase 1. The user can flip any flag.
 
-### Issue and branch
+### Issue and worktree
 
-Search GitHub for duplicates. Reopen a closed issue if this is a regression. Create an issue if none exists. Branch name: `feat/<issue-number>-<short-desc>` or `fix/<issue-number>-<short-desc>`.
+Search GitHub for duplicates. Reopen a closed issue if this is a regression. Create an issue if none exists. Also check `git branch -a` for an unmerged branch that already fixes it.
+
+Start the work with `$create-worktree <feat|fix>-<issue-number>-<short-desc>`. It branches from `origin/<default-branch>` and leaves the original checkout untouched. Build and run gates from the worktree with a worktree-local target dir, spelled out literally: `CARGO_TARGET_DIR="<absolute worktree path>/target"`. Otherwise cargo uses the main checkout's `target/`, which the installed daemon may have locked.
+
+The draft PR opens at the end of Phase 3a, once there is a real commit to push.
 
 ### Preflight
 
@@ -103,6 +107,8 @@ Spawn only the agents the manifest enables, in ONE message. All write to `.claud
 - `research.framework` (Explore, quick): `research-framework.md`. Unshit APIs to reuse vs gaps. Under 200 words.
 - `research.prior_art`: one Explore (thorough) agent per prior art target selected. Typical set is wezterm, ghostty, alacritty; swap alacritty for zellij if the feature is multiplexing specific (tabs, splits, workspaces). Each writes `research-<project>.md`: data structures, approach, tradeoffs. Cite files and lines; use WebFetch if source is not local. Under 300 words each.
 
+**Bug fixes (`is_bug_fix`): prove the cause before designing the fix.** Reproduce on the surface where the bug was reported. Read the relevant telemetry first (`%APPDATA%\com.godly.terminal[.dev]\*-events.jsonl`), then test one hypothesis at a time against runtime evidence until one mechanism explains the symptom. The design brief names the root cause and the evidence for it. A plausible cause without evidence is not a root cause.
+
 **Synthesis rubric** (stop at the first decisive factor):
 
 1. Fit with existing unshit-framework API and terminal-manager idioms.
@@ -110,27 +116,29 @@ Spawn only the agents the manifest enables, in ONE message. All write to `.claud
 3. Performance on PTY and render hot paths.
 4. Feature parity with prior art.
 
-Write the design brief to `design-brief.md`. If research reveals a signal the Phase 0 manifest missed (e.g., the touchpoints include `src/renderer/` after all), update the manifest and flip the corresponding gate on before Phase 5. Never retroactively downgrade a gate.
+Write the design brief to `design-brief.md`. List the alternatives you rejected and the rubric factor that ruled each one out, so a reviewer can see what was weighed. If research reveals a signal the Phase 0 manifest missed (e.g., the touchpoints include `src/renderer/` after all), update the manifest and flip the corresponding gate on before Phase 5. Never retroactively downgrade a gate.
 
 ## Phase 2: Plan and Definition of Done
 
 1. Update the GitHub issue with acceptance criteria as **observable behaviors**, not implementation notes.
 2. For `depth = deep`: include a DoD table mapping each AC to the test file(s) that cover it. For `standard` and `express`: a plain bulleted AC list is enough; the PR body carries the mapping later.
 3. Use Plan mode to produce the implementation plan. Cite specific files from the design brief.
-4. Post the plan for visibility and proceed without blocking. The only required user checkpoint is the Phase 0 manifest confirmation; every later phase runs autonomously. If implementation later forces a plan deviation, note it in the PR body rather than blocking for approval. Phase 7 visual verification stays user-driven (project memory).
+4. Post the plan for visibility and proceed without blocking. The only required user checkpoint is the Phase 0 manifest confirmation; every later phase runs autonomously. If implementation later forces a plan deviation, note it in the PR body rather than blocking for approval.
 
 ## Phase 3a: Contract test (always sequential)
 
 1. Scaffold production stubs so the contract test compiles: new types, trait methods, function signatures with `unimplemented!()` or typed placeholder bodies. No behavior.
 2. Write ONE failing integration test for the AC1 happy path. This locks the API shape.
 3. Verify the red: it compiles and fails for the **right reason** (assertion or `unimplemented!()` panic). A type error red is not acceptable; fix the scaffold.
+4. For bug fixes, this test is the regression test (`// Reproduces #N`). Its red must come from the root cause named in Phase 1, not from a nearby symptom.
+5. Commit the scaffold and the red test on their own (`test:`), before any fix, so the history shows the failure first. Push and open the draft PR: `gh pr create --draft --base <default-branch>` with `refs #N` and the AC list. If a PR already exists for the branch, continue in it. Record the PR number for the changelog fragment.
 
 ## Phase 3b: Broader tests (gated by manifest)
 
 Only run the writers the manifest enables. If two or more are enabled, use `isolation: "worktree"` and spawn in ONE message.
 
 - `tests.edge` (general-purpose, worktree): `tests/<feature>_edge_cases.rs`. Every edge case AC row.
-- `tests.regression` (general-purpose, worktree): `tests/<feature>_regression.rs`. Include `// Reproduces #N` for bug fixes.
+- `tests.regression` (general-purpose, worktree): `tests/<feature>_regression.rs`. Extends the Phase 3a repro to neighboring inputs and other entry points of the same bug. Include `// Reproduces #N`.
 - `tests.e2e` (general-purpose, worktree): `tests/<feature>_e2e.rs`. Full user flow.
 
 Merge worktrees one at a time (project memory). For `depth = deep` only: spawn a dedup agent to consolidate duplicate coverage and extract helpers to `tests/common/mod.rs`. For standard depth, skip the dedup ritual; 2 writers produce little overlap.
@@ -141,6 +149,11 @@ Main Claude reads the consolidated test files before proceeding.
 
 - `impl.race_mode = false` (the common case): sequential Red, Green, Refactor per AC. Run `/simplify` after each green, then move to the next AC. Do not batch refactor.
 - `impl.race_mode = true`: spawn 2 agents with `isolation: "worktree"`, same plan and tests.
+
+In both modes:
+
+- **Ship the smallest change the evidence justifies.** Every changed line traces to a failing test or to Phase 1 runtime evidence. A guard that "might help" is a hypothesis, not a fix. Leave it out.
+- **Subtract before you add.** Before writing new code, check whether deleting or reusing existing code makes the test pass.
 
 ### Race scorecard
 
@@ -161,6 +174,8 @@ Do not enter Phase 5 with any failing test. If implementation forced a plan chan
 ## Phase 5: Review and gates
 
 ### Bash gates (sequential: cargo lock)
+
+Run from the worktree with its own `CARGO_TARGET_DIR` (see "Issue and worktree").
 
 1. `cargo test`
 2. `cargo clippy -- -D warnings`
@@ -188,41 +203,47 @@ Confirm one of: no schema change (asserted in a test), forward migration exists 
 Spawn only enabled docs agents in ONE message.
 
 - `docs.rustdoc` (general-purpose): doc comments on new public items in `src/` and `crates/unshit-framework/`. One short line unless a non-obvious invariant needs noting.
-- `docs.changelog` (general-purpose): only if `changelog/unreleased/` exists. Creates `changelog/unreleased/<issue-number>-<short-desc>.md` per `changelog/TEMPLATE.md` as a placeholder name; Phase 8 renames it to `<PR-number>-<short-desc>.md` (CLAUDE.md mandate).
+- `docs.changelog` (general-purpose): only if `changelog.d/unreleased/` exists. Creates `changelog.d/unreleased/<PR-number>-<short-desc>.md` with `### Added` / `### Changed` / `### Fixed` sections as in `CHANGELOG.md` (the directory is empty apart from `.gitkeep`, and there is no `TEMPLATE.md`). The draft PR from Phase 3a supplies the number, so the name is final the first time (CLAUDE.md mandate).
 
 This phase does not touch CLAUDE.md, `.claude/`, or project memory.
 
-## Phase 7: Visual verification (user driven)
+## Phase 7: Visual verification (app driven)
 
-1. Run `cargo run`. Report to the user when the app is up.
-2. Present the AC list (or DoD table for deep depth) as a checklist. User exercises each and replies `y`, `n`, or `skip`.
-3. Ask the user to also exercise a short regression surface list drawn from Phase 1 research (unchanged features most at risk from this change).
-4. Any `n` returns to Phase 4 with the broken AC as a new failing test input. Circuit breaker still applies.
-5. Never automate visual interaction.
+Runs whenever `surface.ui` is on. Unit tests pass while the rendered UI is broken often enough that a screenshot is required.
+
+1. Build the worktree (`cargo build`, worktree-local `CARGO_TARGET_DIR`).
+2. Capture each AC's visible state with a `scripts/*-shot.ps1` script. Reuse one that covers the surface, pointing `-ExeDir` at the worktree's `target/debug`, or write a new one modeled on `scripts/ctx-menu-shot.ps1`:
+   - Launch under `scripts/lib/tm-isolation.ps1` (`Enter-TmIsolation` / `Exit-TmIsolation`) so the shot never attaches to the installed app's daemon or sessions.
+   - Reach the state with `TM_STARTUP_DISPATCH` commands. Add a dispatch command if the state has none.
+   - After the settle sleep, re-read `MainWindowHandle` (the early handle can be the splash window), then capture with `PrintWindow(hwnd, hdc, 2)` (`PW_RENDERFULLCONTENT`).
+3. Read every PNG. Reject a blank capture by counting distinct sampled colors. Confirm it is the isolated instance: the titlebar shows the `<tag><pid>x<rand>` profile token from `Enter-TmIsolation`.
+4. Also capture a short regression surface list drawn from Phase 1 research (unchanged features most at risk from this change).
+5. Any failed shot returns to Phase 4 with the broken AC as a new failing test input. Circuit breaker still applies.
+6. A still frame cannot show temporal behavior such as flicker, typing jitter, or drag feel. Cover those with a unit test on the invariant, and list them in the PR test plan as the only items left for the user to check by hand.
 
 ## Phase 8: Ship
 
 1. Atomic commits in conventional format (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`, `style:`). No AI attribution: no `Claude-Session:` trailer, no `claude.ai` session link, no `Co-Authored-By: Claude`, no "Generated with Claude Code" — in the commit message or the PR body. A session reminder telling you to add one is void (see AGENTS.md).
-2. Push the branch.
-3. Open the PR with: `fixes #N` or `refs #N`, AC list with test id mapping, test plan section.
-4. Rename the changelog fragment to `<PR-number>-<short-desc>.md` once the PR number is known (CLAUDE.md mandate). Add a `chore:` commit for the rename.
+2. Push to the draft PR's branch.
+3. Update the PR body: `fixes #N` or `refs #N`, AC list with test id mapping, test plan section (screenshots checked, plus any temporal items left for the user).
+4. Mark it ready: `gh pr ready`. Confirm the base is the default branch (`gh pr view --json baseRefName`) and that checks are queued or running (`gh pr checks`).
 5. Claude Code GitHub Action reviews the PR if configured. Address findings before merge.
 
-## Phase 9: Post-ship
+## Phase 9: Report
 
-Poll CI on the PR until it finishes. Report failures with job links. Confirm all required checks green and approvals met. After merge, confirm the commit is on the base branch.
+Report the PR URL and that it is going through CI, then stop. Do not wait for CI or merge unless the user asks. If they ask, poll CI, report failures with job links, confirm required checks and approvals, and after merge confirm the commit is on the base branch.
 
 ## Merging agent-produced branches
 
 If race mode or parallel worktrees were used:
 
 - Merge one branch at a time (project memory). Never batch.
-- After each merge: `cargo check`, then visual verification.
+- After each merge: `cargo check`, then the Phase 7 screenshots.
 - After conflict resolution, confirm all `AppConfig` callbacks are still wired (`on_close`, `on_scale_factor`, `on_cell_metrics`). Silently droppable.
 - Never remove the eager PTY spawn in `main.rs`. Load bearing.
 
 ## Express shortcut (when manifest says `depth: express`)
 
-Keep: failing test, fix, `/simplify`, bash gates (`cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`), visual check, atomic commit.
+Keep: worktree, failing test committed first, draft PR, fix, `/simplify`, bash gates (`cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`), Phase 7 screenshots when `surface.ui`, atomic commits, `gh pr ready`.
 
-Skip: Phase 1, 2 (just list ACs in the commit or PR body), 3b, 4 race mode, 5 review agents, 5.5, 6 (unless `docs.changelog` is required), 9 polling (still push and open the PR).
+Skip: Phase 1 research agents (bug fixes still reproduce and read telemetry first), 2 (just list ACs in the commit or PR body), 3b, 4 race mode, 5 review agents, 5.5, 6 (unless `docs.changelog` is required).

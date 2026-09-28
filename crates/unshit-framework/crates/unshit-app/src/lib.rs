@@ -20,10 +20,10 @@ pub mod subscription;
 pub mod window;
 
 pub use app::{
-    prewarm_window_gpu, App, AppConfig, FrameMetrics, GlyphAtlasRecoveryEvent, GridAnimationHook,
-    GridTick, ScrollGridPatch, ScrollTelemetry, ScrollTelemetryCallback, ScrollTelemetryPhase,
-    ScrollTuning, StyleResolveScope, DEFAULT_SMOOTH_SCROLL_DURATION_MS,
-    DEFAULT_WHEEL_LINE_SCROLL_PX,
+    apply_scroll_fraction_patches, prewarm_window_gpu, App, AppConfig, FrameMetrics,
+    GlyphAtlasRecoveryEvent, GridAnimationHook, GridTick, ScrollFractionPatch, ScrollGridPatch,
+    ScrollTelemetry, ScrollTelemetryCallback, ScrollTelemetryPhase, ScrollTuning,
+    StyleResolveScope, DEFAULT_SMOOTH_SCROLL_DURATION_MS, DEFAULT_WHEEL_LINE_SCROLL_PX,
 };
 pub use clipboard::{ClipboardContent, ClipboardContext, ClipboardError, ClipboardFormat};
 pub use event_sink::{EventSink, ExternalEvent, SendError};

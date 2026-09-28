@@ -11,6 +11,7 @@ use unshit::core::event::{
 };
 use unshit::core::style::parse::StyleDeclaration;
 
+use super::markdown_preview;
 use crate::state::{mutate_with, PaneId, SharedState};
 
 /// Lines per PageUp/PageDown step for a viewport of `rows`.
@@ -446,6 +447,63 @@ fn build_find_bar(
     bar
 }
 
+/// Scroll the editor for one wheel event and return the paint-only patch, or
+/// `None` when the pane is gone or the event carries no delta.
+///
+/// Shift+wheel scrolls horizontally (VS Code / xterm convention) in
+/// character steps against the cell width; plain wheel scrolls whole lines
+/// against the cell height. delta_y > 0 is wheel up (toward the top of the
+/// file / start of the line). `preview_id` names an overflow container that
+/// mirrors the editor's vertical position (the Markdown preview).
+pub(super) fn wheel_scroll_patch(
+    shared: &SharedState,
+    pane_id: PaneId,
+    se: &unshit::core::event::ScrollEvent,
+    preview_id: Option<&str>,
+) -> Option<unshit::app::app::ScrollGridPatch> {
+    let horizontal = se.modifiers.contains(Modifiers::SHIFT);
+    let cell = if horizontal {
+        unshit::core::cell_grid::CellGrid::global_cell_w()
+    } else {
+        unshit::core::cell_grid::CellGrid::global_cell_h()
+    }
+    .max(1.0);
+    let units = (se.delta_y / cell).round() as isize;
+    mutate_with(shared, |st| {
+        let editor = st.editors.get_mut(&pane_id.0)?;
+        let step = if units == 0 {
+            if se.delta_y > 0.0 {
+                -1
+            } else if se.delta_y < 0.0 {
+                1
+            } else {
+                return None;
+            }
+        } else {
+            -units
+        };
+        let moved = if horizontal {
+            editor.scroll_h_by(step)
+        } else {
+            editor.scroll_by(step)
+        };
+        let scroll_fractions = preview_id
+            .filter(|_| !horizontal)
+            .map(|id| unshit::app::ScrollFractionPatch {
+                id: id.to_string(),
+                x: None,
+                y: Some(editor.scroll_fraction()),
+            })
+            .into_iter()
+            .collect();
+        Some(unshit::app::app::ScrollGridPatch {
+            grid: moved.then(|| editor.grid.clone()),
+            scroll_fractions,
+            animation: None,
+        })
+    })
+}
+
 /// Build the editor pane body. `capture_keyboard` is true for the active
 /// pane only, exactly like terminal panes.
 pub fn build_editor_pane_body(
@@ -453,6 +511,7 @@ pub fn build_editor_pane_body(
     capture_keyboard: bool,
     font_size_pt: u32,
     find: Option<&crate::state::EditorFindView>,
+    markdown: Option<&crate::markdown::MarkdownView>,
     shared: &SharedState,
     grids: &std::collections::HashMap<u32, unshit::core::cell_grid::CellGrid>,
 ) -> ElementDef {
@@ -517,49 +576,21 @@ pub fn build_editor_pane_body(
     // above stays focus-gated.
     let scroll_shared = shared.clone();
     let scroll_pane = pane_id;
+    let preview_sync_target = matches!(markdown, Some(crate::markdown::MarkdownView::Open(_)))
+        .then(|| markdown_preview::body_id(pane_id));
     grid_el = grid_el.on(
         EventType::Scroll,
         move |event: &Event| -> Option<Box<dyn std::any::Any>> {
             let Event::Scroll(se) = event else {
                 return None;
             };
-            // Shift+wheel scrolls horizontally (VS Code / xterm
-            // convention) in character steps against the cell width;
-            // plain wheel scrolls whole lines against the cell
-            // height. delta_y > 0 is wheel up (toward the top of
-            // the file / start of the line).
-            let horizontal = se.modifiers.contains(Modifiers::SHIFT);
-            let cell = if horizontal {
-                unshit::core::cell_grid::CellGrid::global_cell_w()
-            } else {
-                unshit::core::cell_grid::CellGrid::global_cell_h()
-            }
-            .max(1.0);
-            let units = (se.delta_y / cell).round() as isize;
-            let grid = mutate_with(&scroll_shared, |st| {
-                let editor = st.editors.get_mut(&scroll_pane.0)?;
-                let step = if units == 0 {
-                    if se.delta_y > 0.0 {
-                        -1
-                    } else if se.delta_y < 0.0 {
-                        1
-                    } else {
-                        return None;
-                    }
-                } else {
-                    -units
-                };
-                let moved = if horizontal {
-                    editor.scroll_h_by(step)
-                } else {
-                    editor.scroll_by(step)
-                };
-                moved.then(|| editor.grid.clone())
-            });
-            Some(Box::new(unshit::app::app::ScrollGridPatch {
-                grid,
-                animation: None,
-            }))
+            let patch = wheel_scroll_patch(
+                &scroll_shared,
+                scroll_pane,
+                se,
+                preview_sync_target.as_deref(),
+            )?;
+            Some(Box::new(patch))
         },
     );
 
@@ -640,8 +671,10 @@ pub fn build_editor_pane_body(
         })
     });
 
-    body = body.with_child(grid_el);
-    body
+    match markdown {
+        Some(view) => markdown_preview::attach(body, grid_el, view, pane_id, shared),
+        None => body.with_child(grid_el),
+    }
 }
 
 #[cfg(test)]
@@ -742,7 +775,7 @@ mod tests {
     fn editor_pane_body_renders_grid_with_content() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.classes.contains(&"pane-body".to_string()));
         assert_eq!(el.children.len(), 1);
         let grid_el = &el.children[0];
@@ -756,7 +789,7 @@ mod tests {
     fn active_editor_pane_captures_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -765,7 +798,7 @@ mod tests {
     fn inactive_editor_pane_does_not_capture_keyboard() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         assert!(!el.children[0].captures_keyboard);
         let _ = std::fs::remove_file(path);
     }
@@ -776,7 +809,7 @@ mod tests {
     fn inactive_editor_pane_still_registers_scroll_handler() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         assert!(
             el.children[0]
                 .handlers
@@ -791,7 +824,7 @@ mod tests {
     fn missing_grid_renders_empty_body() {
         let (shared, path) = shared_with_editor();
         let grids = std::collections::HashMap::new();
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert!(el.children.is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -1097,7 +1130,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1127,7 +1160,7 @@ mod tests {
     fn editor_pane_registers_mouse_handlers_even_when_inactive() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), false, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), false, 13, None, None, &shared, &grids);
         let grid_el = &el.children[0];
         assert!(
             grid_el
@@ -1306,7 +1339,7 @@ mod tests {
             Arc::new(Mutex::new(state))
         };
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         let handler = el.children[0]
             .handlers
             .iter()
@@ -1375,7 +1408,7 @@ mod tests {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
         let view = find_view("row 1", "2 of 11");
-        let el = build_editor_pane_body(PaneId(1), true, 13, Some(&view), &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, Some(&view), None, &shared, &grids);
 
         assert_eq!(el.children.len(), 2, "bar, then grid");
         let bar = &el.children[0];
@@ -1397,7 +1430,7 @@ mod tests {
     fn find_bar_is_absent_when_no_search_is_open() {
         let (shared, path) = shared_with_editor();
         let grids = grids_for(&shared);
-        let el = build_editor_pane_body(PaneId(1), true, 13, None, &shared, &grids);
+        let el = build_editor_pane_body(PaneId(1), true, 13, None, None, &shared, &grids);
         assert_eq!(el.children.len(), 1);
         let _ = std::fs::remove_file(path);
     }

@@ -456,6 +456,18 @@ impl Session {
         matches!(child.try_wait(), Ok(None))
     }
 
+    /// Retirement requires confirmed exit. A failed query or poisoned lock
+    /// is not permission to drop a child that may still be doing work.
+    pub(super) fn child_exit_confirmed(&self) -> bool {
+        let Some(pty) = self.pty.as_ref() else {
+            return true;
+        };
+        let Ok(mut child) = pty.child.lock() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
+
     pub fn cols(&self) -> u16 {
         self.cols
     }
@@ -835,6 +847,27 @@ mod tests {
         assert_eq!(session.name(), None);
 
         session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_requires_confirmed_exit_even_with_poisoned_child_lock() {
+        let (mut session, _token, _rx) =
+            Session::spawn(3, 80, 24, None, Some(test_shell()), &[], 0, 0, None)
+                .expect("spawn session");
+        assert!(!session.child_exit_confirmed());
+        let child = session.pty.as_ref().unwrap().child.clone();
+        let poison = child.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison the fixture child lock");
+        })
+        .join()
+        .is_err());
+        let confirmed = session.child_exit_confirmed();
+        child.clear_poison();
+        session.kill();
+        assert!(!confirmed, "an uninspectable child must prevent retirement");
+        assert!(session.child_exit_confirmed());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

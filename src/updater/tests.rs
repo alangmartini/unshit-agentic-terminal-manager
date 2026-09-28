@@ -330,26 +330,16 @@ fn downloaded(dir: &Path) -> feed::Downloaded {
 }
 
 #[test]
-fn handoff_persists_launches_then_stops_daemon_and_requests_exit() {
+fn handoff_persists_launches_and_preserves_daemon_before_exit() {
     let mut state = state_with(Some(InstallScope::CurrentUser));
     apply_check_result(&mut state, CheckSource::Manual, Ok(newer()));
     let dir = std::env::temp_dir();
     let mut launched: Option<(PathBuf, Vec<String>)> = None;
-    let mut daemon_stopped = false;
-    let exit_now = finish_install_with(
-        &mut state,
-        &downloaded(&dir),
-        |installer, args| {
-            launched = Some((installer.to_path_buf(), args.to_vec()));
-            Ok(777)
-        },
-        |_st| {
-            daemon_stopped = true;
-            Ok(())
-        },
-    );
+    let exit_now = finish_install_with(&mut state, &downloaded(&dir), |installer, args| {
+        launched = Some((installer.to_path_buf(), args.to_vec()));
+        Ok(777)
+    });
     assert!(exit_now);
-    assert!(daemon_stopped);
     assert_eq!(state.update.phase, UpdatePhase::Installing);
     let (installer, args) = launched.expect("installer launched");
     assert!(installer.ends_with("terminal-manager-99.0.0-setup.exe"));
@@ -358,24 +348,24 @@ fn handoff_persists_launches_then_stops_daemon_and_requests_exit() {
     assert!(args.contains(&"/SELFUPDATE=1".to_string()));
     assert!(args.contains(&format!("/PARENTPID={}", std::process::id())));
     assert!(args.iter().any(|a| a.starts_with("/RELAUNCH=")));
+    assert!(args.contains(&format!(
+        "/DAEMONSOCKET={}",
+        crate::ptyd_socket_path().display()
+    )));
     assert!(args
         .iter()
         .any(|a| a.starts_with("/LOG=") && a.ends_with("terminal-manager-99.0.0-setup.log")));
 }
 
 #[test]
-fn handoff_still_exits_when_the_daemon_refuses_to_stop() {
+fn handoff_preserves_machine_install_scope() {
     let mut state = state_with(Some(InstallScope::AllUsers));
     apply_check_result(&mut state, CheckSource::Manual, Ok(newer()));
-    let exit_now = finish_install_with(
-        &mut state,
-        &downloaded(&std::env::temp_dir()),
-        |_, args| {
+    let exit_now =
+        finish_install_with(&mut state, &downloaded(&std::env::temp_dir()), |_, args| {
             assert!(args.contains(&"/ALLUSERS".to_string()));
             Ok(1)
-        },
-        |_| Err(io::Error::new(io::ErrorKind::TimedOut, "no reply")),
-    );
+        });
     assert!(
         exit_now,
         "the installer relaunches the old build on failure"
@@ -386,18 +376,10 @@ fn handoff_still_exits_when_the_daemon_refuses_to_stop() {
 fn handoff_aborts_without_exiting_when_the_installer_cannot_start() {
     let mut state = state_with(Some(InstallScope::CurrentUser));
     apply_check_result(&mut state, CheckSource::Manual, Ok(newer()));
-    let mut daemon_touched = false;
-    let exit_now = finish_install_with(
-        &mut state,
-        &downloaded(&std::env::temp_dir()),
-        |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "blocked")),
-        |_| {
-            daemon_touched = true;
-            Ok(())
-        },
-    );
+    let exit_now = finish_install_with(&mut state, &downloaded(&std::env::temp_dir()), |_, _| {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "blocked"))
+    });
     assert!(!exit_now);
-    assert!(!daemon_touched, "sessions untouched when the launch fails");
     assert_eq!(state.update.phase, UpdatePhase::Failed);
     assert!(state.update.status_line().contains("could not be started"));
 }
@@ -406,12 +388,9 @@ fn handoff_aborts_without_exiting_when_the_installer_cannot_start() {
 fn handoff_refuses_unmanaged_copies() {
     let mut state = state_with(None);
     apply_check_result(&mut state, CheckSource::Manual, Ok(newer()));
-    let exit_now = finish_install_with(
-        &mut state,
-        &downloaded(&std::env::temp_dir()),
-        |_, _| panic!("must not launch"),
-        |_| panic!("must not stop the daemon"),
-    );
+    let exit_now = finish_install_with(&mut state, &downloaded(&std::env::temp_dir()), |_, _| {
+        panic!("must not launch")
+    });
     assert!(!exit_now);
     assert_eq!(state.update.phase, UpdatePhase::Failed);
 }

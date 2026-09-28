@@ -1,3 +1,6 @@
+//! System clipboard tests are opt-in because they replace desktop clipboard
+//! contents. See `CLIPBOARD_TESTS.md` at the framework root for explicit commands.
+
 use std::sync::{Mutex, OnceLock};
 use unshit_app::clipboard::{ClipboardContext, ClipboardError};
 
@@ -26,6 +29,7 @@ fn skip_if_unavailable(ctx: &ClipboardContext) -> bool {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn write_then_read_roundtrip() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -39,6 +43,7 @@ fn write_then_read_roundtrip() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn empty_clipboard_returns_empty_string() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -52,6 +57,7 @@ fn empty_clipboard_returns_empty_string() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn unicode_cjk() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -66,6 +72,7 @@ fn unicode_cjk() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn unicode_emoji() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -80,6 +87,7 @@ fn unicode_emoji() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn unicode_rtl() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -94,6 +102,7 @@ fn unicode_rtl() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn clipboard_error_does_not_panic() {
     // Use the shared context to avoid concurrent initialization issues.
     // Even if the clipboard is unavailable, calling methods should return
@@ -107,6 +116,7 @@ fn clipboard_error_does_not_panic() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn overwrite_replaces_previous_content() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;
@@ -121,6 +131,7 @@ fn overwrite_replaces_previous_content() {
 }
 
 #[test]
+#[ignore = "uses the system clipboard; run explicitly in a disposable desktop session"]
 fn clear_after_write_empties_clipboard() {
     let guard = shared_ctx().lock().unwrap();
     let ctx = *guard;

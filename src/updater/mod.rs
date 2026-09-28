@@ -14,10 +14,9 @@
 //! 3. **Install** (`update.install`) downloads the `*-setup.exe` asset into
 //!    the profile's data dir, verifies size and SHA-256 against the feed's
 //!    digest, persists the layout with every tab intact, launches the
-//!    installer silently, shuts the session daemon down (Inno refuses in-use
-//!    files, and the daemon binary is replaced too) and exits. The installer
-//!    waits for this pid to leave, installs, and relaunches the app, which
-//!    restores the layout and spawns fresh shells for every pane.
+//!    installer silently and exits. The daemon keeps its sessions alive. The
+//!    installer checks compatibility, installs the new daemon alongside the
+//!    old one, replaces the UI and relaunches it to reattach to those sessions.
 //!
 //! Threads never hold the state lock across network or disk I/O; they lock
 //! only to apply a result and then ask the window for a rebuild. Every step
@@ -782,26 +781,18 @@ fn record_download_completed(state: &mut AppState, downloaded: &feed::Downloaded
     telemetry::record(&record);
 }
 
-/// Production hand-off: real installer launch, real daemon shutdown.
+/// Production hand-off. Updating the UI never stops the session daemon.
 fn finish_install(state: &mut AppState, downloaded: &feed::Downloaded) -> bool {
-    finish_install_with(state, downloaded, install::launch_installer, |st| {
-        st.pty_manager.shutdown_daemon_blocking(true)
-    })
+    finish_install_with(state, downloaded, install::launch_installer)
 }
 
-/// Persist the layout, launch the installer, stop the daemon. Returns `true`
-/// when the process must exit now so the installer can replace the files.
-///
-/// Order matters: the layout is saved first with every tab intact (this is
-/// what the relaunch restores); the installer is started before the daemon
-/// goes down so a launch failure leaves the sessions untouched; and a daemon
-/// that refuses to stop is only logged, since the installer then fails on
-/// the in-use binary and relaunches this same version, which reattaches.
+/// Persist the layout and launch the installer. Returns `true` when the UI
+/// must exit. The installer preflights the target release's protocol support
+/// before replacing files and relaunches the UI even if installation fails.
 pub fn finish_install_with(
     state: &mut AppState,
     downloaded: &feed::Downloaded,
     launch: impl FnOnce(&Path, &[String]) -> io::Result<u32>,
-    shutdown_daemon: impl FnOnce(&mut AppState) -> io::Result<()>,
 ) -> bool {
     let Some(scope) = state.update.install_scope else {
         fail_install(
@@ -826,7 +817,11 @@ pub fn finish_install_with(
 
     let relaunch = std::env::current_exe().unwrap_or_default();
     let log_path = install::log_path_for(&downloaded.path);
-    let args = install::installer_args(scope, std::process::id(), &relaunch, &log_path);
+    let mut args = install::installer_args(scope, std::process::id(), &relaunch, &log_path);
+    args.push(format!(
+        "/DAEMONSOCKET={}",
+        crate::ptyd_socket_path().display()
+    ));
     let installer_pid = match launch(&downloaded.path, &args) {
         Ok(pid) => pid,
         Err(error) => {
@@ -849,19 +844,9 @@ pub fn finish_install_with(
         .map(|release| release.version.to_string());
     telemetry::record(&record);
 
-    match shutdown_daemon(state) {
-        Ok(()) => {
-            let mut record = new_record("update.daemon_shutdown", "info", state);
-            record.outcome = Some("ok");
-            telemetry::record(&record);
-        }
-        Err(error) => {
-            let mut record = new_record("update.daemon_shutdown", "warn", state);
-            record.outcome = Some("failed");
-            record.error_kind = Some(io_error_kind(&error));
-            telemetry::record(&record);
-        }
-    }
+    let mut record = new_record("update.daemon_preserved", "info", state);
+    record.outcome = Some("running");
+    telemetry::record(&record);
 
     let mut record = new_record("update.exiting", "info", state);
     record.pid = Some(std::process::id());

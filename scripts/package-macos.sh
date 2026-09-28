@@ -145,6 +145,48 @@ cp "$daemon_binary" "$stage_bundle/Contents/MacOS/unshit-ptyd"
 cp "$repo_root/packaging/macos/Info.plist" "$stage_bundle/Contents/Info.plist"
 cp "$repo_root/LICENSE" "$stage_bundle/Contents/Resources/LICENSE"
 
+# Stamp the crate version into the staged bundle. The checked-in Info.plist
+# only holds a placeholder; shipped unchanged, every release would report the
+# same version in Finder and the About panel. `cargo pkgid` prints
+# `path+file:///...#terminal-manager@0.6.1` (or `#0.6.1` when the package name
+# matches the directory name), so the version is the text after the last `#`
+# and `@`. A version that does not parse aborts the build rather than
+# shipping the placeholder.
+pkgid="$(cargo pkgid -p terminal-manager)"
+version="${pkgid##*#}"
+version="${version##*@}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+	echo "error: could not read the crate version from cargo pkgid output: $pkgid" >&2
+	exit 1
+fi
+
+# Replace the <string> that follows each of the two version keys. Plain awk so
+# the step also runs where plutil is unavailable; plutil -lint below validates
+# the result on macOS.
+stamp_plist_version() {
+	local plist="$1" version="$2" tmp="$1.tmp"
+	if ! awk -v version="$version" '
+		stamp {
+			if (sub(/<string>[^<]*<\/string>/, "<string>" version "</string>")) { stamped++ }
+			stamp = 0
+		}
+		/<key>(CFBundleShortVersionString|CFBundleVersion)<\/key>/ { stamp = 1 }
+		{ print }
+		END {
+			if (stamped != 2) {
+				print "error: stamped " stamped + 0 " version strings in Info.plist, expected 2" > "/dev/stderr"
+				exit 1
+			}
+		}
+	' "$plist" > "$tmp"; then
+		rm -f -- "$tmp"
+		exit 1
+	fi
+	mv -- "$tmp" "$plist"
+}
+stamp_plist_version "$stage_bundle/Contents/Info.plist" "$version"
+echo "Bundle version: $version"
+
 make_icns() {
 	local source_png iconset size double
 	if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; then

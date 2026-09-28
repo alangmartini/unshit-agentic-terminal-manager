@@ -1,5 +1,6 @@
 pub mod build;
 pub mod cell_grid;
+mod cell_metrics;
 pub mod cursor;
 pub mod damage;
 pub mod dirty;

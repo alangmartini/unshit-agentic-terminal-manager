@@ -21,7 +21,7 @@
     install   like settings, then `update.install`: the app downloads the
               stand-in, verifies it, persists the layout, launches the
               stand-in installer with the silent hand-off switches, shuts its
-              isolated daemon down and exits. The script asserts the exit, the
+              UI down and exits while the isolated daemon keeps running. The script asserts the exit, the
               telemetry chain in update-events.jsonl and that workspaces.json
               still carries the tab. Nothing is installed: hostname.exe just
               prints and exits.
@@ -234,11 +234,11 @@ try {
         Write-Host 'install mode without digest OK: refused before download, app still running, reason captured in Settings'
     } elseif ($Mode -eq 'install') {
         $lines = @(Get-Content $events)
-        foreach ($needle in '"event":"update.check_completed"', '"event":"update.download_completed"', '"event":"update.layout_persisted"', '"event":"update.install_launched"', '"event":"update.daemon_shutdown"', '"event":"update.exiting"') {
+        foreach ($needle in '"event":"update.check_completed"', '"event":"update.download_completed"', '"event":"update.layout_persisted"', '"event":"update.install_launched"', '"event":"update.daemon_preserved"', '"event":"update.exiting"') {
             if (-not ($lines | Where-Object { $_ -like "*$needle*" })) { throw "install mode: telemetry is missing $needle" }
         }
-        if (-not ($lines | Where-Object { $_ -like '*"event":"update.daemon_shutdown"*"outcome":"ok"*' })) {
-            throw 'install mode: the daemon shutdown did not report outcome ok'
+        if (-not ($lines | Where-Object { $_ -like '*"event":"update.daemon_preserved"*"outcome":"running"*' })) {
+            throw 'install mode: the daemon preservation did not report outcome running'
         }
         $ws = Join-Path $isolation.ConfigDir 'workspaces.json'
         $persisted = Get-Content -LiteralPath $ws -Raw | ConvertFrom-Json

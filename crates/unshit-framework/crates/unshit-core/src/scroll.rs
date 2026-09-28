@@ -88,7 +88,6 @@ pub const SCROLLBAR_WIDTH: f32 = 12.0;
 pub const SCROLLBAR_INSET: f32 = 0.0;
 pub const SCROLLBAR_BUTTON_SIZE: f32 = 18.0;
 pub const MIN_THUMB_SIZE: f32 = 24.0;
-pub const THUMB_SIZE_SCALE: f32 = 1.16;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -431,9 +430,10 @@ pub fn compute_scrollbar_geometry(
         let length = (container_h - if has_horizontal { SCROLLBAR_WIDTH } else { 0.0 }).max(0.0);
         let button_size = SCROLLBAR_BUTTON_SIZE.min(length / 3.0);
         let visual_track_h = length - button_size * 2.0;
-        let thumb_h = (container_h / content_max_y * container_h * THUMB_SIZE_SCALE)
-            .max(MIN_THUMB_SIZE)
-            .min(visual_track_h);
+        // Size against the usable track, excluding the arrow buttons. Inflating
+        // this ratio can fill the track while content still overflows.
+        let thumb_h =
+            (container_h / content_max_y * visual_track_h).max(MIN_THUMB_SIZE).min(visual_track_h);
         let track_h = visual_track_h;
         let thumb_y_offset = scroll_ratio * (track_h - thumb_h);
 
@@ -466,9 +466,8 @@ pub fn compute_scrollbar_geometry(
         let length = (container_w - if has_vertical { SCROLLBAR_WIDTH } else { 0.0 }).max(0.0);
         let button_size = SCROLLBAR_BUTTON_SIZE.min(length / 3.0);
         let visual_track_w = length - button_size * 2.0;
-        let thumb_w = (container_w / content_max_x * container_w * THUMB_SIZE_SCALE)
-            .max(MIN_THUMB_SIZE)
-            .min(visual_track_w);
+        let thumb_w =
+            (container_w / content_max_x * visual_track_w).max(MIN_THUMB_SIZE).min(visual_track_w);
         let track_w = visual_track_w;
         let thumb_x_offset = scroll_ratio * (track_w - thumb_w);
 
@@ -745,6 +744,51 @@ mod visual_state_tests {
 
         assert!(hover_alpha > resting);
         assert!(drag_alpha > hover_alpha);
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::element::{Element, LayoutRect, Tag};
+
+    #[test]
+    fn slightly_overflowing_content_has_proportional_moving_thumbs() {
+        for axis in [ScrollbarAxis::Vertical, ScrollbarAxis::Horizontal] {
+            let mut arena = NodeArena::new();
+            let mut container = Element::new(Tag::Div);
+            container.layout_rect = LayoutRect { x: 0.0, y: 0.0, width: 1000.0, height: 1000.0 };
+            container.computed_style.overflow_x = Overflow::Scroll;
+            container.computed_style.overflow_y = Overflow::Scroll;
+            let container = arena.alloc(container);
+            let mut content = Element::new(Tag::Div);
+            content.layout_rect = LayoutRect { x: 0.0, y: 0.0, width: 1100.0, height: 1100.0 };
+            let content = arena.alloc(content);
+            arena.append_child(container, content);
+
+            for offset in [0.0, 50.0, 100.0] {
+                set_scroll_position(&mut arena, container, offset, offset);
+                let (vertical, horizontal) =
+                    compute_scrollbar_geometry(&arena, container, 0.0, 0.0);
+                let (geom, track, thumb, position, start) = match axis {
+                    ScrollbarAxis::Vertical => {
+                        let g = vertical.unwrap();
+                        (g, g.track_h, g.thumb_h, g.thumb_y, g.track_y)
+                    }
+                    ScrollbarAxis::Horizontal => {
+                        let g = horizontal.unwrap();
+                        (g, g.track_w, g.thumb_w, g.thumb_x, g.track_x)
+                    }
+                };
+                assert!(thumb < track, "overflow must leave room for thumb movement: {axis:?}");
+                assert!((thumb / track - 1000.0 / 1100.0).abs() < 0.0001);
+                let expected = start + offset / geom.max_scroll * (track - thumb);
+                assert!((position - expected).abs() < 0.001);
+                let drag =
+                    ScrollbarDrag { node_id: container, axis, grab_offset: 0.0, geometry: geom };
+                assert!((scroll_from_drag(&drag, position) - offset).abs() < 0.001);
+            }
+        }
     }
 }
 

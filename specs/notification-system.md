@@ -14,6 +14,11 @@ Acceptance criteria:
 - `terminal-manager notify --title "..." --text "..."` sends a notification request to the running terminal-manager process.
 - When called from a managed terminal, the request automatically includes `TM_WORKSPACE_ID`, `TM_PANE_ID`, and `TM_NOTIFY_SOCKET`.
 - The app shows a bottom-right card containing the notification title and text.
+- A provider lifecycle hook can request the same card without trusting arbitrary
+  hook input: the request must carry the unguessable capability injected into the
+  originating PTY, and only an allowlisted event/title/message is forwarded.
+- The horizontal tab strip and the vertical workspace/agent row blink for the
+  originating pane until that pane receives focus.
 - Clicking the in-app card focuses the originating workspace and terminal.
 - The app also emits a desktop notification; on Windows, clicking it sends an activation request back to the app and focuses the originating workspace and terminal.
 - Activation requests wake and focus the terminal-manager window when supported by winit.
@@ -38,6 +43,7 @@ Acceptance criteria:
 - `src/main.rs` -> CLI routing, notification subscription registration, external activation handling
 - `src/state.rs` -> targeted notification toast metadata and focus mutation
 - `src/ui/toasts.rs` -> bottom-right titled notification card rendering
+- `src/agent_restore/hooks.rs` -> consent-gated Claude Code/Codex lifecycle-hook installation
 - `assets/styles.css` -> notification card styling
 - `crates/unshit-ptyd/src/session/mod.rs` -> PTY child environment variables
 - `crates/unshit-framework/crates/unshit-app/src/event_sink.rs` and `app.rs` -> app window activation event
@@ -66,6 +72,8 @@ Conventions:
 - Unit-test notification socket path override behavior.
 - Unit-test PTY child environment construction.
 - Unit-test targeted notification insertion and activation focus behavior.
+- Unit-test provider hook installation/removal, payload allowlisting, and
+  attention-state clearing.
 - Unit-test UI card rendering for title and body.
 - Run focused crate tests plus formatting/build checks.
 
@@ -84,7 +92,11 @@ Conventions:
 3. Extend PTY session spawn environment with `TM_WORKSPACE_ID`, `TM_PANE_ID`, and `TM_NOTIFY_SOCKET`.
 4. Extend toast state/view rendering to support optional title and workspace/pane target metadata.
 5. Add app window activation event support to the framework event loop.
-6. Verify with focused unit tests, `cargo fmt --check`, and `cargo build -p terminal-manager`.
+6. Install separate notification hooks from Settings: Claude Code uses `Stop`
+   and `Notification`; Codex uses `Stop` and `PermissionRequest`. Hooks made for
+   other harnesses can call the generic `notify` command because OpenRouter,
+   Gemini, OpenCode, Aider, and Copilot have no shared lifecycle-hook contract.
+7. Verify with focused unit tests, `cargo fmt --check`, and `cargo build -p terminal-manager`.
 
 ## Tasks
 - [ ] Add spec and notification module.

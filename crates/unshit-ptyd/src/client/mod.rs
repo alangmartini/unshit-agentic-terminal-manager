@@ -139,6 +139,12 @@ impl Client {
             .await
     }
 
+    /// v3 only: retire without affecting live sessions or another UI client.
+    pub async fn retire_if_idle(&mut self) -> Result<Response, ProtocolError> {
+        let id = self.alloc_id();
+        self.roundtrip(Request::RetireIfIdle { id }, id).await
+    }
+
     /// Sends a Shutdown that kills every live session first. Used by
     /// test/script cleanup where the daemon is ephemeral by design.
     pub async fn shutdown_force(&mut self) -> Result<Response, ProtocolError> {

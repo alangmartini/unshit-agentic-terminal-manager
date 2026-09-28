@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, Mutex};
 
@@ -30,6 +30,16 @@ pub struct EnsuredSession {
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<u64, Session>>,
     next_id: AtomicU64,
+    stopping: AtomicBool,
+    connections: AtomicUsize,
+}
+
+pub struct ConnectionGuard<'a>(&'a SessionRegistry);
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl SessionRegistry {
@@ -39,7 +49,60 @@ impl SessionRegistry {
             // Ids start at 1. Zero is reserved as a sentinel for "no
             // session" in future slices.
             next_id: AtomicU64::new(1),
+            stopping: AtomicBool::new(false),
+            connections: AtomicUsize::new(0),
         }
+    }
+
+    pub async fn register_connection(&self) -> std::io::Result<ConnectionGuard<'_>> {
+        let _guard = self.sessions.lock().await;
+        self.check_accepting()?;
+        self.connections.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionGuard(self))
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    fn check_accepting(&self) -> std::io::Result<()> {
+        if self.is_stopping() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "daemon is retiring",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn begin_shutdown(&self, force: bool) -> Result<(), String> {
+        self.stop(force, false).await
+    }
+
+    pub async fn begin_retirement(&self) -> Result<(), String> {
+        self.stop(false, true).await
+    }
+
+    async fn stop(&self, force: bool, retire: bool) -> Result<(), String> {
+        // The same lock gates Spawn, Ensure and new connections. Once we
+        // accept, no request can create a session between the check and exit.
+        let mut guard = self.sessions.lock().await;
+        // A broken output reader must not make a still-running child eligible
+        // for retirement. Only child exit (or explicit kill) makes it safe.
+        let alive = guard
+            .values()
+            .filter(|session| !session.child_exit_confirmed())
+            .count();
+        if !force && alive > 0 {
+            return Err(format!("{alive} sessions alive"));
+        }
+        if retire && self.connections.load(Ordering::SeqCst) > 1 {
+            return Err("another client is connected".to_string());
+        }
+        self.stopping.store(true, Ordering::SeqCst);
+        guard.clear();
+        Ok(())
     }
 
     /// Allocates the next monotonic id. Saturating; never wraps to zero.
@@ -106,6 +169,7 @@ impl SessionRegistry {
         restore_correlation_id: Option<&str>,
     ) -> std::io::Result<(u64, AttachmentToken, String, mpsc::Receiver<Vec<u8>>)> {
         let mut guard = self.sessions.lock().await;
+        self.check_accepting()?;
         if guard.values().any(|session| {
             session.workspace_id() == workspace_id
                 && session.pane_id() == pane_id
@@ -187,6 +251,7 @@ impl SessionRegistry {
         restore_correlation_id: Option<&str>,
     ) -> std::io::Result<EnsuredSession> {
         let mut guard = self.sessions.lock().await;
+        self.check_accepting()?;
         let matching_live: Vec<u64> = guard
             .iter()
             .filter_map(|(&id, session)| {
@@ -449,6 +514,47 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_shutdown_prevents_both_session_creation_paths() {
+        let reg = SessionRegistry::new();
+        assert_eq!(reg.begin_shutdown(false).await, Ok(()));
+        let error = reg
+            .spawn(80, 24, None, None, &[], 1, 1, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        let result = reg.ensure(80, 24, None, None, &[], 1, 1, None, 0).await;
+        assert!(matches!(result, Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted));
+        assert!(reg.is_empty().await);
+        assert!(reg.register_connection().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_racing_spawn_never_accepts_both() {
+        use std::sync::Arc;
+        for _ in 0..8 {
+            let reg = Arc::new(SessionRegistry::new());
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let shutdown_reg = reg.clone();
+            let shutdown_barrier = barrier.clone();
+            let shutdown = tokio::spawn(async move {
+                shutdown_barrier.wait().await;
+                shutdown_reg.begin_shutdown(false).await
+            });
+            barrier.wait().await;
+            let spawn = reg
+                .spawn(80, 24, None, Some(test_shell()), &[], 1, 1, None)
+                .await;
+            let shutdown = shutdown.await.unwrap();
+            assert!(!(shutdown.is_ok() && spawn.is_ok()));
+            if shutdown.is_err() {
+                assert!(!reg.is_stopping(), "refusal must leave the daemon usable");
+                assert!(reg.register_connection().await.is_ok());
+            }
+            reg.kill_all().await;
+        }
+    }
 
     #[tokio::test]
     async fn next_id_is_monotonic_starting_at_one() {

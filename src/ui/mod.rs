@@ -7,6 +7,7 @@ pub mod explorer;
 pub mod flow_pane;
 pub mod fps_overlay;
 pub mod icons;
+pub mod markdown_preview;
 pub mod process_details;
 pub mod settings;
 pub mod sidebar;

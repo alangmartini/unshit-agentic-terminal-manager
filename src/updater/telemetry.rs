@@ -18,7 +18,7 @@
 //! `update.download_started`, `update.download_completed`,
 //! `update.download_failed`, `update.layout_persisted`,
 //! `update.install_launched`, `update.install_failed`,
-//! `update.daemon_shutdown`, `update.exiting`, `update.stale_downloads_removed`,
+//! `update.daemon_preserved`, `update.exiting`, `update.stale_downloads_removed`,
 //! `update.worker_spawn_failed`.
 
 use std::path::PathBuf;
