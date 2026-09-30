@@ -8,10 +8,7 @@ use serde_json::{json, Value};
 use super::AgentKind;
 
 const MANAGED_STATUS: &str = "Terminal Manager agent recovery";
-const MANAGED_NOTIFICATION_STATUS: &str = "Terminal Manager agent notifications";
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
-const CLAUDE_NOTIFICATION_MATCHER: &str =
-    "permission_prompt|idle_prompt|agent_needs_input|agent_completed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEdit {
@@ -44,14 +41,6 @@ pub fn install_managed_hooks() -> HookInstallReport {
 
 pub fn uninstall_managed_hooks() -> HookInstallReport {
     manage_default_hooks(uninstall_managed_hooks_at)
-}
-
-pub fn install_agent_notification_hooks() -> HookInstallReport {
-    manage_default_hooks(install_agent_notification_hooks_at)
-}
-
-pub fn uninstall_agent_notification_hooks() -> HookInstallReport {
-    manage_default_hooks(uninstall_agent_notification_hooks_at)
 }
 
 fn manage_default_hooks(
@@ -89,20 +78,8 @@ pub fn install_managed_hooks_at(
     codex_hooks: &Path,
 ) -> HookInstallReport {
     HookInstallReport {
-        claude: edit_hook_file(
-            claude_settings,
-            AgentKind::Claude,
-            executable,
-            HookPurpose::Recovery,
-            false,
-        ),
-        codex: edit_hook_file(
-            codex_hooks,
-            AgentKind::Codex,
-            executable,
-            HookPurpose::Recovery,
-            false,
-        ),
+        claude: edit_hook_file(claude_settings, AgentKind::Claude, executable, false),
+        codex: edit_hook_file(codex_hooks, AgentKind::Codex, executable, false),
     }
 }
 
@@ -112,80 +89,15 @@ pub fn uninstall_managed_hooks_at(
     codex_hooks: &Path,
 ) -> HookInstallReport {
     HookInstallReport {
-        claude: edit_hook_file(
-            claude_settings,
-            AgentKind::Claude,
-            executable,
-            HookPurpose::Recovery,
-            true,
-        ),
-        codex: edit_hook_file(
-            codex_hooks,
-            AgentKind::Codex,
-            executable,
-            HookPurpose::Recovery,
-            true,
-        ),
+        claude: edit_hook_file(claude_settings, AgentKind::Claude, executable, true),
+        codex: edit_hook_file(codex_hooks, AgentKind::Codex, executable, true),
     }
-}
-
-pub fn install_agent_notification_hooks_at(
-    executable: &Path,
-    claude_settings: &Path,
-    codex_hooks: &Path,
-) -> HookInstallReport {
-    HookInstallReport {
-        claude: edit_hook_file(
-            claude_settings,
-            AgentKind::Claude,
-            executable,
-            HookPurpose::Notification,
-            false,
-        ),
-        codex: edit_hook_file(
-            codex_hooks,
-            AgentKind::Codex,
-            executable,
-            HookPurpose::Notification,
-            false,
-        ),
-    }
-}
-
-pub fn uninstall_agent_notification_hooks_at(
-    executable: &Path,
-    claude_settings: &Path,
-    codex_hooks: &Path,
-) -> HookInstallReport {
-    HookInstallReport {
-        claude: edit_hook_file(
-            claude_settings,
-            AgentKind::Claude,
-            executable,
-            HookPurpose::Notification,
-            true,
-        ),
-        codex: edit_hook_file(
-            codex_hooks,
-            AgentKind::Codex,
-            executable,
-            HookPurpose::Notification,
-            true,
-        ),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HookPurpose {
-    Recovery,
-    Notification,
 }
 
 fn edit_hook_file(
     path: &Path,
     agent: AgentKind,
     executable: &Path,
-    purpose: HookPurpose,
     remove: bool,
 ) -> io::Result<HookEdit> {
     let _edit_lock = HookEditLock::acquire(path)?;
@@ -199,23 +111,10 @@ fn edit_hook_file(
         Some(bytes) => serde_json::from_slice::<Value>(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     };
-    let changed = match (purpose, remove) {
-        (HookPurpose::Recovery, true) => {
-            remove_owned_event_hook(&mut document, agent, purpose, "SessionStart")?
-        }
-        (HookPurpose::Recovery, false) => {
-            merge_owned_recovery_hook(&mut document, agent, executable)?
-        }
-        (HookPurpose::Notification, true) => {
-            let mut changed = false;
-            for event in notification_events(agent) {
-                changed |= remove_owned_event_hook(&mut document, agent, purpose, event)?;
-            }
-            changed
-        }
-        (HookPurpose::Notification, false) => {
-            merge_owned_notification_hooks(&mut document, agent, executable)?
-        }
+    let changed = if remove {
+        remove_owned_session_start_hook(&mut document, agent)?
+    } else {
+        merge_owned_session_start_hook(&mut document, agent, executable)?
     };
     if !changed {
         return Ok(HookEdit::Unchanged);
@@ -399,12 +298,12 @@ fn unlock_file(file: &File) -> io::Result<()> {
     file.unlock()
 }
 
-fn merge_owned_recovery_hook(
+fn merge_owned_session_start_hook(
     document: &mut Value,
     agent: AgentKind,
     executable: &Path,
 ) -> io::Result<bool> {
-    let desired = desired_handler(agent, executable, HookPurpose::Recovery);
+    let desired = desired_handler(agent, executable);
     let groups = session_start_groups_mut(document)?;
 
     let mut owned = Vec::new();
@@ -415,7 +314,7 @@ fn merge_owned_recovery_hook(
             .and_then(Value::as_array)
             .ok_or_else(wrong_hook_shape)?;
         for (hook_index, hook) in hooks.iter().enumerate() {
-            if is_owned_handler(hook, agent, HookPurpose::Recovery) {
+            if is_owned_handler(hook, agent) {
                 owned.push((group_index, hook_index));
             }
         }
@@ -435,7 +334,7 @@ fn merge_owned_recovery_hook(
         }
     }
 
-    remove_owned_from_groups(groups, agent, HookPurpose::Recovery)?;
+    remove_owned_from_groups(groups, agent)?;
     groups.push(json!({
         "matcher": SESSION_START_MATCHER,
         "hooks": [desired]
@@ -443,60 +342,7 @@ fn merge_owned_recovery_hook(
     Ok(true)
 }
 
-fn merge_owned_notification_hooks(
-    document: &mut Value,
-    agent: AgentKind,
-    executable: &Path,
-) -> io::Result<bool> {
-    let mut changed = false;
-    let desired = desired_handler(agent, executable, HookPurpose::Notification);
-    for event in notification_events(agent) {
-        let groups = event_groups_mut(document, event)?;
-        let mut owned = Vec::new();
-        for (group_index, group) in groups.iter().enumerate() {
-            let object = group.as_object().ok_or_else(wrong_hook_shape)?;
-            let hooks = object
-                .get("hooks")
-                .and_then(Value::as_array)
-                .ok_or_else(wrong_hook_shape)?;
-            for (hook_index, hook) in hooks.iter().enumerate() {
-                if is_owned_handler(hook, agent, HookPurpose::Notification) {
-                    owned.push((group_index, hook_index));
-                }
-            }
-        }
-        if let [(group_index, hook_index)] = owned.as_slice() {
-            let group = groups[*group_index]
-                .as_object()
-                .expect("validated group object");
-            let hooks = group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .expect("validated hooks array");
-            if group.get("matcher").and_then(Value::as_str) == notification_matcher(agent, event)
-                && hooks[*hook_index] == desired
-            {
-                continue;
-            }
-        }
-
-        remove_owned_from_groups(groups, agent, HookPurpose::Notification)?;
-        let mut group = json!({ "hooks": [desired] });
-        if let Some(matcher) = notification_matcher(agent, event) {
-            group["matcher"] = Value::String(matcher.to_string());
-        }
-        groups.push(group);
-        changed = true;
-    }
-    Ok(changed)
-}
-
-fn remove_owned_event_hook(
-    document: &mut Value,
-    agent: AgentKind,
-    purpose: HookPurpose,
-    event: &str,
-) -> io::Result<bool> {
+fn remove_owned_session_start_hook(document: &mut Value, agent: AgentKind) -> io::Result<bool> {
     let Some(root) = document.as_object_mut() else {
         return Err(wrong_hook_shape());
     };
@@ -506,34 +352,26 @@ fn remove_owned_event_hook(
     let Some(hooks) = hooks.as_object_mut() else {
         return Err(wrong_hook_shape());
     };
-    let Some(groups) = hooks.get_mut(event) else {
+    let Some(groups) = hooks.get_mut("SessionStart") else {
         return Ok(false);
     };
     let groups = groups.as_array_mut().ok_or_else(wrong_hook_shape)?;
-    remove_owned_from_groups(groups, agent, purpose)
+    remove_owned_from_groups(groups, agent)
 }
 
-fn remove_owned_from_groups(
-    groups: &mut Vec<Value>,
-    agent: AgentKind,
-    purpose: HookPurpose,
-) -> io::Result<bool> {
+fn remove_owned_from_groups(groups: &mut Vec<Value>, agent: AgentKind) -> io::Result<bool> {
     let mut changed = false;
     let mut rebuilt = Vec::with_capacity(groups.len());
     for mut group in groups.drain(..) {
         let object = group.as_object_mut().ok_or_else(wrong_hook_shape)?;
-        let matcher_is_managed = match purpose {
-            HookPurpose::Recovery => {
-                object.get("matcher").and_then(Value::as_str) == Some(SESSION_START_MATCHER)
-            }
-            HookPurpose::Notification => is_managed_notification_matcher(agent, object),
-        };
+        let matcher_is_managed =
+            object.get("matcher").and_then(Value::as_str) == Some(SESSION_START_MATCHER);
         let hooks = object
             .get_mut("hooks")
             .and_then(Value::as_array_mut)
             .ok_or_else(wrong_hook_shape)?;
         let before = hooks.len();
-        hooks.retain(|hook| !is_owned_handler(hook, agent, purpose));
+        hooks.retain(|hook| !is_owned_handler(hook, agent));
         let removed = hooks.len() != before;
         changed |= removed;
         let dedicated_managed_group = removed
@@ -549,10 +387,6 @@ fn remove_owned_from_groups(
 }
 
 fn session_start_groups_mut(document: &mut Value) -> io::Result<&mut Vec<Value>> {
-    event_groups_mut(document, "SessionStart")
-}
-
-fn event_groups_mut<'a>(document: &'a mut Value, event: &str) -> io::Result<&'a mut Vec<Value>> {
     let root = document.as_object_mut().ok_or_else(wrong_hook_shape)?;
     if !root.contains_key("hooks") {
         root.insert("hooks".into(), json!({}));
@@ -561,106 +395,64 @@ fn event_groups_mut<'a>(document: &'a mut Value, event: &str) -> io::Result<&'a 
         .get_mut("hooks")
         .and_then(Value::as_object_mut)
         .ok_or_else(wrong_hook_shape)?;
-    if !hooks.contains_key(event) {
-        hooks.insert(event.into(), json!([]));
+    if !hooks.contains_key("SessionStart") {
+        hooks.insert("SessionStart".into(), json!([]));
     }
     hooks
-        .get_mut(event)
+        .get_mut("SessionStart")
         .and_then(Value::as_array_mut)
         .ok_or_else(wrong_hook_shape)
 }
 
-fn notification_events(agent: AgentKind) -> &'static [&'static str] {
-    match agent {
-        AgentKind::Claude => &["Stop", "Notification"],
-        AgentKind::Codex => &["Stop", "PermissionRequest"],
-    }
-}
-
-fn notification_matcher(agent: AgentKind, event: &str) -> Option<&'static str> {
-    match (agent, event) {
-        (AgentKind::Claude, "Notification") => Some(CLAUDE_NOTIFICATION_MATCHER),
-        _ => None,
-    }
-}
-
-fn is_managed_notification_matcher(
-    agent: AgentKind,
-    object: &serde_json::Map<String, Value>,
-) -> bool {
-    let Some(matcher) = object.get("matcher").and_then(Value::as_str) else {
-        return false;
-    };
-    notification_events(agent)
-        .iter()
-        .any(|event| notification_matcher(agent, event) == Some(matcher))
-}
-
-fn desired_handler(agent: AgentKind, executable: &Path, purpose: HookPurpose) -> Value {
+fn desired_handler(agent: AgentKind, executable: &Path) -> Value {
     let executable = executable.to_string_lossy();
-    let (command_name, status) = match purpose {
-        HookPurpose::Recovery => ("session-hook", MANAGED_STATUS),
-        HookPurpose::Notification => ("agent-notify", MANAGED_NOTIFICATION_STATUS),
-    };
     match agent {
         AgentKind::Claude => json!({
             "type": "command",
             "command": executable,
-            "args": [command_name, "claude"],
+            "args": ["session-hook", "claude"],
             "timeout": 5,
-            "statusMessage": status,
-            "async": purpose == HookPurpose::Notification
+            "statusMessage": MANAGED_STATUS
         }),
         AgentKind::Codex => json!({
             "type": "command",
-            "command": format!("{} {command_name} codex", posix_quote(&executable)),
-            "commandWindows": format!(
-                "& {} {command_name} codex",
-                powershell_quote(&executable)
-            ),
+            "command": format!("{} session-hook codex", posix_quote(&executable)),
+            "commandWindows": format!("& {} session-hook codex", powershell_quote(&executable)),
             "timeout": 5,
-            "statusMessage": status,
-            "async": purpose == HookPurpose::Notification
+            "statusMessage": MANAGED_STATUS
         }),
     }
 }
 
-fn is_owned_handler(value: &Value, agent: AgentKind, purpose: HookPurpose) -> bool {
+fn is_owned_handler(value: &Value, agent: AgentKind) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    let expected_status = match purpose {
-        HookPurpose::Recovery => MANAGED_STATUS,
-        HookPurpose::Notification => MANAGED_NOTIFICATION_STATUS,
-    };
     if object.get("type").and_then(Value::as_str) != Some("command")
-        || object.get("statusMessage").and_then(Value::as_str) != Some(expected_status)
+        || object.get("statusMessage").and_then(Value::as_str) != Some(MANAGED_STATUS)
     {
         return false;
     }
-    let command_name = match purpose {
-        HookPurpose::Recovery => "session-hook",
-        HookPurpose::Notification => "agent-notify",
-    };
     match agent {
         AgentKind::Claude => object
             .get("args")
             .and_then(Value::as_array)
             .is_some_and(|args| {
-                args.len() == 2
-                    && args[0].as_str() == Some(command_name)
-                    && args[1].as_str() == Some("claude")
+                args == &vec![
+                    Value::String("session-hook".into()),
+                    Value::String("claude".into()),
+                ]
             }),
         AgentKind::Codex => {
-            let suffix = format!(" {command_name} codex");
+            let suffix = " session-hook codex";
             object
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|command| command.ends_with(suffix.as_str()))
+                .is_some_and(|command| command.ends_with(suffix))
                 || object
                     .get("commandWindows")
                     .and_then(Value::as_str)
-                    .is_some_and(|command| command.ends_with(suffix.as_str()))
+                    .is_some_and(|command| command.ends_with(suffix))
         }
     }
 }
@@ -736,48 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn notification_hooks_install_and_remove_independently_from_recovery() {
-        let (executable, claude, codex) = fixture("notifications");
-        let recovery = install_managed_hooks_at(&executable, &claude, &codex);
-        assert!(recovery.all_succeeded());
-        let notifications = install_agent_notification_hooks_at(&executable, &claude, &codex);
-        assert!(notifications.all_succeeded());
-        let repeat = install_agent_notification_hooks_at(&executable, &claude, &codex);
-        assert_eq!(repeat.changed_count(), 0);
-
-        let claude_value: Value =
-            serde_json::from_slice(&std::fs::read(&claude).expect("claude")).expect("json");
-        assert!(claude_value["hooks"]["Stop"][0]["hooks"][0]
-            .as_object()
-            .expect("handler")
-            .contains_key("async"));
-        assert_eq!(
-            claude_value["hooks"]["Notification"][0]["matcher"],
-            CLAUDE_NOTIFICATION_MATCHER
-        );
-        let codex_value: Value =
-            serde_json::from_slice(&std::fs::read(&codex).expect("codex")).expect("json");
-        assert!(codex_value["hooks"]["Stop"].is_array());
-        assert!(codex_value["hooks"]["PermissionRequest"].is_array());
-
-        let removed = uninstall_agent_notification_hooks_at(&executable, &claude, &codex);
-        assert!(removed.all_succeeded());
-        let claude_after: Value =
-            serde_json::from_slice(&std::fs::read(&claude).expect("claude")).expect("json");
-        let codex_after: Value =
-            serde_json::from_slice(&std::fs::read(&codex).expect("codex")).expect("json");
-        assert!(claude_after["hooks"]["SessionStart"].is_array());
-        assert!(codex_after["hooks"]["SessionStart"].is_array());
-        assert!(!serde_json::to_string(&claude_after)
-            .expect("claude body")
-            .contains(MANAGED_NOTIFICATION_STATUS));
-        assert!(!serde_json::to_string(&codex_after)
-            .expect("codex body")
-            .contains(MANAGED_NOTIFICATION_STATUS));
-        let _ = std::fs::remove_dir_all(executable.parent().unwrap().parent().unwrap());
-    }
-
-    #[test]
     fn malformed_json_is_never_overwritten() {
         let (executable, claude, codex) = fixture("malformed");
         std::fs::create_dir_all(claude.parent().expect("parent")).expect("parent");
@@ -794,7 +544,7 @@ mod tests {
     #[test]
     fn codex_commands_quote_spaces_and_apostrophes_for_both_shells() {
         let (executable, _, _) = fixture("quote");
-        let handler = desired_handler(AgentKind::Codex, &executable, HookPurpose::Notification);
+        let handler = desired_handler(AgentKind::Codex, &executable);
         let posix = handler["command"].as_str().expect("posix");
         let windows = handler["commandWindows"].as_str().expect("windows");
         assert!(posix.starts_with('\''));
