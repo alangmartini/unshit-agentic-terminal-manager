@@ -149,12 +149,10 @@ The Windows installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo
 ```powershell
 cargo build --release -p terminal-manager --bin terminal-manager
 cargo build --release -p unshit-ptyd --bin unshit-ptyd
-& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.8.1 packaging\terminal-manager.iss
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" packaging\terminal-manager.iss
 ```
 
-The result is `dist\terminal-manager-0.8.1-setup.exe`. Use the application version from `Cargo.toml` for `MyAppVersion`.
-
-Stable `vX.Y.Z` tags integrated into `main` also build on the Beelink and publish the installer and changelog automatically; see [Automatic Windows releases](docs/DEVELOPMENT.md#automatic-windows-releases).
+The result is `dist\terminal-manager-0.8.0-setup.exe`.
 
 ## Usage
 

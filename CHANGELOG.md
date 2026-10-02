@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Stable release tags integrated into the default branch now build the Windows
-  installer on the Beelink and publish it to GitHub Releases with changelog
-  notes and a SHA-256 checksum. A manual dry run validates packaging without
-  publishing.
-
 ## [0.8.1] - 2026-10-02
 
 ### Fixed
