@@ -69,11 +69,20 @@ jobs:
           }
           $toolchainBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
-      - name: Validate, test and package Windows
+        with:
+          cache-workspace-crates: true
+          cache-bin: false
+      - name: Validate release version and changelog
         env:
           RELEASE_REF: ${{ matrix.ref }}
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/windows-release.ps1
+        run: scripts/ci/windows-release.ps1 -Stage Prepare
+      - name: Test application, daemon and terminal core
+        run: cargo test --locked -p terminal-manager -p unshit-ptyd -p unshit-terminal-core --no-fail-fast -- --test-threads=1
+      - name: Build Windows release executables
+        run: cargo build --locked --release -p terminal-manager --bin terminal-manager -p unshit-ptyd --bin unshit-ptyd
+      - name: Package Windows installer
+        run: scripts/ci/windows-release.ps1 -Stage Package
       - uses: actions/upload-artifact@v4
         with:
           name: windows-release-${{ matrix.ref }}

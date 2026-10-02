@@ -61,8 +61,8 @@ isolated `CARGO_HOME` as the quality gate, preserving the developer's tools.
    git push origin vX.Y.Z
    ```
 3. The pipeline checks that the tag belongs to the default branch and matches
-   the Cargo version. It verifies the rendered changelog, runs serial Windows
-   tests, builds both executables, and compiles the
+   the Cargo version. It verifies the rendered changelog, runs serial tests for
+   the application, daemon and terminal core, builds both executables, and compiles the
    installer with the tag's version passed to Inno Setup.
 4. CI uploads the installer, `SHA256SUMS.txt` and release notes as an Actions
    artifact. It creates a draft GitHub Release, uploads the installer and
@@ -76,6 +76,11 @@ merges create different commits: tag the resulting default-branch revision.
 Existing published releases are never overwritten. A failed upload leaves a
 draft; rerunning the workflow completes it. Concurrent tag/merge events are
 serialized per tag. Tags and versioned changelog sections must remain immutable.
+
+Validation, tests, release compilation and installer packaging appear as separate
+steps. Workspace build artifacts are cached to avoid recompiling unchanged local
+crates. The release job does not rerun the framework-wide test suite; cold Rust
+builds can still take longer than cached builds.
 
 For verification without publishing, run `Windows Release` manually with
 `ref=main` and `dry_run=true`. To retry publication, select an existing release
