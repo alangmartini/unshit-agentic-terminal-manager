@@ -5109,8 +5109,7 @@ impl ApplicationHandler for AppHandler {
 
                     // Fallback: when focus is on a non-capturing, non-editable element
                     // (e.g., a sidebar entry or a button that was just clicked), route
-                    // ordinary typing to any element that declares captures_keyboard.
-                    // Control activation and Tab navigation keep the current focus.
+                    // keyboard events to any element that declares captures_keyboard.
                     // This lets users type into a terminal pane immediately after
                     // clicking UI that switches to it, without a second click.
                     if !focused_captures {
