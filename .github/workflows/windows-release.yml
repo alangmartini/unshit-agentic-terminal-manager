@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.ref }}
+          ref: ${{ startsWith(matrix.ref, 'v') && format('refs/tags/{0}', matrix.ref) || matrix.ref }}
           fetch-depth: 0
       - name: Use the runner's stable Rust toolchain
         run: |

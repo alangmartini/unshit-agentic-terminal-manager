@@ -26,8 +26,9 @@ def select(event_name, event):
         dry_run = str(event["inputs"].get("dry_run", "true")).lower() == "true"
         if not TAG.fullmatch(ref) and not (dry_run and ref == branch):
             raise ValueError("Use vX.Y.Z, or the default branch for a dry run")
-        git("rev-parse", "--verify", f"{ref}^{{commit}}")
-        if not on_default(ref, branch):
+        revision = f"refs/tags/{ref}" if TAG.fullmatch(ref) else f"origin/{branch}"
+        git("rev-parse", "--verify", f"{revision}^{{commit}}")
+        if not on_default(revision, branch):
             raise ValueError("Release commit must belong to the default branch")
         return [{"ref": ref, "dry_run": dry_run}]
     if event.get("deleted"):
@@ -46,7 +47,7 @@ def select(event_name, event):
     return [
         {"ref": tag, "dry_run": False}
         for tag in git("tag", "--list", "v*").splitlines()
-        if TAG.fullmatch(tag) and git("rev-parse", f"{tag}^{{commit}}") in integrated
+        if TAG.fullmatch(tag) and git("rev-parse", f"refs/tags/{tag}^{{commit}}") in integrated
     ]
 
 
