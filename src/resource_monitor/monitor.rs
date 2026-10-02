@@ -577,7 +577,10 @@ mod tests {
             {"profile":"wrong-agent","executable":"codex"}
         ]}"#).unwrap();
         let observations = observe_agents(&sessions, &table, &owner, &names, &rules, |pid| {
-            assert_eq!(pid, 20, "query only the custom runtime");
+            if pid == 10 {
+                return Some("codex.exe".into());
+            }
+            assert_eq!(pid, 20, "query only Codex and the custom runtime");
             Some(r#"deno run "C:\tools\agent.ts" --prompt text"#.into())
         });
         assert_eq!(observations[0].profile.as_deref(), Some("codex"));
@@ -588,13 +591,68 @@ mod tests {
             &owner,
             &names,
             &crate::agents::rules::DetectionRules::default(),
-            |_| panic!("no runtime needs a query"),
+            |pid| {
+                assert_eq!(pid, 10);
+                Some("codex.exe".into())
+            },
         );
         assert_eq!(observations[0].profile.as_deref(), Some("codex"));
         assert_eq!(
             observations[1].profile, None,
             "removing the rule clears custom detection"
         );
+    }
+
+    #[test]
+    fn npm_desktop_app_with_codex_server_stays_a_terminal() {
+        let sessions = [SessionRoot {
+            pid: 10,
+            pane_id: Some(1),
+            session_id: 100,
+        }];
+        // zsh -> npm start -> node -> Electron -> codex app-server
+        let table: Vec<_> = (10..=14)
+            .map(|pid| tree::ProcessRecord {
+                pid,
+                parent_pid: pid - 1,
+            })
+            .collect();
+        let names = HashMap::from([
+            (10, "zsh".into()),
+            (11, "npm start".into()),
+            (12, "node".into()),
+            (13, "Electron".into()),
+            (14, "codex".into()),
+        ]);
+        let owner = tree::attribute(&table, &HashSet::from([10]), |_| None);
+        let rules = crate::agents::rules::DetectionRules::default();
+        for mode in ["app-server", "mcp-server", "resume"] {
+            let observations =
+                observe_agents(&sessions, &table, &owner, &names, &rules, |pid| match pid {
+                    12 => Some("node dist/scripts/start-direct.cjs .".into()),
+                    14 => Some(format!("codex {mode}")),
+                    _ => panic!("unexpected command query: {pid}"),
+                });
+            assert_eq!(observations.len(), 1);
+            assert_eq!(
+                observations[0].profile.as_deref(),
+                (mode == "resume").then_some("codex"),
+                "{mode}"
+            );
+            let mut state = seed_state();
+            // A successful negative scan also repairs an earlier false tag.
+            crate::state::classify_pane_process(&mut state, 1, Some("codex"));
+            crate::state::classify_pane_process(&mut state, 1, observations[0].profile.as_deref());
+            let snapshot = state.ui_snapshot();
+            assert_eq!(
+                snapshot.workspaces[0].agent_entries.len(),
+                usize::from(mode == "resume")
+            );
+            assert_eq!(
+                snapshot.workspaces[0].terminal_entries.len(),
+                usize::from(mode != "resume")
+            );
+        }
     }
 
     #[test]
