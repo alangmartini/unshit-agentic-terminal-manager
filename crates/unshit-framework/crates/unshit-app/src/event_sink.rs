@@ -7,6 +7,9 @@ use winit::event_loop::EventLoopProxy;
 
 /// Opaque event type that external sources push into the framework.
 pub enum ExternalEvent {
+    /// Deliver a terminal bell through the application's configured bell
+    /// policy without rebuilding the element tree.
+    Bell,
     /// Request a full tree rebuild + re-render.
     RequestRebuild,
     /// Rebuild, then reveal an element by id after its new layout is available.
@@ -197,6 +200,12 @@ impl EventSink {
         self.send(ExternalEvent::Bytes(data))
     }
 
+    /// Deliver a terminal bell through the application's configured bell
+    /// policy. Bell delivery requests a redraw but never a tree rebuild.
+    pub fn bell(&self) -> Result<(), SendError> {
+        self.send(ExternalEvent::Bell)
+    }
+
     /// Minimize the application window.
     pub fn minimize_window(&self) -> Result<(), SendError> {
         self.send(ExternalEvent::MinimizeWindow)
@@ -244,6 +253,15 @@ mod tests {
     fn bytes_variant_constructs() {
         let data: Arc<[u8]> = Arc::from(b"hello".as_ref());
         let _event = ExternalEvent::Bytes(data);
+    }
+
+    #[test]
+    fn bell_enqueues_bell_event() {
+        let (sink, rx) = make_sink();
+
+        sink.bell().unwrap();
+
+        assert!(matches!(rx.try_recv().unwrap(), ExternalEvent::Bell));
     }
 
     #[test]

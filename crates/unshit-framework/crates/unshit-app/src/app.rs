@@ -453,6 +453,10 @@ pub struct App {
     render_tier_preference: RenderTierPreference,
     tree_fn: Box<dyn Fn() -> ElementTree>,
     state: Option<AppState>,
+    /// Optional callback invoked whenever the native window focus changes.
+    /// Kept on `App` rather than `AppConfig` so adding this hook does not
+    /// require every existing configuration literal to grow a new field.
+    window_focus_callback: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     event_tx: flume::Sender<ExternalEvent>,
     event_rx: flume::Receiver<ExternalEvent>,
     proxy_cell: Arc<OnceLock<EventLoopProxy>>,
@@ -830,6 +834,19 @@ fn reveal_element_by_id(state: &mut AppState, id: &str) {
     };
     if state.smooth_scroll.is_some_and(|animation| animation.node_id == container) {
         state.smooth_scroll = None;
+    }
+}
+
+/// Deliver one bell through the configured bell policy. Bell delivery only
+/// requests a repaint; it never marks the element tree for rebuilding.
+fn fire_bell(state: &mut AppState) {
+    if state.bell_state.try_bell() {
+        if state.bell_state.should_request_attention() {
+            state.window.request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
+        }
+        // Visual bell overlay is rendered by the frame loop when
+        // bell_state.visual_bell_active is true.
+        state.window.request_redraw();
     }
 }
 
@@ -2737,6 +2754,7 @@ impl App {
             render_tier_preference: RenderTierPreference::Auto,
             tree_fn: Box::new(tree_fn),
             state: None,
+            window_focus_callback: None,
             // Placeholder interval: the display's refresh rate is not
             // known until the window exists. `can_create_surfaces`
             // rebuilds the waker with the true period before any
@@ -2815,6 +2833,13 @@ impl App {
         }
     }
 
+    /// Register a callback invoked whenever the native window gains or loses
+    /// focus. This is intentionally an `App`-level setter so existing
+    /// [`AppConfig`] literals remain source-compatible.
+    pub fn set_window_focus_callback(&mut self, callback: Arc<dyn Fn(bool) + Send + Sync>) {
+        self.window_focus_callback = Some(callback);
+    }
+
     /// Return a fresh snapshot of the input latency histograms.
     ///
     /// Returns `None` before the event loop starts (no [`AppState`] yet)
@@ -2842,16 +2867,7 @@ impl App {
     /// silently suppressed.
     pub fn bell(&mut self) {
         if let Some(ref mut state) = self.state {
-            if state.bell_state.try_bell() {
-                if state.bell_state.should_request_attention() {
-                    state
-                        .window
-                        .request_user_attention(Some(AttentionUrgency::Informational.to_winit()));
-                }
-                // Visual bell overlay is rendered by the frame loop when
-                // bell_state.visual_bell_active is true.
-                state.window.request_redraw();
-            }
+            fire_bell(state);
         }
     }
 
@@ -3361,6 +3377,15 @@ impl AppHandler {
                 // worth the risk, and the swap will redo layout anyway.
                 self.show_splash();
             }
+            WindowEvent::Focused(focused) => {
+                let changed = unshit_core::cell_grid::CellGrid::is_window_focused() != focused;
+                unshit_core::cell_grid::CellGrid::set_window_focused(focused);
+                if changed {
+                    if let Some(ref callback) = self.app.window_focus_callback {
+                        callback(focused);
+                    }
+                }
+            }
             // Keystrokes and the modifier state they depend on, kept in
             // arrival order and replayed once there is something to route
             // them to. Everything else -- pointer motion, focus, hover -- is
@@ -3796,6 +3821,12 @@ impl ApplicationHandler for AppHandler {
         coalescer.begin_drain();
         for event in self.event_rx.try_iter() {
             match event {
+                ExternalEvent::Bell => {
+                    fire_bell(state);
+                    // A bell changes renderer state (and may request window
+                    // attention) but never changes the element tree.
+                    coalescer.observe(false);
+                }
                 ExternalEvent::RequestRebuild => {
                     coalescer.observe(true);
                 }
@@ -4978,6 +5009,18 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Focused(focused) => {
+                let changed = unshit_core::cell_grid::CellGrid::is_window_focused() != focused;
+                unshit_core::cell_grid::CellGrid::set_window_focused(focused);
+                if changed {
+                    if let Some(ref callback) = self.app.window_focus_callback {
+                        callback(focused);
+                    }
+                }
+                // Cursor masking/blink phase depends on the global focus
+                // state, so make the change visible immediately without a
+                // tree rebuild.
+                state.window.request_redraw();
+
                 if !matches!(defer_surface_metrics_from_window(state), SurfaceMetricsChange::None) {
                     state.window.request_redraw();
                 }
@@ -5066,7 +5109,8 @@ impl ApplicationHandler for AppHandler {
 
                     // Fallback: when focus is on a non-capturing, non-editable element
                     // (e.g., a sidebar entry or a button that was just clicked), route
-                    // keyboard events to any element that declares captures_keyboard.
+                    // ordinary typing to any element that declares captures_keyboard.
+                    // Control activation and Tab navigation keep the current focus.
                     // This lets users type into a terminal pane immediately after
                     // clicking UI that switches to it, without a second click.
                     if !focused_captures {

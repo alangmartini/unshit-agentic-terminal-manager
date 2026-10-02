@@ -5511,7 +5511,10 @@ fn expand_agents_subtab_for_pane(state: &mut AppState, pane_id: u32) {
     }
 }
 
-fn workspace_num_for_pane(state: &AppState, pane_id: u32) -> Option<u32> {
+/// Return the stable workspace id that owns `pane_id`, including panes in
+/// inactive workspaces. Bridge-side terminal events use this to target a
+/// notification at the pane that emitted it rather than the active workspace.
+pub fn workspace_num_for_pane(state: &AppState, pane_id: u32) -> Option<u32> {
     let active_contains = state
         .panes
         .iter()

@@ -167,6 +167,7 @@ mod tests {
             grid,
             scrollback,
             mouse_modes: Default::default(),
+            focus_reporting_1004: false,
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         assert!(

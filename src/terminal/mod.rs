@@ -21,6 +21,13 @@ pub mod telemetry;
 /// Maximum number of scrollback lines retained per terminal.
 const MAX_SCROLLBACK: usize = 10_000;
 
+/// Maximum number of terminal-originated notification signals retained until
+/// the UI bridge drains them.
+const MAX_PENDING_TERMINAL_SIGNALS: usize = 32;
+
+/// Maximum UTF-8 payload accepted for an OSC 9 notification.
+const MAX_OSC9_PAYLOAD_BYTES: usize = 4096;
+
 /// High-bit namespace for the overscan row's stable line id in
 /// [`Terminal::display_grid`] snapshots. The id is derived from the
 /// overscan line's absolute index so an unchanged overscan row keeps its
@@ -38,6 +45,17 @@ fn preview_bytes(bytes: &[u8], limit: usize) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+/// A notification signal emitted by the terminal's PTY stream.
+///
+/// These signals are kept separate from rendered terminal text: BEL and OSC
+/// 9 are consumed by the parser and surfaced to the UI bridge without writing
+/// control bytes into the cell grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalSignal {
+    Bell,
+    Osc9(String),
 }
 
 /// Terminal emulator state.
@@ -62,7 +80,7 @@ pub struct Terminal {
     fg: Color,
     bg: Color,
     attrs: CellAttrs,
-    parser: vte::Parser,
+    parser: vte::Parser<8192>,
     rows: usize,
     cols: usize,
     title: String,
@@ -128,12 +146,18 @@ pub struct Terminal {
     /// see a real terminal and pick their full-feature rendering path
     /// instead of falling back to a defensive minimal layout.
     pending_response: Vec<u8>,
+    /// Terminal-originated notification signals waiting for the UI bridge.
+    pending_signals: VecDeque<TerminalSignal>,
     synchronized_output_active: bool,
     /// Whether the running program enabled bracketed paste mode via
     /// DECSET 2004 (`CSI ? 2004 h`). When set, pasted text should be
     /// wrapped in `ESC[200~` / `ESC[201~` so readline/editors can tell
     /// a paste from typed input. Reset by `CSI ? 2004 l`.
     bracketed_paste: bool,
+    /// Whether the program requested focus-in/focus-out reports through
+    /// DECSET 1004. Codex uses these reports to decide whether its default
+    /// `unfocused` notification policy should emit a bell.
+    focus_reporting_1004: bool,
     /// Which DEC private mouse-reporting modes the running program has
     /// enabled: `1000` (button press/release), `1002` (button + drag),
     /// `1003` (any motion). When any is set the program wants to receive
@@ -402,7 +426,7 @@ impl Terminal {
             fg: default_fg(),
             bg: default_bg(),
             attrs: CellAttrs::empty(),
-            parser: vte::Parser::new(),
+            parser: vte::Parser::<8192>::new_with_size(),
             rows,
             cols,
             title: String::new(),
@@ -420,8 +444,10 @@ impl Terminal {
             scroll_top: 0,
             scroll_bot: rows,
             pending_response: Vec::new(),
+            pending_signals: VecDeque::new(),
             synchronized_output_active: false,
             bracketed_paste: false,
+            focus_reporting_1004: false,
             mouse_report_1000: false,
             mouse_report_1002: false,
             mouse_report_1003: false,
@@ -437,6 +463,62 @@ impl Terminal {
     /// PTY back to the running TUI.
     pub fn take_pending_response(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response)
+    }
+
+    /// Drain terminal-originated notification signals in PTY wire order.
+    pub fn take_pending_signals(&mut self) -> Vec<TerminalSignal> {
+        std::mem::take(&mut self.pending_signals)
+            .into_iter()
+            .collect()
+    }
+
+    fn queue_signal(&mut self, signal: TerminalSignal) {
+        if self.pending_signals.len() >= MAX_PENDING_TERMINAL_SIGNALS {
+            self.pending_signals.pop_front();
+        }
+        self.pending_signals.push_back(signal);
+    }
+
+    /// Queue an OSC 9 notification while preserving semicolons in the
+    /// payload. The VTE parser presents semicolon-separated OSC fields as
+    /// individual slices, so fields after the command are joined back with
+    /// their separators before UTF-8 validation.
+    fn queue_osc9(&mut self, params: &[&[u8]]) {
+        if params.len() < 2 {
+            return;
+        }
+
+        let payload_parts = &params[1..];
+        let mut payload_len = 0usize;
+        for (index, part) in payload_parts.iter().enumerate() {
+            if index > 0 {
+                payload_len = match payload_len.checked_add(1) {
+                    Some(length) if length <= MAX_OSC9_PAYLOAD_BYTES => length,
+                    _ => return,
+                };
+            }
+            payload_len = match payload_len.checked_add(part.len()) {
+                Some(length) if length <= MAX_OSC9_PAYLOAD_BYTES => length,
+                _ => return,
+            };
+        }
+
+        // Empty OSC 9 messages do not carry useful notification content.
+        if payload_len == 0 {
+            return;
+        }
+
+        let mut payload = Vec::with_capacity(payload_len);
+        for (index, part) in payload_parts.iter().enumerate() {
+            if index > 0 {
+                payload.push(b';');
+            }
+            payload.extend_from_slice(part);
+        }
+
+        if let Ok(payload) = String::from_utf8(payload) {
+            self.queue_signal(TerminalSignal::Osc9(payload));
+        }
     }
 
     pub fn synchronized_output_active(&self) -> bool {
@@ -721,6 +803,7 @@ impl Terminal {
         self.mouse_report_1002 = snapshot.mouse_modes.report_1002;
         self.mouse_report_1003 = snapshot.mouse_modes.report_1003;
         self.mouse_sgr = snapshot.mouse_modes.sgr;
+        self.focus_reporting_1004 = snapshot.focus_reporting_1004;
         self.mouse_wheel_accum = 0.0;
         self.scrollback.reserve(snapshot.scrollback.len());
         for line in &snapshot.scrollback {
@@ -1236,6 +1319,12 @@ impl Terminal {
     /// (Claude Code, vim, fzf) can only be scrolled through this path.
     pub fn mouse_reporting_active(&self) -> bool {
         self.mouse_report_1000 || self.mouse_report_1002 || self.mouse_report_1003
+    }
+
+    /// Whether the program requested terminal focus reports through DECSET
+    /// 1004. The bridge sends `CSI I`/`CSI O` only while this is enabled.
+    pub fn focus_reporting_active(&self) -> bool {
+        self.focus_reporting_1004
     }
 
     /// Whether the alternate screen buffer (DECSET 47/1047/1049) is
@@ -2026,8 +2115,8 @@ impl<'a> Perform for Performer<'a> {
                 t.clear_pending_wrap();
                 t.cursor_col = t.cursor_col.saturating_sub(1);
             }
-            // Bell: ignored
-            0x07 => {}
+            // Bell: surface a signal without rendering the control byte.
+            0x07 => t.queue_signal(TerminalSignal::Bell),
             _ => {}
         }
     }
@@ -2361,6 +2450,7 @@ impl<'a> Perform for Performer<'a> {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
                         1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, true),
+                        1004 => t.focus_reporting_1004 = true,
                         2004 => t.bracketed_paste = true,
                         2026 => t.synchronized_output_active = true,
                         47 | 1047 | 1049 => t.enter_alt_screen(),
@@ -2373,6 +2463,7 @@ impl<'a> Perform for Performer<'a> {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
                         1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, false),
+                        1004 => t.focus_reporting_1004 = false,
                         2004 => t.bracketed_paste = false,
                         2026 => t.synchronized_output_active = false,
                         47 | 1047 | 1049 => t.exit_alt_screen(),
@@ -2440,6 +2531,8 @@ impl<'a> Perform for Performer<'a> {
                 if let Ok(title) = std::str::from_utf8(params[1]) {
                     self.terminal.title = title.to_string();
                 }
+            } else if cmd == b"9" {
+                self.terminal.queue_osc9(params);
             }
         }
     }
@@ -3332,6 +3425,93 @@ mod tests {
         let mut t = Terminal::new(3, 20);
         t.process_bytes(b"\x1b]2;Another Title\x07");
         assert_eq!(t.title(), "Another Title");
+    }
+
+    #[test]
+    fn bell_queues_signal_without_rendering() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x07");
+
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(t.take_pending_signals(), vec![TerminalSignal::Bell]);
+        assert!(t.take_pending_signals().is_empty());
+    }
+
+    #[test]
+    fn osc9_bell_terminated_queues_message() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]9;hello\x07");
+
+        assert_eq!(
+            t.take_pending_signals(),
+            vec![TerminalSignal::Osc9("hello".into())]
+        );
+    }
+
+    #[test]
+    fn osc9_st_terminated_queues_message() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]9;hello\x1b\\");
+
+        assert_eq!(
+            t.take_pending_signals(),
+            vec![TerminalSignal::Osc9("hello".into())]
+        );
+    }
+
+    #[test]
+    fn osc9_preserves_semicolons_in_payload() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]9;hello;world\x07");
+
+        assert_eq!(
+            t.take_pending_signals(),
+            vec![TerminalSignal::Osc9("hello;world".into())]
+        );
+    }
+
+    #[test]
+    fn osc9_payload_split_across_process_calls_queues_message() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]9;hel");
+        assert!(t.take_pending_signals().is_empty());
+
+        t.process_bytes(b"lo\x07");
+        assert_eq!(
+            t.take_pending_signals(),
+            vec![TerminalSignal::Osc9("hello".into())]
+        );
+    }
+
+    #[test]
+    fn osc9_rejects_invalid_utf8_and_oversized_payloads() {
+        let mut t = Terminal::new(3, 20);
+        t.process_bytes(b"\x1b]9;\xff\x07");
+
+        let mut oversized = b"\x1b]9;".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_OSC9_PAYLOAD_BYTES + 1));
+        oversized.push(0x07);
+        t.process_bytes(&oversized);
+
+        assert!(t.take_pending_signals().is_empty());
+    }
+
+    #[test]
+    fn pending_signal_queue_keeps_newest_bounded_batch() {
+        let mut t = Terminal::new(3, 20);
+        let total = MAX_PENDING_TERMINAL_SIGNALS + 8;
+        for index in 0..total {
+            let sequence = format!("\x1b]9;{index}\x07");
+            t.process_bytes(sequence.as_bytes());
+        }
+
+        let signals = t.take_pending_signals();
+        assert_eq!(signals.len(), MAX_PENDING_TERMINAL_SIGNALS);
+        for (offset, signal) in signals.into_iter().enumerate() {
+            let index = offset + total - MAX_PENDING_TERMINAL_SIGNALS;
+            assert_eq!(signal, TerminalSignal::Osc9(index.to_string()));
+        }
+        assert!(t.take_pending_signals().is_empty());
     }
 
     // -- Insert/Delete characters ---------------------------------------------
@@ -5169,6 +5349,24 @@ mod tests {
     }
 
     #[test]
+    fn focus_reporting_tracks_dec_private_1004() {
+        let mut term = Terminal::new(3, 5);
+        assert!(!term.focus_reporting_active());
+
+        term.process_bytes(b"\x1b[?1004h");
+        assert!(
+            term.focus_reporting_active(),
+            "CSI ?1004h must enable focus reporting"
+        );
+
+        term.process_bytes(b"\x1b[?1004l");
+        assert!(
+            !term.focus_reporting_active(),
+            "CSI ?1004l must disable focus reporting"
+        );
+    }
+
+    #[test]
     fn mouse_reporting_tracks_dec_private_1000_1002_1003() {
         for mode in ["1000", "1002", "1003"] {
             let mut term = Terminal::new(3, 5);
@@ -5674,6 +5872,23 @@ mod tests {
             assert!(ui.encode_wheel_reports(10.0, 20.0).is_empty());
             assert_eq!(ui.encode_wheel_reports(10.0, 20.0), b"\x1b[M`!!");
         }
+    }
+
+    #[test]
+    fn reattached_session_preserves_focus_reporting() {
+        let mut daemon = unshit_terminal_core::Terminal::new(3, 10, 100);
+        daemon.process_bytes(b"\x1b[?1004h");
+        let encoded = serde_json::to_vec(&daemon.snapshot(100)).unwrap();
+        let snapshot = serde_json::from_slice(&encoded).unwrap();
+
+        let mut ui = Terminal::new(3, 10);
+        assert!(!ui.focus_reporting_active());
+        ui.apply_snapshot(&snapshot);
+        assert!(ui.focus_reporting_active());
+
+        daemon.process_bytes(b"\x1b[?1004l");
+        ui.apply_snapshot(&daemon.snapshot(100));
+        assert!(!ui.focus_reporting_active());
     }
 
     #[test]
