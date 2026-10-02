@@ -28,12 +28,6 @@ pub fn needs_command_line(image: &str) -> bool {
 }
 
 /// Identify Codex server modes from the subcommand, never from prompt text.
-fn codex_is_server(command_line: &str) -> Option<bool> {
-    let mut remaining = command_line;
-    next_argument(&mut remaining)?;
-    codex_arguments_are_server(remaining)
-}
-
 fn codex_arguments_are_server(mut remaining: &str) -> Option<bool> {
     while !remaining.trim().is_empty() {
         let argument = next_argument(&mut remaining)?;
@@ -51,8 +45,12 @@ fn codex_arguments_are_server(mut remaining: &str) -> Option<bool> {
 pub fn classify_process(image: &str, command_line: Option<&str>) -> Option<&'static AgentProfile> {
     let stem = executable_stem(image);
     if let Some(agent) = profile(&stem) {
-        if stem == "codex" && codex_is_server(command_line?)? {
-            return None;
+        if stem == "codex" {
+            let mut remaining = command_line?;
+            next_argument(&mut remaining)?; // codex executable
+            if codex_arguments_are_server(remaining)? {
+                return None;
+            }
         }
         return Some(agent);
     }
