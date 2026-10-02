@@ -9,6 +9,8 @@
 //!    (`terminal-manager session-hook`). Lives in `AppState::agent_restarts`.
 //! 3. **Process** — the background resource monitor recognizes a native
 //!    executable or a known runtime entrypoint beneath the session shell.
+//!    Codex app-server and mcp-server modes are excluded: these can be
+//!    internal services of desktop apps launched from an ordinary terminal.
 //!    This works without title updates or hooks and clears on process exit.
 //! 4. **Title** — the guest program's window title (OSC 0/2) identifies a
 //!    known agent. A fallback for harnesses not recognized by process; it
