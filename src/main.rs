@@ -1183,6 +1183,7 @@ fn main() {
     let scroll_tuning_shared = shared.clone();
     let startup_prewarm_shared = shared.clone();
     let native_open_shared = shared.clone();
+    let focus_shared = shared.clone();
     let window_event_sink: Arc<std::sync::OnceLock<unshit::app::EventSink>> =
         Arc::new(std::sync::OnceLock::new());
     let tree_window_event_sink = window_event_sink.clone();
@@ -1545,6 +1546,9 @@ fn main() {
         },
     );
     app.set_render_tier_preference(render_tier_preference);
+    app.set_window_focus_callback(Arc::new(move |focused| {
+        crate::bridge::report_window_focus(&focus_shared, focused);
+    }));
     let _ = window_event_sink.set(app.event_sink());
     if let Some(cfg) = bench_config {
         crate::bench::start(cfg, shared.clone(), window_event_sink.clone());

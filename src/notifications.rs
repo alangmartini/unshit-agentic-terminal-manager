@@ -9,7 +9,6 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-#[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
 
 use futures_core::Stream;
@@ -185,6 +184,15 @@ pub enum CliCommand {
         target: Option<NotificationTarget>,
         capability: Option<String>,
     },
+    CodexNotify {
+        socket: PathBuf,
+        target: Option<NotificationTarget>,
+        title: Option<String>,
+        text: Option<String>,
+        payload: String,
+        forward_program: Option<PathBuf>,
+        forward_args: Vec<String>,
+    },
     NewAgent {
         socket: PathBuf,
         profile: Option<String>,
@@ -199,6 +207,7 @@ enum CliMode {
     Activate,
     SessionHook(crate::agent_restore::AgentKind),
     AgentNotify(crate::agent_restore::AgentKind),
+    CodexNotify,
     NewAgent,
 }
 
@@ -211,6 +220,9 @@ struct CliFields {
     workspace_id: Option<u32>,
     pane_id: Option<u32>,
     profile: Option<String>,
+    codex_payload: Option<String>,
+    forward_program: Option<PathBuf>,
+    forward_args: Vec<String>,
 }
 
 pub fn handle_cli_from_env<I, S>(args: I) -> Option<i32>
@@ -222,6 +234,9 @@ where
     let is_session_hook = args
         .first()
         .is_some_and(|arg| arg.to_string_lossy() == "session-hook");
+    let is_codex_notify = args
+        .first()
+        .is_some_and(|arg| arg.to_string_lossy() == "codex-notify");
     let hook_agent = session_hook_agent_from_args(&args);
     let is_agent_notify = args
         .first()
@@ -344,6 +359,35 @@ where
                 },
             )
         }
+        CliCommand::CodexNotify {
+            socket,
+            target,
+            title,
+            text,
+            payload,
+            forward_program,
+            forward_args,
+        } => {
+            // Deliver to the running UI before invoking a configured relay.
+            // The two legs are intentionally independent: an unavailable UI
+            // must not prevent an existing callback from running, and a relay
+            // failure must not retract a toast already accepted by the UI.
+            let ui_result = match (target, title, text) {
+                (Some(target), Some(title), Some(text)) => send_cli_request_blocking(
+                    &socket,
+                    NotificationIpcRequest::Notify {
+                        title,
+                        text,
+                        workspace_id: target.workspace_id,
+                        pane_id: target.pane_id,
+                    },
+                ),
+                _ => Ok(()),
+            };
+            let forward_result =
+                forward_codex_notification(forward_program.as_deref(), &forward_args, &payload);
+            combine_codex_notify_results(ui_result, forward_result)
+        }
         CliCommand::NewAgent {
             socket,
             profile,
@@ -367,6 +411,9 @@ where
                     hook_transport_error_kind(&e),
                 );
                 Some(0)
+            } else if is_codex_notify {
+                eprintln!("terminal-manager codex notification error: {e}");
+                Some(1)
             } else {
                 eprintln!("terminal-manager notification error: {e}");
                 Some(1)
@@ -411,6 +458,7 @@ pub(crate) fn is_top_level_cli_command(name: &str) -> bool {
             | "--activate"
             | "session-hook"
             | "agent-notify"
+            | "codex-notify"
             | "agent"
             | "new-agent"
     )
@@ -452,12 +500,16 @@ where
             let agent = parse_hook_agent("agent-notify", &provider)?;
             CliMode::AgentNotify(agent)
         }
+        "codex-notify" => CliMode::CodexNotify,
         "agent" | "new-agent" => CliMode::NewAgent,
         _ => return Ok(None),
     };
 
     let mut fields = CliFields::default();
     while let Some(arg) = args.next() {
+        if matches!(mode, CliMode::CodexNotify) && fields.codex_payload.is_some() {
+            return Err("codex-notify JSON payload must be the final argument".into());
+        }
         match arg.as_str() {
             "--help" | "-h" => return Err(notification_usage().to_string()),
             "--title" => {
@@ -465,6 +517,9 @@ where
                     return Err(
                         "hooks do not accept notification content on the command line".into(),
                     );
+                }
+                if matches!(mode, CliMode::CodexNotify) {
+                    return Err("codex-notify does not accept notification content".into());
                 }
                 fields.title = Some(take_value(&mut args, "--title")?);
             }
@@ -474,18 +529,39 @@ where
                         "hooks do not accept notification content on the command line".into(),
                     );
                 }
+                if matches!(mode, CliMode::CodexNotify) {
+                    return Err("codex-notify does not accept notification content".into());
+                }
                 fields.text = Some(take_value(&mut args, arg.as_str())?)
+            }
+            "--forward-program" if matches!(mode, CliMode::CodexNotify) => {
+                if fields.forward_program.is_some() {
+                    return Err("--forward-program may only be specified once".into());
+                }
+                fields.forward_program =
+                    Some(PathBuf::from(take_value(&mut args, "--forward-program")?));
+            }
+            "--forward-arg" if matches!(mode, CliMode::CodexNotify) => {
+                fields
+                    .forward_args
+                    .push(take_value(&mut args, "--forward-arg")?);
             }
             "--socket" => fields.socket = Some(PathBuf::from(take_value(&mut args, "--socket")?)),
             "--workspace-id" | "--workspace" => {
                 if is_hook_mode(&mode) {
                     return Err("hook targets come only from terminal environment".into());
                 }
+                if matches!(mode, CliMode::CodexNotify) {
+                    return Err("codex-notify target comes only from terminal environment".into());
+                }
                 fields.workspace_id = Some(parse_u32_flag(&mut args, arg.as_str())?)
             }
             "--pane-id" | "--pane" => {
                 if is_hook_mode(&mode) {
                     return Err("hook targets come only from terminal environment".into());
+                }
+                if matches!(mode, CliMode::CodexNotify) {
+                    return Err("codex-notify target comes only from terminal environment".into());
                 }
                 fields.pane_id = Some(parse_u32_flag(&mut args, arg.as_str())?)
             }
@@ -513,8 +589,14 @@ where
                     }
                     fields.profile = Some(positional.to_string());
                 }
+                CliMode::CodexNotify if fields.codex_payload.is_none() => {
+                    fields.codex_payload = Some(positional.to_string());
+                }
                 CliMode::SessionHook(_) | CliMode::AgentNotify(_) => {
                     return Err(format!("unexpected positional argument {positional:?}"));
+                }
+                CliMode::CodexNotify => {
+                    return Err("codex-notify accepts exactly one final JSON payload".into());
                 }
                 _ => return Err(format!("unexpected positional argument {positional:?}")),
             },
@@ -596,6 +678,34 @@ where
             capability: get_env(ENV_AGENT_HOOK_CAPABILITY)
                 .filter(|value| is_valid_hook_capability(value)),
         })),
+        CliMode::CodexNotify => {
+            if fields.forward_program.is_none() && !fields.forward_args.is_empty() {
+                return Err("--forward-arg requires --forward-program".into());
+            }
+            let payload = fields
+                .codex_payload
+                .ok_or_else(|| "codex-notify requires a final JSON payload".to_string())?;
+            let notification = match parse_codex_notification_payload(&payload) {
+                Ok(notification) => Some(notification),
+                Err(error) if fields.forward_program.is_some() => {
+                    // Keep a configured prior callback working across future
+                    // Codex event types or payload schema changes. The UI leg
+                    // is intentionally limited to the completion event.
+                    let _ = error;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(Some(CliCommand::CodexNotify {
+                socket,
+                target: env_target(),
+                title: notification.as_ref().map(|value| value.title.clone()),
+                text: notification.as_ref().map(|value| value.text.clone()),
+                payload,
+                forward_program: fields.forward_program,
+                forward_args: fields.forward_args,
+            }))
+        }
         CliMode::NewAgent => {
             if fields.title.is_some() || fields.text.is_some() {
                 return Err("agent does not accept notification content".into());
@@ -660,8 +770,78 @@ fn require_non_empty(value: Option<String>, field: &str) -> Result<String, Strin
         .ok_or_else(|| format!("missing {field}"))
 }
 
+const CODEX_NOTIFY_EVENT: &str = "agent-turn-complete";
+const CODEX_NOTIFY_TITLE: &str = "Codex finished";
+const CODEX_NOTIFY_TEXT: &str = "The agent finished its turn.";
+const MAX_CODEX_NOTIFY_PAYLOAD_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct CodexNotificationInput {
+    #[serde(rename = "type")]
+    event_type: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexNotification {
+    title: String,
+    text: String,
+}
+
+fn parse_codex_notification_payload(payload: &str) -> Result<CodexNotification, String> {
+    if payload.len() > MAX_CODEX_NOTIFY_PAYLOAD_BYTES {
+        return Err("Codex notification payload exceeds size limit".into());
+    }
+    let input: CodexNotificationInput =
+        serde_json::from_str(payload).map_err(|_| "invalid Codex notification JSON".to_string())?;
+    if input.event_type != CODEX_NOTIFY_EVENT {
+        return Err("unsupported Codex notification type".into());
+    }
+    Ok(CodexNotification {
+        title: CODEX_NOTIFY_TITLE.to_string(),
+        text: CODEX_NOTIFY_TEXT.to_string(),
+    })
+}
+
+fn forward_codex_notification(
+    program: Option<&Path>,
+    args: &[String],
+    payload: &str,
+) -> io::Result<()> {
+    let Some(program) = program else {
+        return Ok(());
+    };
+    let status = Command::new(program)
+        .args(args)
+        .arg(payload)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Codex notification forwarder failed"))
+    }
+}
+
+fn combine_codex_notify_results(
+    ui_result: io::Result<()>,
+    forward_result: io::Result<()>,
+) -> io::Result<()> {
+    if let Err(error) = ui_result {
+        log::warn!("Codex notification UI delivery failed: {error}");
+    }
+    if let Err(error) = forward_result {
+        log::warn!("Codex notification forwarding failed: {error}");
+    }
+    // Codex treats notifications as best-effort side effects. Once the
+    // command line has been validated, neither a missing UI listener nor a
+    // failing relay should turn a completed agent turn into a failed turn.
+    Ok(())
+}
+
 fn notification_usage() -> &'static str {
-    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>\n       terminal-manager agent-notify <claude|codex>"
+    "usage: terminal-manager notify --title <title> --text <text> [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager activate [--workspace-id <id>] [--pane-id <id>] [--socket <path>]\n       terminal-manager agent [claude|codex|gemini|opencode|aider|copilot] [--workspace-id <id>] [--socket <path>]\n       terminal-manager flow open <path> [--workspace-id <id>] [--socket <path>]\n       terminal-manager session-hook <claude|codex>\n       terminal-manager agent-notify <claude|codex>\n       terminal-manager codex-notify [--forward-program <path> [--forward-arg <arg>]...] <json>"
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -1661,6 +1841,111 @@ mod tests {
                 capability: Some(CAPABILITY.to_string()),
             }
         );
+    }
+
+    #[test]
+    fn parse_codex_notify_maps_completion_to_terminal_target_and_preserves_forwarding() {
+        let payload = r#"{"type":"agent-turn-complete","thread-id":"thread-1","last-assistant-message":"private"}"#;
+        let parsed = parse_cli_args(
+            [
+                "codex-notify",
+                "--forward-program",
+                "/usr/local/bin/sky-notify",
+                "--forward-arg",
+                "--profile",
+                "--forward-arg",
+                "codex",
+                payload,
+            ],
+            env_map(&[
+                (ENV_NOTIFY_SOCKET, "notify.sock"),
+                (ENV_WORKSPACE_ID, "4"),
+                (ENV_PANE_ID, "9"),
+            ]),
+        )
+        .expect("parse")
+        .expect("command");
+
+        assert_eq!(
+            parsed,
+            CliCommand::CodexNotify {
+                socket: PathBuf::from("notify.sock"),
+                target: Some(NotificationTarget {
+                    workspace_id: 4,
+                    pane_id: 9,
+                }),
+                title: Some("Codex finished".into()),
+                text: Some("The agent finished its turn.".into()),
+                payload: payload.into(),
+                forward_program: Some(PathBuf::from("/usr/local/bin/sky-notify")),
+                forward_args: vec!["--profile".into(), "codex".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_codex_notify_keeps_forwarding_for_unknown_payloads_without_ui_content() {
+        let payload = r#"{"type":"future-event","last-assistant-message":"private"}"#;
+        let parsed = parse_cli_args(
+            ["codex-notify", "--forward-program", "sky-notify", payload],
+            env_map(&[(ENV_WORKSPACE_ID, "4"), (ENV_PANE_ID, "9")]),
+        )
+        .expect("parse")
+        .expect("command");
+
+        assert_eq!(
+            parsed,
+            CliCommand::CodexNotify {
+                socket: default_notification_socket_path(),
+                target: Some(NotificationTarget {
+                    workspace_id: 4,
+                    pane_id: 9,
+                }),
+                title: None,
+                text: None,
+                payload: payload.into(),
+                forward_program: Some(PathBuf::from("sky-notify")),
+                forward_args: Vec::new(),
+            }
+        );
+        assert!(parse_cli_args(["codex-notify", payload], env_map(&[])).is_err());
+    }
+
+    #[test]
+    fn parse_codex_notify_requires_a_final_payload_and_forward_program_for_args() {
+        let payload = r#"{"type":"agent-turn-complete"}"#;
+        assert!(parse_cli_args(
+            ["codex-notify", payload, "--forward-program", "sky-notify"],
+            env_map(&[]),
+        )
+        .is_err());
+        assert!(parse_cli_args(
+            ["codex-notify", "--forward-arg", "codex", payload],
+            env_map(&[]),
+        )
+        .is_err());
+        assert!(parse_cli_args(["codex-notify", "not-json"], env_map(&[]),).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_notify_forwarding_passes_opaque_payload_as_final_argv() {
+        let output = unique_socket_path().with_extension("forwarded");
+        let payload = r#"{"type":"agent-turn-complete","last-assistant-message":"opaque"}"#;
+        let args = vec![
+            "-c".into(),
+            "printf '%s' \"$2\" > \"$1\"".into(),
+            "codex-forward".into(),
+            output.to_string_lossy().into_owned(),
+        ];
+
+        forward_codex_notification(Some(Path::new("/bin/sh")), &args, payload)
+            .expect("forwarder exits successfully");
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("forwarded payload"),
+            payload
+        );
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]

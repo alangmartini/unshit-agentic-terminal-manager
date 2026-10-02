@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-02
+
+### Fixed
+
+- Terminal BEL and OSC 9 signals now reach desktop notifications and in-app
+  toasts. Codex receives native window and pane focus changes, including
+  after reattaching to daemon-owned sessions.
+- The `codex-notify` completion relay preserves existing notification
+  callbacks and no longer falls through to desktop file opening.
+
 ## [0.8.0] - 2026-09-28
 
 Voice dictation arrives: press a global shortcut in any application, speak,
@@ -1104,7 +1114,8 @@ Initial release of Terminal Manager — a GPU-accelerated, agentic terminal mana
 - Hardened the desktop regression harness: traces are now consumed (not just validated) for supported suites, the app only advertises diagnostic event families it actually emits (`test_step`, `invariant`, `log`), `--observe basic` runs write `pre-snap`/`post-snap` snapshots, and the `post-resize-glitches` suite fails on a blank mid-pane, lost foreground, stuck modifier, or overlapping non-owned window.
 - Fixed terminal blanking after a snap resize.
 
-[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/alangmartini/unshit-agentic-terminal-manager/compare/v0.5.0...v0.6.0

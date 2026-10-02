@@ -10,6 +10,10 @@ pub struct Snapshot {
     /// Mouse protocol state must survive UI reattachment to daemon sessions.
     #[serde(default)]
     pub mouse_modes: MouseModes,
+    /// DECSET 1004 focus-reporting state must survive UI reattachment so the
+    /// bridge can continue sending focus-in/focus-out reports to the child.
+    #[serde(default)]
+    pub focus_reporting_1004: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ mod tests {
         });
         let snapshot: Snapshot = serde_json::from_value(old).unwrap();
         assert_eq!(snapshot.mouse_modes, MouseModes::default());
+        assert!(!snapshot.focus_reporting_1004);
     }
 
     #[test]
@@ -39,6 +44,7 @@ mod tests {
         let grid = Grid::new(2, 3);
         let snap = Snapshot {
             mouse_modes: MouseModes::default(),
+            focus_reporting_1004: true,
             grid: grid.clone(),
             scrollback: vec![vec![Cell::BLANK; 3]],
         };

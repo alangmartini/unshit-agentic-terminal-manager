@@ -308,6 +308,7 @@ mod tests {
             "--activate",
             "session-hook",
             "agent-notify",
+            "codex-notify",
         ] {
             assert_eq!(
                 parse_args_from_dir([command], &root),

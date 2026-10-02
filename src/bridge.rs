@@ -10,6 +10,130 @@ use unshit::core::trace::{append_terminal_trace_line, terminal_trace_enabled};
 
 use crate::state::{record_diagnostic_pty_event, MutexExt, SharedState};
 
+const FOCUS_IN: &[u8] = b"\x1b[I";
+const FOCUS_OUT: &[u8] = b"\x1b[O";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalNotification {
+    title: String,
+    text: String,
+    workspace_id: u32,
+    pane_id: u32,
+}
+
+fn notification_for_terminal_signal(
+    signal: &crate::terminal::TerminalSignal,
+    workspace_id: Option<u32>,
+    pane_id: u32,
+    is_codex: bool,
+) -> Option<TerminalNotification> {
+    let workspace_id = workspace_id?;
+    match signal {
+        crate::terminal::TerminalSignal::Bell if is_codex => Some(TerminalNotification {
+            title: "Codex needs attention".to_string(),
+            text: "Codex is waiting for you.".to_string(),
+            workspace_id,
+            pane_id,
+        }),
+        crate::terminal::TerminalSignal::Osc9(message) => Some(TerminalNotification {
+            title: if is_codex {
+                "Codex"
+            } else {
+                "Terminal notification"
+            }
+            .to_string(),
+            text: message.clone(),
+            workspace_id,
+            pane_id,
+        }),
+        crate::terminal::TerminalSignal::Bell => None,
+    }
+}
+
+fn signals_contain_bell(signals: &[crate::terminal::TerminalSignal]) -> bool {
+    signals
+        .iter()
+        .any(|signal| matches!(signal, crate::terminal::TerminalSignal::Bell))
+}
+
+/// Whether a pane should receive focus reports. The parser-tracked mode is
+/// authoritative for terminals that explicitly requested DECSET 1004. The
+/// Codex fallback covers sessions attached from a legacy daemon snapshot that
+/// did not persist that mode bit.
+fn should_send_focus_reports(focus_reporting_active: bool, is_codex: bool) -> bool {
+    focus_reporting_active || is_codex
+}
+
+/// Return the panes that should receive focus reports in stable order. Only
+/// the active pane is focused while the native window is focused; every other
+/// pane receives FocusOut so a background Codex session can emit its normal
+/// `unfocused` notification.
+fn focus_reporting_targets(state: &crate::state::AppState) -> Vec<u32> {
+    let mut targets: Vec<u32> = state
+        .terminals
+        .iter()
+        .filter_map(|(&pane_id, terminal)| {
+            let focus_reporting_active = terminal.lock_recover().focus_reporting_active();
+            let is_codex = crate::state::agent_tag_for_pane(state, pane_id)
+                .is_some_and(|tag| tag.profile == "codex");
+            should_send_focus_reports(focus_reporting_active, is_codex).then_some(pane_id)
+        })
+        .collect();
+    targets.sort_unstable();
+    targets
+}
+
+/// Codex-only target set used by the periodic bridge tick. Process
+/// classification can arrive after the first attach tick, while parser-mode
+/// transitions already synchronize immediately in the PTY path. Tracking this
+/// narrower set catches the late classification without repeating every
+/// parser-mode write on the next tick.
+fn codex_focus_reporting_targets(state: &crate::state::AppState) -> Vec<u32> {
+    let mut targets: Vec<u32> = state
+        .terminals
+        .keys()
+        .copied()
+        .filter(|&pane_id| {
+            crate::state::agent_tag_for_pane(state, pane_id)
+                .is_some_and(|tag| tag.profile == "codex")
+        })
+        .collect();
+    targets.sort_unstable();
+    targets
+}
+
+fn focus_report_bytes(window_focused: bool, active_pane: u32, pane_id: u32) -> &'static [u8] {
+    if window_focused && pane_id == active_pane {
+        FOCUS_IN
+    } else {
+        FOCUS_OUT
+    }
+}
+
+fn sync_terminal_focus_reporting(state: &mut crate::state::AppState, window_focused: bool) {
+    let active_pane = state.active_pane.0;
+    let focus_reporting_panes = focus_reporting_targets(state);
+
+    for pane_id in focus_reporting_panes {
+        let bytes = focus_report_bytes(window_focused, active_pane, pane_id);
+        if let Err(error) = state.pty_manager.write(pane_id, bytes) {
+            log::debug!(
+                "pty-{}: could not send terminal focus report: {}",
+                pane_id,
+                error
+            );
+        }
+    }
+}
+
+/// Called directly from the framework's native focus callback, before the
+/// next PTY batch can arrive. This keeps Codex's `unfocused` notification
+/// policy synchronized with the real window state.
+pub fn report_window_focus(shared: &SharedState, focused: bool) {
+    let mut state = shared.lock_recover();
+    sync_terminal_focus_reporting(&mut state, focused);
+}
+
 struct PendingReader {
     generation: u64,
     reader: Box<dyn Read + Send>,
@@ -202,12 +326,15 @@ fn pty_subscription(
 
                     let (
                         pending_response,
+                        pending_signals,
+                        focus_reporting_changed,
                         osc_title,
                         batched,
                         total_bytes,
                         grid_patch,
                     ) = {
                         let mut terminal = terminal_handle.lock_recover();
+                        let focus_reporting_was_active = terminal.focus_reporting_active();
                         let (batched, total_bytes) =
                             process_pty_batch(&mut terminal, &data, &mut rx);
                         if terminal_trace_enabled() {
@@ -250,6 +377,8 @@ fn pty_subscription(
                             .flatten();
                         (
                             terminal.take_pending_response(),
+                            terminal.take_pending_signals(),
+                            terminal.focus_reporting_active() != focus_reporting_was_active,
                             osc_title,
                             batched,
                             total_bytes,
@@ -257,7 +386,7 @@ fn pty_subscription(
                         )
                     };
                     let title_changed = osc_title.is_some();
-                    {
+                    let terminal_notifications = {
                         let mut guard = shared.lock_recover();
                         record_diagnostic_pty_event(
                             &mut guard,
@@ -277,6 +406,16 @@ fn pty_subscription(
                                 );
                             }
                             last_osc_title = title;
+                        }
+                        if focus_reporting_changed {
+                            // Codex enables DECSET 1004 after startup. Send
+                            // the current state immediately so an already
+                            // unfocused window does not leave it assuming it
+                            // owns terminal focus until the next native event.
+                            sync_terminal_focus_reporting(
+                                &mut guard,
+                                unshit::core::cell_grid::CellGrid::is_window_focused(),
+                            );
                         }
                         if !pending_response.is_empty() {
                             // Reply to host queries (DA1, DA2, DSR, CPR,
@@ -301,15 +440,57 @@ fn pty_subscription(
                                 );
                             }
                         }
+                        let workspace_id = crate::state::workspace_num_for_pane(&guard, pane_id);
+                        let is_codex = crate::state::agent_tag_for_pane(&guard, pane_id)
+                            .is_some_and(|tag| tag.profile == "codex");
+                        let notifications: Vec<_> = pending_signals
+                            .iter()
+                            .filter_map(|signal| {
+                                notification_for_terminal_signal(
+                                    signal,
+                                    workspace_id,
+                                    pane_id,
+                                    is_codex,
+                                )
+                            })
+                            .collect();
+                        for notification in &notifications {
+                            crate::state::push_notification_toast(
+                                &mut guard,
+                                notification.title.clone(),
+                                notification.text.clone(),
+                                notification.workspace_id,
+                                notification.pane_id,
+                            );
+                        }
+                        notifications
+                    };
+                    #[cfg(not(test))]
+                    for notification in &terminal_notifications {
+                        if let Err(error) = crate::notifications::spawn_desktop_notification_for_target(
+                            notification.title.clone(),
+                            notification.text.clone(),
+                            notification.workspace_id,
+                            notification.pane_id,
+                        ) {
+                            log::warn!(
+                                "desktop terminal notification failed for pane {}: {}",
+                                notification.pane_id,
+                                error
+                            );
+                        }
                     }
                     if batched > 1 {
                         log::debug!("pty-{}: batched {} chunks into 1 rebuild", pane_id, batched);
+                    }
+                    if signals_contain_bell(&pending_signals) {
+                        yield ExternalEvent::Bell;
                     }
                     if let Some((node, grid)) = grid_patch {
                         last_grid_snapshot = Some(std::time::Instant::now());
                         yield ExternalEvent::GridPatch { node, grid: Box::new(grid) };
                     }
-                    if title_changed {
+                    if title_changed || !terminal_notifications.is_empty() {
                         yield ExternalEvent::RequestRebuild;
                     }
                 }
@@ -355,6 +536,7 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
             Box::pin(async_stream::stream! {
                 let mut synced = false;
                 let mut last_focus_signature: Option<(u32, bool)> = None;
+                let mut last_codex_focus_targets: Vec<u32> = Vec::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let mut needs_rebuild = false;
@@ -371,8 +553,29 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                         let active_id = guard.active_pane.0;
                         let win_focused = unshit::core::cell_grid::CellGrid::is_window_focused();
                         let signature = (active_id, win_focused);
-                        if last_focus_signature != Some(signature) {
+                        let codex_focus_targets = codex_focus_reporting_targets(&guard);
+                        let active_pane_changed = last_focus_signature
+                            .map_or(true, |(last_active, _)| last_active != active_id);
+                        let focus_changed = last_focus_signature != Some(signature);
+                        let codex_targets_changed =
+                            last_codex_focus_targets != codex_focus_targets;
+                        if active_pane_changed || codex_targets_changed {
                             last_focus_signature = Some(signature);
+                            last_codex_focus_targets = codex_focus_targets;
+                            // Pane switches turn the old terminal into a
+                            // background session and make the new one active.
+                            // Keep DECSET 1004 clients synchronized even
+                            // though active-pane state is mutated by several
+                            // UI paths.
+                            sync_terminal_focus_reporting(&mut guard, win_focused);
+                        } else if focus_changed {
+                            // The native focus callback owns window-only
+                            // transitions and already sent the matching
+                            // report. Keep the signature current so this tick
+                            // still requests the appropriate tree rebuild.
+                            last_focus_signature = Some(signature);
+                        }
+                        if focus_changed {
                             // A pane focus change is observable in the tree
                             // (e.g. focused pane border styling and cursor
                             // masking), so promote this tick to a rebuild.
@@ -846,6 +1049,108 @@ mod tests {
     #[test]
     fn terminal_updates_do_not_patch_mid_synchronized_output_frame() {
         assert!(!should_patch_terminal_grid(true));
+    }
+
+    #[test]
+    fn codex_bell_maps_to_an_attention_notification() {
+        let notification = notification_for_terminal_signal(
+            &crate::terminal::TerminalSignal::Bell,
+            Some(3),
+            7,
+            true,
+        )
+        .expect("Codex bell notification");
+
+        assert_eq!(notification.title, "Codex needs attention");
+        assert_eq!(notification.text, "Codex is waiting for you.");
+        assert_eq!((notification.workspace_id, notification.pane_id), (3, 7));
+    }
+
+    #[test]
+    fn generic_bell_does_not_create_a_desktop_notification() {
+        assert_eq!(
+            notification_for_terminal_signal(
+                &crate::terminal::TerminalSignal::Bell,
+                Some(3),
+                7,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_bel_signals_drive_the_framework_bell() {
+        assert!(!signals_contain_bell(&[
+            crate::terminal::TerminalSignal::Osc9("approval requested".into(),)
+        ]));
+        assert!(signals_contain_bell(&[
+            crate::terminal::TerminalSignal::Osc9("approval requested".into()),
+            crate::terminal::TerminalSignal::Bell,
+        ]));
+    }
+
+    #[test]
+    fn osc9_maps_message_to_the_emitting_pane() {
+        let notification = notification_for_terminal_signal(
+            &crate::terminal::TerminalSignal::Osc9("approval requested; edit files".into()),
+            Some(5),
+            11,
+            true,
+        )
+        .expect("OSC 9 notification");
+
+        assert_eq!(notification.title, "Codex");
+        assert_eq!(notification.text, "approval requested; edit files");
+        assert_eq!((notification.workspace_id, notification.pane_id), (5, 11));
+    }
+
+    #[test]
+    fn focus_reports_only_the_active_terminal_as_focused() {
+        assert_eq!(focus_report_bytes(true, 2, 2), FOCUS_IN);
+        assert_eq!(focus_report_bytes(true, 2, 1), FOCUS_OUT);
+        assert_eq!(focus_report_bytes(false, 2, 2), FOCUS_OUT);
+    }
+
+    #[test]
+    fn known_codex_panes_use_focus_reports_after_legacy_snapshot_reattach() {
+        assert!(should_send_focus_reports(false, true));
+    }
+
+    #[test]
+    fn ordinary_shells_without_decset_1004_do_not_get_focus_reports() {
+        assert!(!should_send_focus_reports(false, false));
+    }
+
+    #[test]
+    fn explicit_decset_1004_still_enables_focus_reports_for_any_terminal() {
+        assert!(should_send_focus_reports(true, false));
+    }
+
+    #[test]
+    fn focus_reporting_targets_are_sorted_and_exclude_unknown_shells() {
+        let mut state = crate::state::seed_state();
+        for pane_id in [9, 3, 5] {
+            state.terminals.insert(
+                pane_id,
+                std::sync::Arc::new(std::sync::Mutex::new(crate::terminal::Terminal::new(2, 2))),
+            );
+        }
+        state.pane_agents.insert(
+            9,
+            crate::agents::AgentTag::new("codex", crate::agents::AgentTagSource::Process),
+        );
+        state.pane_agents.insert(
+            3,
+            crate::agents::AgentTag::new("codex", crate::agents::AgentTagSource::Process),
+        );
+        state.pane_agents.insert(
+            5,
+            crate::agents::AgentTag::new("shell", crate::agents::AgentTagSource::Process),
+        );
+
+        assert_eq!(focus_reporting_targets(&state), vec![3, 9]);
+        assert_eq!(codex_focus_reporting_targets(&state), vec![3, 9]);
     }
 
     #[test]

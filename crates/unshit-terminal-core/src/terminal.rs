@@ -134,6 +134,8 @@ pub struct Terminal {
     pending_response: Vec<u8>,
     synchronized_output_active: bool,
     mouse_modes: crate::snapshot::MouseModes,
+    /// Whether the child requested focus-in/focus-out reports via DECSET 1004.
+    focus_reporting_1004: bool,
 }
 
 impl Terminal {
@@ -162,6 +164,7 @@ impl Terminal {
             pending_response: Vec::new(),
             synchronized_output_active: false,
             mouse_modes: crate::snapshot::MouseModes::default(),
+            focus_reporting_1004: false,
         }
     }
 
@@ -280,6 +283,7 @@ impl Terminal {
             grid: self.grid.clone(),
             scrollback: self.scrollback.tail(scrollback_lines),
             mouse_modes: self.mouse_modes,
+            focus_reporting_1004: self.focus_reporting_1004,
         }
     }
 
@@ -532,6 +536,7 @@ impl Perform for Performer<'_> {
                             1002 => t.mouse_modes.report_1002 = on,
                             1003 => t.mouse_modes.report_1003 = on,
                             1006 => t.mouse_modes.sgr = on,
+                            1004 => t.focus_reporting_1004 = on,
                             2026 => t.synchronized_output_active = on,
                             47 | 1047 | 1049 if on => t.enter_alt_screen(),
                             47 | 1047 | 1049 => t.exit_alt_screen(),
@@ -1178,6 +1183,18 @@ mod tests {
         }
         let snap = t.snapshot(2);
         assert!(snap.scrollback.len() <= 2);
+    }
+
+    #[test]
+    fn snapshot_preserves_focus_reporting_mode() {
+        let mut t = Terminal::new(3, 5, 10);
+        assert!(!t.snapshot(0).focus_reporting_1004);
+
+        t.process_bytes(b"\x1b[?1004h");
+        assert!(t.snapshot(0).focus_reporting_1004);
+
+        t.process_bytes(b"\x1b[?1004l");
+        assert!(!t.snapshot(0).focus_reporting_1004);
     }
 
     #[test]
