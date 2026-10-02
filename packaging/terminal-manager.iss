@@ -8,7 +8,9 @@
 ; Output: dist\terminal-manager-0.8.0-setup.exe
 
 #define MyAppName "Terminal Manager"
-#define MyAppVersion "0.8.0"
+#ifndef MyAppVersion
+#define MyAppVersion "0.8.1"
+#endif
 #define MyAppPublisher "Alan Galvao"
 #define MyAppURL "https://github.com/alangmartini/unshit-agentic-terminal-manager"
 #define MyAppExeName "terminal-manager.exe"

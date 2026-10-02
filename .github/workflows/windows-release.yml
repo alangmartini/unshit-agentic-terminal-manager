@@ -1,0 +1,90 @@
+name: Windows Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing vX.Y.Z tag (or main for a dry run)'
+        required: true
+        default: main
+        type: string
+      dry_run:
+        description: 'Build and upload CI artifacts without publishing a release'
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  select-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.refs.outputs.matrix }}
+      has_releases: ${{ steps.refs.outputs.has_releases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Test release selection
+        run: python3 scripts/tests/test_release_refs.py
+      - name: Select tags integrated into the default branch
+        id: refs
+        run: python3 scripts/ci/release_refs.py
+
+  release:
+    needs: select-releases
+    if: needs.select-releases.outputs.has_releases == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-releases.outputs.matrix) }}
+    concurrency:
+      group: windows-release-${{ matrix.ref }}
+      cancel-in-progress: false
+    runs-on: [self-hosted, Windows, X64, local-windows]
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      # Preserve the Beelink developer's Rust installation (see pr-review.yml).
+      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ startsWith(matrix.ref, 'v') && format('refs/tags/{0}', matrix.ref) || matrix.ref }}
+          fetch-depth: 0
+      - name: Use the runner's stable Rust toolchain
+        run: |
+          $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path "$toolchainBin\cargo.exe")) {
+            throw "Stable Rust toolchain is missing at $toolchainBin"
+          }
+          $toolchainBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate, test and package Windows
+        env:
+          RELEASE_REF: ${{ matrix.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/windows-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-${{ matrix.ref }}
+          path: |
+            dist/*-setup.exe
+            dist/SHA256SUMS.txt
+            dist/release-notes-*.md
+          if-no-files-found: error
+      - name: Publish release with installer and changelog
+        if: matrix.dry_run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ matrix.ref }}
+        run: scripts/ci/publish-release.ps1
