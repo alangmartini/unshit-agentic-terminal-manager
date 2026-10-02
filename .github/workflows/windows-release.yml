@@ -72,7 +72,6 @@ jobs:
       - name: Validate, test and package Windows
         env:
           RELEASE_REF: ${{ matrix.ref }}
-          RELEASE_DRY_RUN: ${{ matrix.dry_run }}
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/windows-release.ps1
       - uses: actions/upload-artifact@v4

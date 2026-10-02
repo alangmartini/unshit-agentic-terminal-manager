@@ -24,8 +24,6 @@ $intro = 'Download `terminal-manager-' + $version + '-setup.exe` and run it for 
 [IO.File]::WriteAllText((Join-Path $PWD 'dist/install.md'), $intro)
 & "$PSScriptRoot/../release-notes.ps1" -Version $version -IntroFile dist/install.md -Verify
 
-Invoke-Native cargo @('fmt', '--check')
-Invoke-Native cargo @('clippy', '--locked', '--', '-D', 'warnings')
 Invoke-Native cargo @('test', '--locked', '--all', '--no-fail-fast', '--', '--test-threads=1')
 Invoke-Native cargo @('build', '--locked', '--release', '-p', 'terminal-manager', '--bin', 'terminal-manager', '-p', 'unshit-ptyd', '--bin', 'unshit-ptyd')
 

@@ -61,8 +61,8 @@ isolated `CARGO_HOME` as the quality gate, preserving the developer's tools.
    git push origin vX.Y.Z
    ```
 3. The pipeline checks that the tag belongs to the default branch and matches
-   the Cargo version. It verifies the rendered changelog, runs formatting,
-   Clippy and serial Windows tests, builds both executables, and compiles the
+   the Cargo version. It verifies the rendered changelog, runs serial Windows
+   tests, builds both executables, and compiles the
    installer with the tag's version passed to Inno Setup.
 4. CI uploads the installer, `SHA256SUMS.txt` and release notes as an Actions
    artifact. It creates a draft GitHub Release, uploads the installer and
