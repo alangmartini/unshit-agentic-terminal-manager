@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+param([ValidateSet('Prepare', 'Package')][string]$Stage = 'Package')
 $ErrorActionPreference = 'Stop'
 
 function Invoke-Native([string]$Command, [string[]]$Arguments) {
@@ -9,23 +10,23 @@ function Invoke-Native([string]$Command, [string[]]$Arguments) {
 $metadata = & cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
 $version = ($metadata.packages | Where-Object name -eq 'terminal-manager').version
-if ($env:RELEASE_REF -match '^v' -and $env:RELEASE_REF -cne "v$version") {
-    throw "Tag $env:RELEASE_REF does not match Cargo.toml version $version"
+if ($Stage -eq 'Prepare') {
+    if ($env:RELEASE_REF -match '^v' -and $env:RELEASE_REF -cne "v$version") {
+        throw "Tag $env:RELEASE_REF does not match Cargo.toml version $version"
+    }
+    # The checkout is the exact release revision, not the moving default branch.
+    $repo = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+    Invoke-Native git @('fetch', 'origin', $repo.repository.default_branch)
+    Invoke-Native git @('merge-base', '--is-ancestor', 'HEAD', "origin/$($repo.repository.default_branch)")
+
+    # Prevent stale files on the persistent self-hosted runner from being uploaded.
+    if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+    New-Item -ItemType Directory dist | Out-Null
+    $intro = 'Download `terminal-manager-' + $version + '-setup.exe` and run it for a per-user Windows x64 installation. Existing installations can update through **Settings > Updates**. This release contains the Windows installer.'
+    [IO.File]::WriteAllText((Join-Path $PWD 'dist/install.md'), $intro)
+    & "$PSScriptRoot/../release-notes.ps1" -Version $version -IntroFile dist/install.md -Verify
+    return
 }
-# The checkout is the exact release revision, not the moving default branch.
-$repo = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
-Invoke-Native git @('fetch', 'origin', $repo.repository.default_branch)
-Invoke-Native git @('merge-base', '--is-ancestor', 'HEAD', "origin/$($repo.repository.default_branch)")
-
-# Prevent stale files on the persistent self-hosted runner from being uploaded.
-if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-New-Item -ItemType Directory dist | Out-Null
-$intro = 'Download `terminal-manager-' + $version + '-setup.exe` and run it for a per-user Windows x64 installation. Existing installations can update through **Settings > Updates**. This release contains the Windows installer.'
-[IO.File]::WriteAllText((Join-Path $PWD 'dist/install.md'), $intro)
-& "$PSScriptRoot/../release-notes.ps1" -Version $version -IntroFile dist/install.md -Verify
-
-Invoke-Native cargo @('test', '--locked', '--all', '--no-fail-fast', '--', '--test-threads=1')
-Invoke-Native cargo @('build', '--locked', '--release', '-p', 'terminal-manager', '--bin', 'terminal-manager', '-p', 'unshit-ptyd', '--bin', 'unshit-ptyd')
 
 $iscc = @(
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
