@@ -3494,15 +3494,14 @@ pub fn prepare_external_workspace_for_launch(state: &mut AppState, path: PathBuf
 /// open requests after the daemon is ready, so a caller can spawn a terminal
 /// immediately afterwards.
 fn activate_or_create_workspace_for_path(state: &mut AppState, path: &std::path::Path) -> bool {
+    // Lexical only: this runs under the state lock, and a `canonicalize` of
+    // every saved workspace blocked the UI whenever one lived on an
+    // unreachable network share or WSL distro.
     let existing = state.workspaces.iter().position(|workspace| {
-        workspace.path.as_ref().is_some_and(|workspace_path| {
-            workspace_path == path
-                || workspace_path
-                    .canonicalize()
-                    .ok()
-                    .as_deref()
-                    .is_some_and(|canonical| canonical == path)
-        })
+        workspace
+            .path
+            .as_deref()
+            .is_some_and(|workspace_path| crate::launch_target::same_path(workspace_path, path))
     });
     if let Some(index) = existing {
         if index != state.active_workspace {
@@ -7071,6 +7070,13 @@ fn dispatch_editor_open_path_buf_at(
 /// canonicalisation fails (a deleted file, a permission error), which is
 /// still correct for the common "the same string twice" case.
 fn find_editor_pane_for_path(state: &AppState, path: &std::path::Path) -> Option<u32> {
+    // The common case needs no filesystem access, which matters because
+    // callers hold the state lock.
+    if let Some((id, _)) = state.editors.iter().find(|(_, editor)| {
+        !editor.is_diff() && crate::launch_target::same_path(&editor.path, path)
+    }) {
+        return Some(*id);
+    }
     let target = std::fs::canonicalize(path).ok();
     state
         .editors
@@ -19725,6 +19731,48 @@ pub(crate) mod tests {
         let review = patch_state.diff_review.as_ref().expect("patch review");
         assert_eq!(review.mode, "patch");
         assert_eq!(review.patch_path.as_ref(), Some(&patch));
+
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn external_document_open_reuses_its_workspace_and_editor_by_path() {
+        // Regression: desktop opens matched workspaces by canonicalizing
+        // every saved workspace path under the state lock, so one workspace
+        // on an unreachable share froze the UI before the document opened.
+        let root = std::env::temp_dir().join(format!(
+            "terminal-manager-external-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test folder");
+        let root = root.canonicalize().expect("canonical test folder");
+        let markdown = root.join("notes.md");
+        std::fs::write(&markdown, "# notes\n").expect("write markdown fixture");
+        let target =
+            crate::launch_target::resolve_absolute_target(&markdown).expect("resolve target");
+
+        let mut state = test_state();
+        mutate_add_workspace_with_path(
+            &mut state,
+            Some(PathBuf::from("/unreachable/share/workspace")),
+        );
+        mutate_add_workspace_with_path(&mut state, Some(root.clone()));
+        let workspace_count = state.workspaces.len();
+        let docs_workspace = workspace_count - 1;
+        mutate_switch_workspace(&mut state, 0);
+
+        assert!(open_external_target(&mut state, &target));
+        assert_eq!(state.workspaces.len(), workspace_count);
+        assert_eq!(state.active_workspace, docs_workspace);
+        assert_eq!(state.editors.len(), 1);
+
+        assert!(open_external_target(&mut state, &target));
+        assert_eq!(state.workspaces.len(), workspace_count);
+        assert_eq!(state.editors.len(), 1, "a second open focuses the editor");
 
         std::fs::remove_dir_all(root).expect("remove test folder");
     }

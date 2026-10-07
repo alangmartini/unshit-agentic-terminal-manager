@@ -148,6 +148,104 @@ pub fn classify_supported_file_path(path: &Path) -> Option<LaunchTarget> {
     }
 }
 
+/// Whether two paths name the same location, compared without touching the
+/// filesystem.
+///
+/// Callers run this while holding the app state lock, so it must never block:
+/// a workspace on an unreachable network share or a stopped WSL distro made a
+/// per-workspace `canonicalize` hang the UI. On Windows the comparison also
+/// ignores the `\\?\` prefix `canonicalize` adds, separator style, and case,
+/// which is how the filesystem itself compares names there.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    if let (Some(a), Some(b)) = (a.to_str(), b.to_str()) {
+        return windows_path_key(a) == windows_path_key(b);
+    }
+    false
+}
+
+/// Drop the `\\?\` prefix Windows' `canonicalize` adds when the plain form
+/// names the same file. Stored verbatim, the prefix leaks into workspace
+/// paths, terminal working directories, and every later path comparison.
+pub fn simplify_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(simplified) = path.to_str().and_then(simplify_verbatim_str) {
+        return PathBuf::from(simplified);
+    }
+    path.to_path_buf()
+}
+
+/// `\\?\C:\dir` -> `C:\dir` and `\\?\UNC\server\share\dir` ->
+/// `\\server\share\dir`. `None` when the path is not verbatim or when Win32
+/// normalization would change what the plain form refers to (over-long
+/// paths, reserved device names, components ending in a dot or space).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn simplify_verbatim_str(path: &str) -> Option<String> {
+    const MAX_PATH: usize = 260;
+    let rest = path.strip_prefix(r"\\?\")?;
+    let simplified = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        let bytes = rest.as_bytes();
+        let is_drive_root = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        if !is_drive_root {
+            return None;
+        }
+        rest.to_string()
+    };
+    if simplified.len() >= MAX_PATH || simplified.contains('/') {
+        return None;
+    }
+    let components = simplified.split('\\').skip(1).filter(|c| !c.is_empty());
+    for component in components {
+        if component == "."
+            || component == ".."
+            || component.ends_with('.')
+            || component.ends_with(' ')
+            || is_reserved_device_name(component)
+        {
+            return None;
+        }
+    }
+    Some(simplified)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_reserved_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end()
+        .to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let bytes = stem.as_bytes();
+            bytes.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&bytes[3])
+        }
+    }
+}
+
+/// Comparison key for a Windows path string: verbatim prefix dropped,
+/// separators unified, trailing separators trimmed, case folded.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_path_key(path: &str) -> String {
+    let plain = simplify_verbatim_str(path).unwrap_or_else(|| path.to_string());
+    plain
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 fn exactly_one_path(args: &[OsString], command: &str) -> Result<PathBuf, String> {
     match args {
         [path] if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -168,6 +266,7 @@ fn resolve_target_from_dir(path: &Path, cwd: &Path) -> Result<LaunchTarget, Stri
 fn resolve_target(path: &Path) -> Result<LaunchTarget, String> {
     let path = path
         .canonicalize()
+        .map(|path| simplify_verbatim(&path))
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     let metadata = path
         .metadata()
@@ -342,6 +441,81 @@ mod tests {
             resolve_absolute_target(Path::new("relative.txt")),
             Err(message) if message.contains("absolute")
         ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn simplifies_verbatim_drive_and_unc_paths() {
+        assert_eq!(
+            simplify_verbatim_str(r"\\?\C:\Users\me\docs").as_deref(),
+            Some(r"C:\Users\me\docs")
+        );
+        assert_eq!(simplify_verbatim_str(r"\\?\D:\").as_deref(), Some(r"D:\"));
+        assert_eq!(
+            simplify_verbatim_str(r"\\?\UNC\server\share\notes").as_deref(),
+            Some(r"\\server\share\notes")
+        );
+        assert_eq!(simplify_verbatim_str(r"C:\already\plain"), None);
+    }
+
+    #[test]
+    fn keeps_verbatim_paths_whose_plain_form_differs() {
+        // Win32 normalization would reinterpret each of these.
+        assert_eq!(simplify_verbatim_str(r"\\?\C:\dir\CON"), None);
+        assert_eq!(simplify_verbatim_str(r"\\?\C:\dir\lpt1.txt"), None);
+        assert_eq!(simplify_verbatim_str(r"\\?\C:\dir\trailing."), None);
+        assert_eq!(simplify_verbatim_str(r"\\?\C:\dir\trailing "), None);
+        assert_eq!(simplify_verbatim_str(r"\\?\C:relative"), None);
+        assert_eq!(simplify_verbatim_str(r"\\?\Volume{1234}\dir"), None);
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(simplify_verbatim_str(&long), None);
+        // Names that merely start like a device stay simplifiable.
+        assert_eq!(
+            simplify_verbatim_str(r"\\?\C:\console\com10").as_deref(),
+            Some(r"C:\console\com10")
+        );
+    }
+
+    #[test]
+    fn windows_path_keys_ignore_verbatim_prefix_case_and_separators() {
+        // Regression: Explorer opens resolve to `\\?\C:\...` while saved
+        // workspaces hold `C:\...`. Matching them used to need a
+        // `canonicalize` of every workspace under the state lock, which hung
+        // the UI on unreachable workspace paths.
+        assert_eq!(
+            windows_path_key(r"\\?\C:\Users\Me\Proj"),
+            windows_path_key(r"c:/users/me/proj/")
+        );
+        assert_ne!(
+            windows_path_key(r"C:\Users\me\proj"),
+            windows_path_key(r"C:\Users\me\proj2")
+        );
+    }
+
+    #[test]
+    fn same_path_compares_without_the_filesystem() {
+        let missing = Path::new("/definitely/not/a/real/workspace");
+        assert!(same_path(
+            missing,
+            Path::new("/definitely/not/a/real/workspace/")
+        ));
+        assert!(!same_path(
+            missing,
+            Path::new("/definitely/not/a/real/other")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_targets_drop_the_verbatim_prefix() {
+        let root = test_root("verbatim");
+        let markdown = root.join("notes.md");
+        std::fs::write(&markdown, "# notes").unwrap();
+
+        let target = resolve_absolute_target(&markdown).unwrap();
+        assert!(!target.path().to_string_lossy().starts_with(r"\\?\"));
+        assert!(same_path(target.path(), &markdown.canonicalize().unwrap()));
 
         std::fs::remove_dir_all(root).unwrap();
     }
