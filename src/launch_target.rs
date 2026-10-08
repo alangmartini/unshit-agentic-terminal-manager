@@ -326,6 +326,12 @@ impl ExpectedKind {
 mod tests {
     use super::*;
 
+    /// What resolution yields for an existing path: canonical, without the
+    /// Windows verbatim prefix.
+    fn resolved(path: &Path) -> PathBuf {
+        simplify_verbatim(&path.canonicalize().unwrap())
+    }
+
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "terminal-manager-launch-target-{label}-{}-{}",
@@ -359,25 +365,25 @@ mod tests {
                 ],
                 &root
             ),
-            ParseResult::Target(LaunchTarget::Folder(folder.canonicalize().unwrap()))
+            ParseResult::Target(LaunchTarget::Folder(resolved(&folder)))
         );
         assert_eq!(
             parse_args_from_dir(
                 [OsString::from("open-file"), text.clone().into_os_string()],
                 &root
             ),
-            ParseResult::Target(LaunchTarget::TextFile(text.canonicalize().unwrap()))
+            ParseResult::Target(LaunchTarget::TextFile(resolved(&text)))
         );
         assert_eq!(
             parse_args_from_dir([markdown.clone().into_os_string()], &root),
-            ParseResult::Target(LaunchTarget::TextFile(markdown.canonicalize().unwrap()))
+            ParseResult::Target(LaunchTarget::TextFile(resolved(&markdown)))
         );
         assert_eq!(
             parse_args_from_dir(
                 [OsString::from("open-patch"), patch.clone().into_os_string()],
                 &root
             ),
-            ParseResult::Target(LaunchTarget::PatchFile(patch.canonicalize().unwrap()))
+            ParseResult::Target(LaunchTarget::PatchFile(resolved(&patch)))
         );
 
         std::fs::remove_dir_all(root).unwrap();
@@ -391,7 +397,7 @@ mod tests {
 
         assert_eq!(
             parse_args_from_dir(["open", "draft.md"], &root),
-            ParseResult::Target(LaunchTarget::TextFile(text.canonicalize().unwrap()))
+            ParseResult::Target(LaunchTarget::TextFile(resolved(&text)))
         );
         assert_eq!(
             parse_args_from_dir(["agent", "codex"], &root),
