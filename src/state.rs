@@ -3518,7 +3518,7 @@ fn activate_or_create_workspace_for_path(state: &mut AppState, path: &std::path:
 /// Open a new terminal whose working directory is `path`. Used both by the
 /// native desktop integrations and by the built-in Explorer context menu.
 pub fn open_terminal_here(state: &mut AppState, path: PathBuf) -> bool {
-    let path = match path.canonicalize() {
+    let path = match crate::launch_target::canonicalize_plain(&path) {
         Ok(path) if path.is_dir() => path,
         Ok(path) => {
             push_error_toast(state, format!("{} is not a folder", path.display()));
@@ -7065,29 +7065,26 @@ fn dispatch_editor_open_path_buf_at(
 
 /// Pane id of an editor holding `path`, in any workspace.
 ///
-/// Compares canonicalised paths so `src/state.rs` and an absolute spelling
-/// of the same file are one pane; falls back to the raw path when
-/// canonicalisation fails (a deleted file, a permission error), which is
-/// still correct for the common "the same string twice" case.
+/// Checks lexical equality first (via `same_path`, which touches no
+/// filesystem, since callers hold the state lock); only canonicalises when
+/// that is inconclusive, so that e.g. `src/state.rs` and an absolute
+/// spelling of the same file still match as one pane. If canonicalisation
+/// fails (a deleted file, a permission error), there is no match beyond the
+/// lexical pass already checked.
 fn find_editor_pane_for_path(state: &AppState, path: &std::path::Path) -> Option<u32> {
-    // The common case needs no filesystem access, which matters because
-    // callers hold the state lock.
     if let Some((id, _)) = state.editors.iter().find(|(_, editor)| {
         !editor.is_diff() && crate::launch_target::same_path(&editor.path, path)
     }) {
         return Some(*id);
     }
-    let target = std::fs::canonicalize(path).ok();
+    let target = std::fs::canonicalize(path).ok()?;
     state
         .editors
         .iter()
-        .filter(|(_, editor)| !editor.is_diff())
-        .find(
-            |(_, editor)| match (&target, std::fs::canonicalize(&editor.path).ok()) {
-                (Some(a), Some(b)) => a == &b,
-                _ => editor.path == path,
-            },
-        )
+        .find(|(_, editor)| {
+            !editor.is_diff()
+                && std::fs::canonicalize(&editor.path).ok().as_deref() == Some(target.as_path())
+        })
         .map(|(id, _)| *id)
 }
 
@@ -19773,6 +19770,35 @@ pub(crate) mod tests {
         assert!(open_external_target(&mut state, &target));
         assert_eq!(state.workspaces.len(), workspace_count);
         assert_eq!(state.editors.len(), 1, "a second open focuses the editor");
+
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_a_resolved_folder_target_keeps_the_verbatim_prefix_off() {
+        // Regression: `open_terminal_here` re-canonicalized a `Folder`
+        // target that `resolve_target` had already simplified, which on
+        // Windows re-adds the `\\?\` prefix `canonicalize` always produces
+        // and leaks it back into the stored workspace path.
+        let root = std::env::temp_dir().join(format!(
+            "terminal-manager-folder-verbatim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test folder");
+        let target = crate::launch_target::resolve_absolute_target(&root).expect("resolve target");
+
+        let mut state = test_state();
+        assert!(open_external_target(&mut state, &target));
+        let workspace_path = state.workspaces[state.active_workspace]
+            .path
+            .as_ref()
+            .expect("workspace path");
+        assert!(!workspace_path.to_string_lossy().starts_with(r"\\?\"));
 
         std::fs::remove_dir_all(root).expect("remove test folder");
     }

@@ -167,10 +167,18 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     false
 }
 
+/// Canonicalize `path`, then simplify away Windows' `\\?\` prefix in one
+/// atomic step. Callers that store or display the result must go through
+/// this rather than `Path::canonicalize` directly, since a second
+/// `canonicalize` of an already-simplified path re-adds the prefix.
+pub fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map(|path| simplify_verbatim(&path))
+}
+
 /// Drop the `\\?\` prefix Windows' `canonicalize` adds when the plain form
 /// names the same file. Stored verbatim, the prefix leaks into workspace
 /// paths, terminal working directories, and every later path comparison.
-pub fn simplify_verbatim(path: &Path) -> PathBuf {
+fn simplify_verbatim(path: &Path) -> PathBuf {
     #[cfg(windows)]
     if let Some(simplified) = path.to_str().and_then(simplify_verbatim_str) {
         return PathBuf::from(simplified);
@@ -264,9 +272,7 @@ fn resolve_target_from_dir(path: &Path, cwd: &Path) -> Result<LaunchTarget, Stri
 }
 
 fn resolve_target(path: &Path) -> Result<LaunchTarget, String> {
-    let path = path
-        .canonicalize()
-        .map(|path| simplify_verbatim(&path))
+    let path = canonicalize_plain(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     let metadata = path
         .metadata()
@@ -329,7 +335,7 @@ mod tests {
     /// What resolution yields for an existing path: canonical, without the
     /// Windows verbatim prefix.
     fn resolved(path: &Path) -> PathBuf {
-        simplify_verbatim(&path.canonicalize().unwrap())
+        canonicalize_plain(path).unwrap()
     }
 
     fn test_root(label: &str) -> PathBuf {
