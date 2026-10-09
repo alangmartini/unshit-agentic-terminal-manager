@@ -19,30 +19,26 @@ permissions:
 jobs:
   rust-checks:
     name: Rust Checks
-    runs-on: [self-hosted, Windows, X64, local-windows]
-    timeout-minutes: 20
+    # GitHub-hosted: standard runners are free for this public repository, and
+    # the cargo build no longer competes for CPU with the other projects that
+    # share the local runner machine. The VM is ephemeral, so rust-cache can
+    # keep the default CARGO_HOME without touching anyone's ~/.cargo.
+    runs-on: windows-latest
+    timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # Self-hosted runner shares $USERPROFILE with the developer. Without
-      # this redirect, Swatinem/rust-cache@v2 wipes ~/.cargo/bin on cache
-      # restore, deleting the dev box's rustup proxy shims every PR run
-      # (4-incident streak May 5-13, 2026, root-caused via NTFS audit on
-      # ~/.cargo/bin and ~/.rustup -- see unshit-test-framework/scripts/).
-      CARGO_HOME: C:\Users\Alan Beelink\actions-runner\.cargo-runner
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        shell: powershell
+        # bash runs with -e, so a failed install stops the step.
+        shell: bash
         run: |
-          $toolchainBin = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
-          if (-not (Test-Path "$toolchainBin\cargo.exe")) {
-            throw "Stable Rust toolchain is missing at $toolchainBin"
-          }
-          $toolchainBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$toolchainBin\cargo.exe" --version
-          & "$toolchainBin\cargo-clippy.exe" --version
-          & "$toolchainBin\cargo-fmt.exe" --version
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
 
       - uses: Swatinem/rust-cache@v2
 
