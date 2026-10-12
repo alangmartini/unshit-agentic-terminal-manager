@@ -1388,11 +1388,19 @@ impl Terminal {
     /// Wheel up is button code 64, wheel down 65 (the xterm "button 4/5"
     /// wheel encoding). SGR mode (DECSET 1006) emits `ESC[<Cb;Cx;CyM`;
     /// otherwise legacy X10 `ESC[M` with each of button/col/row offset by
-    /// 32 and clamped to the 223 byte ceiling. The pointer cell is
-    /// reported as `1;1`: the wheel dispatch only carries window-absolute
-    /// coordinates, and mouse-driven TUIs scroll their content regardless
-    /// of the reported cell, so a fixed valid position is sufficient.
-    pub fn encode_wheel_reports(&mut self, delta_y: f32, cell_h: f32) -> Vec<u8> {
+    /// 32 and clamped to the 223 byte ceiling.
+    ///
+    /// `cell` is the zero-based visible `(row, col)` under the pointer and
+    /// is reported 1-based, clamped to the grid. The position matters:
+    /// Codex hit-tests every wheel report against its transcript area and
+    /// drops the ones outside it, and its top row is a sticky prompt
+    /// header, so a fixed `1;1` made the wheel do nothing there.
+    pub fn encode_wheel_reports(
+        &mut self,
+        delta_y: f32,
+        cell_h: f32,
+        cell: (usize, usize),
+    ) -> Vec<u8> {
         if !self.mouse_reporting_active() || cell_h <= 0.0 || !delta_y.is_finite() {
             self.mouse_wheel_accum = 0.0;
             return Vec::new();
@@ -1408,15 +1416,24 @@ impl Terminal {
             return Vec::new();
         }
         let button: u16 = if lines > 0 { 64 } else { 65 };
+        let row = cell.0.min(self.rows.saturating_sub(1)) + 1;
+        let col = cell.1.min(self.cols.saturating_sub(1)) + 1;
         let count = lines.unsigned_abs() as usize;
         let mut out = Vec::new();
         for _ in 0..count {
             if self.mouse_sgr {
-                out.extend_from_slice(format!("\x1b[<{};1;1M", button).as_bytes());
+                out.extend_from_slice(format!("\x1b[<{};{};{}M", button, col, row).as_bytes());
             } else {
                 // X10: cap the 7-bit payload bytes at 255 (32 + 223).
-                let enc = |v: u16| -> u8 { (32 + v.min(223)) as u8 };
-                out.extend_from_slice(&[0x1b, b'[', b'M', enc(button), enc(1), enc(1)]);
+                let enc = |v: usize| -> u8 { (32 + v.min(223)) as u8 };
+                out.extend_from_slice(&[
+                    0x1b,
+                    b'[',
+                    b'M',
+                    enc(button as usize),
+                    enc(col),
+                    enc(row),
+                ]);
             }
         }
         out
@@ -5403,7 +5420,7 @@ mod tests {
     #[test]
     fn encode_wheel_reports_empty_when_reporting_off() {
         let mut term = Terminal::new(3, 5);
-        assert!(term.encode_wheel_reports(100.0, 20.0).is_empty());
+        assert!(term.encode_wheel_reports(100.0, 20.0, (0, 0)).is_empty());
     }
 
     #[test]
@@ -5411,12 +5428,18 @@ mod tests {
         let mut term = Terminal::new(3, 5);
         term.process_bytes(b"\x1b[?1000h\x1b[?1006h"); // tracking + SGR
                                                        // Wheel up (delta_y > 0) => button 64; one line == one report.
-        assert_eq!(term.encode_wheel_reports(20.0, 20.0), b"\x1b[<64;1;1M");
+        assert_eq!(
+            term.encode_wheel_reports(20.0, 20.0, (0, 0)),
+            b"\x1b[<64;1;1M"
+        );
         // Wheel down (delta_y < 0) => button 65.
-        assert_eq!(term.encode_wheel_reports(-20.0, 20.0), b"\x1b[<65;1;1M");
+        assert_eq!(
+            term.encode_wheel_reports(-20.0, 20.0, (0, 0)),
+            b"\x1b[<65;1;1M"
+        );
         // Three lines of motion in one event => three reports.
         assert_eq!(
-            term.encode_wheel_reports(60.0, 20.0),
+            term.encode_wheel_reports(60.0, 20.0, (0, 0)),
             b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M"
         );
     }
@@ -5426,7 +5449,45 @@ mod tests {
         let mut term = Terminal::new(3, 5);
         term.process_bytes(b"\x1b[?1000h"); // tracking, legacy X10 encoding
                                             // ESC [ M  (32+64)=96='`'  (32+1)=33='!'  (32+1)=33='!'
-        assert_eq!(term.encode_wheel_reports(20.0, 20.0), b"\x1b[M`!!");
+        assert_eq!(term.encode_wheel_reports(20.0, 20.0, (0, 0)), b"\x1b[M`!!");
+    }
+
+    #[test]
+    fn encode_wheel_reports_carry_the_pointer_cell() {
+        // Codex drops wheel reports outside its transcript area, and its
+        // top row is a prompt header, so the real cell must be reported.
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[?1003h\x1b[?1006h"); // Codex's mouse modes via ConPTY
+        assert_eq!(
+            term.encode_wheel_reports(20.0, 20.0, (11, 39)),
+            b"\x1b[<64;40;12M",
+            "zero-based (row 11, col 39) is reported as 1-based column 40, row 12"
+        );
+        assert_eq!(
+            term.encode_wheel_reports(-20.0, 20.0, (0, 0)),
+            b"\x1b[<65;1;1M"
+        );
+    }
+
+    #[test]
+    fn encode_wheel_reports_clamp_the_pointer_cell_to_the_grid() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            term.encode_wheel_reports(20.0, 20.0, (500, 900)),
+            b"\x1b[<64;80;24M"
+        );
+    }
+
+    #[test]
+    fn encode_wheel_reports_x10_carries_the_pointer_cell() {
+        let mut term = Terminal::new(24, 80);
+        term.process_bytes(b"\x1b[?1000h");
+        // ESC [ M  (32+65)=97='a'  (32+3)=35='#'  (32+2)=34='"'
+        assert_eq!(
+            term.encode_wheel_reports(-20.0, 20.0, (1, 2)),
+            b"\x1b[Ma#\""
+        );
     }
 
     #[test]
@@ -5434,9 +5495,12 @@ mod tests {
         let mut term = Terminal::new(3, 5);
         term.process_bytes(b"\x1b[?1000h\x1b[?1006h");
         // Half a line: below the whole-line threshold, so no report yet.
-        assert!(term.encode_wheel_reports(10.0, 20.0).is_empty());
+        assert!(term.encode_wheel_reports(10.0, 20.0, (0, 0)).is_empty());
         // Another half line completes one whole line => exactly one report.
-        assert_eq!(term.encode_wheel_reports(10.0, 20.0), b"\x1b[<64;1;1M");
+        assert_eq!(
+            term.encode_wheel_reports(10.0, 20.0, (0, 0)),
+            b"\x1b[<64;1;1M"
+        );
     }
 
     #[test]
@@ -5860,17 +5924,23 @@ mod tests {
             let mut ui = Terminal::new(3, 10);
             ui.apply_snapshot(&snapshot);
             assert!(ui.mouse_reporting_active());
-            assert_eq!(ui.encode_wheel_reports(20.0, 20.0), b"\x1b[<64;1;1M");
-            assert_eq!(ui.encode_wheel_reports(-20.0, 20.0), b"\x1b[<65;1;1M");
+            assert_eq!(
+                ui.encode_wheel_reports(20.0, 20.0, (0, 0)),
+                b"\x1b[<64;1;1M"
+            );
+            assert_eq!(
+                ui.encode_wheel_reports(-20.0, 20.0, (0, 0)),
+                b"\x1b[<65;1;1M"
+            );
 
             // A later snapshot must also clear disabled modes and partial motion.
-            assert!(ui.encode_wheel_reports(10.0, 20.0).is_empty());
+            assert!(ui.encode_wheel_reports(10.0, 20.0, (0, 0)).is_empty());
             daemon.process_bytes(format!("\x1b[?{mode};1006l").as_bytes());
             ui.apply_snapshot(&daemon.snapshot(100));
             assert!(!ui.mouse_reporting_active());
             ui.process_bytes(b"\x1b[?1000h");
-            assert!(ui.encode_wheel_reports(10.0, 20.0).is_empty());
-            assert_eq!(ui.encode_wheel_reports(10.0, 20.0), b"\x1b[M`!!");
+            assert!(ui.encode_wheel_reports(10.0, 20.0, (0, 0)).is_empty());
+            assert_eq!(ui.encode_wheel_reports(10.0, 20.0, (0, 0)), b"\x1b[M`!!");
         }
     }
 

@@ -763,20 +763,39 @@ fn handle_animated_wheel(
 /// `None` when mouse reporting is off, so the caller falls through to the
 /// normal scrollback paths. `Shift+wheel` is the local-scrollback escape
 /// hatch and is filtered by the caller before this is reached.
+///
+/// `local_x`/`local_y` are the pointer's element-local pixels; the reports
+/// carry the visible cell under them (the same mapping link hover uses),
+/// because programs such as Codex ignore wheel reports outside the region
+/// they scroll.
 fn forward_wheel_if_mouse_mode(
     shared: &SharedState,
     pane: u32,
     delta_y: f32,
     cell_h: f32,
+    local_x: f32,
+    local_y: f32,
 ) -> Option<unshit::app::app::ScrollGridPatch> {
     mutate_with(shared, |st| {
         let handle = st.terminals.get(&pane)?.clone();
-        let bytes = {
+        let (bytes, (row, col)) = {
             let mut terminal = handle.lock_recover();
             if !terminal.mouse_reporting_active() {
                 return None;
             }
-            terminal.encode_wheel_reports(delta_y, cell_h)
+            let cell_w =
+                unshit::core::cell_grid::CellGrid::global_cell_w() * terminal_cell_width_scale();
+            let cell = crate::state::cell_from_local(
+                local_x,
+                local_y,
+                cell_w,
+                cell_h,
+                terminal_content_x_offset(),
+                terminal.grid().cols(),
+                terminal.grid().rows(),
+            )
+            .unwrap_or((0, 0));
+            (terminal.encode_wheel_reports(delta_y, cell_h, cell), cell)
         };
         // Mouse mode is active: consume the wheel regardless of whether
         // this (possibly sub-line) delta has yet accumulated to a whole
@@ -789,19 +808,22 @@ fn forward_wheel_if_mouse_mode(
             // and a later "my unfocused pane reacted to the mouse"
             // report needs to be readable straight off this line.
             let active = st.active_pane.0 == pane;
+            // `row`/`col` are the zero-based cell the reports named, so a
+            // "the wheel reached the program but nothing scrolled" report
+            // shows whether the program got a position inside its area.
             match st.pty_manager.write(pane, &bytes) {
                 Ok(()) => record_diagnostic_pty_event(
                     st,
                     format!(
-                        "write pane={} bytes={} source=wheel active={}",
-                        pane, byte_count, active
+                        "write pane={} bytes={} source=wheel active={} row={} col={}",
+                        pane, byte_count, active, row, col
                     ),
                 ),
                 Err(e) => record_diagnostic_pty_event(
                     st,
                     format!(
-                        "write_failed pane={} source=wheel active={} error={}",
-                        pane, active, e
+                        "write_failed pane={} source=wheel active={} row={} col={} error={}",
+                        pane, active, row, col, e
                     ),
                 ),
             }
@@ -1169,6 +1191,8 @@ fn build_pane_body_with_event_sink(
                             scroll_pane_id.0,
                             se.delta_y,
                             cell_h,
+                            se.local_x,
+                            se.local_y,
                         ) {
                             return Some(Box::new(patch));
                         }
@@ -3267,6 +3291,44 @@ mod tests_mouse_selection_copy_paste {
             term.scroll_offset(),
             0,
             "wheel forwarded to the program must not move the local view"
+        );
+    }
+
+    #[test]
+    fn forwarded_wheel_reports_the_cell_under_the_pointer() {
+        // Regression: Codex hit-tests wheel reports against its transcript
+        // area, whose top row is a sticky prompt header. Reports pinned to
+        // 1;1 were all dropped, so the wheel never scrolled a Codex pane.
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.active_pane = PaneId(1);
+            let mut term = crate::terminal::Terminal::new(24, 80);
+            term.process_bytes(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+            guard.terminals.insert(1, Arc::new(Mutex::new(term)));
+        }
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        // Pointer in the middle of zero-based cell (row 11, col 39).
+        let _ = (handler)(&Event::Scroll(unshit::core::event::ScrollEvent {
+            delta_y: 20.0,
+            local_x: 395.0,
+            local_y: 230.0,
+            ..Default::default()
+        }))
+        .expect("scroll handler must return a value");
+
+        let guard = shared.lock().unwrap();
+        let line = guard
+            .diagnostic_pty_recent_events
+            .iter()
+            .rev()
+            .find(|e| e.contains("source=wheel"))
+            .expect("a forwarded wheel must leave a diagnostic PTY line");
+        assert!(
+            line.contains("row=11 col=39"),
+            "the report must name the pointer cell, got {line:?}"
         );
     }
 
