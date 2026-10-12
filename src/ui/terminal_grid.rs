@@ -753,22 +753,24 @@ fn handle_animated_wheel(
     }
 }
 
-/// Forward a wheel notch to the PTY as mouse-wheel reports when the
-/// focused program has enabled mouse tracking (DECSET 1000/1002/1003).
+/// Forward a wheel notch to the program in `pane` when that program owns
+/// the wheel: as mouse-wheel reports when it enabled mouse tracking
+/// (DECSET 1000/1002/1003), or as cursor Up/Down keys when it is on the
+/// alternate screen with xterm alternate scroll (DECSET 1007) and no mouse
+/// tracking (Codex's pager and onboarding screens).
 ///
-/// Returns `Some(empty patch)` when the program is capturing the mouse:
-/// the wheel then belongs to the program (so a TUI in the alternate
-/// screen — Claude Code, vim, fzf — scrolls its own content) and must
-/// NOT also move local scrollback, so the caller stops here. Returns
-/// `None` when mouse reporting is off, so the caller falls through to the
-/// normal scrollback paths. `Shift+wheel` is the local-scrollback escape
-/// hatch and is filtered by the caller before this is reached.
+/// Returns `Some(empty patch)` when the program owns the wheel: it then
+/// scrolls its own content (Claude Code, vim, fzf, Codex) and the wheel
+/// must NOT also move local scrollback, so the caller stops here. Returns
+/// `None` otherwise, so the caller falls through to the normal scrollback
+/// paths. `Shift+wheel` is the local-scrollback escape hatch and is
+/// filtered by the caller before this is reached.
 ///
-/// `local_x`/`local_y` are the pointer's element-local pixels; the reports
-/// carry the visible cell under them (the same mapping link hover uses),
-/// because programs such as Codex ignore wheel reports outside the region
-/// they scroll.
-fn forward_wheel_if_mouse_mode(
+/// `local_x`/`local_y` are the pointer's element-local pixels; mouse
+/// reports carry the visible cell under them (the same mapping link hover
+/// uses), because programs such as Codex ignore wheel reports outside the
+/// region they scroll.
+fn forward_wheel_to_program(
     shared: &SharedState,
     pane: u32,
     delta_y: f32,
@@ -778,28 +780,33 @@ fn forward_wheel_if_mouse_mode(
 ) -> Option<unshit::app::app::ScrollGridPatch> {
     mutate_with(shared, |st| {
         let handle = st.terminals.get(&pane)?.clone();
-        let (bytes, (row, col)) = {
+        let (bytes, source, cell) = {
             let mut terminal = handle.lock_recover();
-            if !terminal.mouse_reporting_active() {
+            if terminal.mouse_reporting_active() {
+                let cell_w = unshit::core::cell_grid::CellGrid::global_cell_w()
+                    * terminal_cell_width_scale();
+                let cell = crate::state::cell_from_local(
+                    local_x,
+                    local_y,
+                    cell_w,
+                    cell_h,
+                    terminal_content_x_offset(),
+                    terminal.grid().cols(),
+                    terminal.grid().rows(),
+                )
+                .unwrap_or((0, 0));
+                let bytes = terminal.encode_wheel_reports(delta_y, cell_h, cell);
+                (bytes, "wheel", Some(cell))
+            } else if terminal.alternate_scroll_active() {
+                let bytes = terminal.encode_alternate_scroll_keys(delta_y, cell_h);
+                (bytes, "wheel_alternate_scroll", None)
+            } else {
                 return None;
             }
-            let cell_w =
-                unshit::core::cell_grid::CellGrid::global_cell_w() * terminal_cell_width_scale();
-            let cell = crate::state::cell_from_local(
-                local_x,
-                local_y,
-                cell_w,
-                cell_h,
-                terminal_content_x_offset(),
-                terminal.grid().cols(),
-                terminal.grid().rows(),
-            )
-            .unwrap_or((0, 0));
-            (terminal.encode_wheel_reports(delta_y, cell_h, cell), cell)
         };
-        // Mouse mode is active: consume the wheel regardless of whether
+        // The program owns the wheel: consume it regardless of whether
         // this (possibly sub-line) delta has yet accumulated to a whole
-        // line of reports, so it never leaks into local scrollback.
+        // line, so it never leaks into local scrollback.
         if !bytes.is_empty() {
             let byte_count = bytes.len();
             // `active` tells a hover-scrolled background pane apart from
@@ -808,22 +815,23 @@ fn forward_wheel_if_mouse_mode(
             // and a later "my unfocused pane reacted to the mouse"
             // report needs to be readable straight off this line.
             let active = st.active_pane.0 == pane;
-            // `row`/`col` are the zero-based cell the reports named, so a
-            // "the wheel reached the program but nothing scrolled" report
+            // `row`/`col` are the zero-based cell a mouse report named, so
+            // a "the wheel reached the program but nothing scrolled" report
             // shows whether the program got a position inside its area.
+            let cell = cell
+                .map(|(row, col)| format!(" row={row} col={col}"))
+                .unwrap_or_default();
             match st.pty_manager.write(pane, &bytes) {
                 Ok(()) => record_diagnostic_pty_event(
                     st,
                     format!(
-                        "write pane={} bytes={} source=wheel active={} row={} col={}",
-                        pane, byte_count, active, row, col
+                        "write pane={pane} bytes={byte_count} source={source} active={active}{cell}"
                     ),
                 ),
                 Err(e) => record_diagnostic_pty_event(
                     st,
                     format!(
-                        "write_failed pane={} source=wheel active={} row={} col={} error={}",
-                        pane, active, row, col, e
+                        "write_failed pane={pane} bytes={byte_count} source={source} active={active}{cell} error={e}"
                     ),
                 ),
             }
@@ -1180,13 +1188,15 @@ fn build_pane_body_with_event_sink(
                 if let Event::Scroll(se) = event {
                     use unshit::core::cell_grid::CellGrid;
                     let cell_h = CellGrid::global_cell_h().max(1.0);
-                    // A program capturing the mouse (DECSET 1000/1002/1003)
-                    // owns the wheel: forward the notch as mouse reports so
-                    // the TUI scrolls its own content. Shift+wheel is the
-                    // escape hatch that always drives local scrollback
-                    // (xterm convention), so it skips forwarding.
+                    // A program capturing the mouse (DECSET 1000/1002/1003),
+                    // or one on the alternate screen with alternate scroll
+                    // (DECSET 1007), owns the wheel: forward the notch as
+                    // mouse reports or cursor keys so the TUI scrolls its
+                    // own content. Shift+wheel is the escape hatch that
+                    // always drives local scrollback (xterm convention), so
+                    // it skips forwarding.
                     if !se.modifiers.contains(Modifiers::SHIFT) {
-                        if let Some(patch) = forward_wheel_if_mouse_mode(
+                        if let Some(patch) = forward_wheel_to_program(
                             &scroll_shared,
                             scroll_pane_id.0,
                             se.delta_y,
@@ -3292,6 +3302,88 @@ mod tests_mouse_selection_copy_paste {
             0,
             "wheel forwarded to the program must not move the local view"
         );
+    }
+
+    /// Seed pane 1 with scrollback and a program that set alternate scroll
+    /// (DECSET 1007), optionally on the alternate screen, like a Codex
+    /// pager. Mouse reporting stays off.
+    fn seed_alternate_scroll_terminal(shared: &SharedState, alt_screen: bool) {
+        let mut guard = shared.lock().unwrap();
+        guard.active_pane = PaneId(1);
+        let mut term = crate::terminal::Terminal::new(3, 5);
+        term.process_bytes(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+        if alt_screen {
+            term.process_bytes(b"\x1b[?1049h");
+        }
+        term.process_bytes(b"\x1b[?1007h");
+        assert!(!term.mouse_reporting_active());
+        guard.terminals.insert(1, Arc::new(Mutex::new(term)));
+    }
+
+    #[test]
+    fn alternate_scroll_sends_the_wheel_to_the_program_on_the_alt_screen() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        seed_alternate_scroll_terminal(&shared, true);
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let patch = (handler)(&wheel_event(cell_h * 2.0))
+            .expect("scroll handler must return a value")
+            .downcast::<unshit::app::app::ScrollGridPatch>()
+            .expect("scroll handler must return a ScrollGridPatch");
+
+        assert!(patch.grid.is_none(), "a forwarded wheel must not repaint");
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard
+                .terminals
+                .get(&1)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            0,
+            "the wheel belongs to the program, not local scrollback"
+        );
+        let line = guard
+            .diagnostic_pty_recent_events
+            .iter()
+            .rev()
+            .find(|e| e.contains("source=wheel_alternate_scroll"))
+            .expect("the cursor keys must leave a diagnostic PTY line");
+        assert!(
+            line.contains("bytes=6"),
+            "two Up keys of 3 bytes, got {line:?}"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_on_the_main_screen_keeps_local_scrollback() {
+        let shared = make_shared();
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+        seed_alternate_scroll_terminal(&shared, false);
+        let handler = scroll_handler_for_pane(&shared, 1);
+
+        let cell_h = CellGrid::global_cell_h().max(1.0);
+        let _ = (handler)(&wheel_event(cell_h * 2.0)).expect("scroll handler must return a value");
+
+        let guard = shared.lock().unwrap();
+        assert_eq!(
+            guard
+                .terminals
+                .get(&1)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .scroll_offset(),
+            1,
+            "1007 only applies on the alternate screen"
+        );
+        assert!(!guard
+            .diagnostic_pty_recent_events
+            .iter()
+            .any(|e| e.contains("source=wheel")));
     }
 
     #[test]

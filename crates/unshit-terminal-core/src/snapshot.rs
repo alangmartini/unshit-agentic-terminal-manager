@@ -14,6 +14,15 @@ pub struct Snapshot {
     /// bridge can continue sending focus-in/focus-out reports to the child.
     #[serde(default)]
     pub focus_reporting_1004: bool,
+    /// DECSET 1007 alternate scroll must survive reattachment so the wheel
+    /// keeps sending cursor keys to a program on the alternate screen.
+    #[serde(default)]
+    pub alternate_scroll_1007: bool,
+    /// Whether the alternate screen was active. The snapshot carries only
+    /// the visible grid, so the UI cannot rebuild the parked main screen,
+    /// but it needs to know the program owns the screen.
+    #[serde(default)]
+    pub alt_screen: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +46,8 @@ mod tests {
         let snapshot: Snapshot = serde_json::from_value(old).unwrap();
         assert_eq!(snapshot.mouse_modes, MouseModes::default());
         assert!(!snapshot.focus_reporting_1004);
+        assert!(!snapshot.alternate_scroll_1007);
+        assert!(!snapshot.alt_screen);
     }
 
     #[test]
@@ -45,6 +56,8 @@ mod tests {
         let snap = Snapshot {
             mouse_modes: MouseModes::default(),
             focus_reporting_1004: true,
+            alternate_scroll_1007: true,
+            alt_screen: true,
             grid: grid.clone(),
             scrollback: vec![vec![Cell::BLANK; 3]],
         };

@@ -120,6 +120,12 @@ pub struct Terminal {
     /// (DEC private mode 1049 / 47 / 1047). `None` means the main
     /// screen is currently in `grid`.
     alt_grid: Option<CellGrid>,
+    /// The daemon snapshot this terminal attached from reported the
+    /// alternate screen active. The snapshot carries only the visible grid,
+    /// so `alt_grid` cannot be rebuilt; this flag keeps
+    /// `alt_screen_active` (and with it alternate scroll) truthful until
+    /// the program next enters or leaves the alternate screen.
+    alt_screen_at_attach: bool,
     /// Cursor position saved by the alt-screen entry sequence. Kept
     /// separate from `saved_cursor` (DECSC) so a TUI nesting `ESC 7` /
     /// `ESC 8` inside the alt screen cannot trample the slot used to
@@ -173,6 +179,12 @@ pub struct Terminal {
     /// `ESC[<b;x;yM`). When unset we fall back to legacy X10 encoding
     /// (`ESC[M` + three offset-by-32 bytes). Claude Code enables 1006.
     mouse_sgr: bool,
+    /// Whether the program enabled xterm alternate scroll (DECSET 1007).
+    /// While the alternate screen is up and mouse reporting is off, wheel
+    /// notches become cursor Up/Down keys, so a TUI that leaves the mouse
+    /// to the terminal for native selection (Codex pickers and pagers)
+    /// still scrolls. See [`Terminal::alternate_scroll_active`].
+    alternate_scroll_1007: bool,
     /// Fractional-line carry for wheel-to-mouse-report forwarding, so a
     /// precision touchpad's sub-line deltas accumulate into whole-line
     /// wheel events instead of rounding every event (mirrors
@@ -437,6 +449,7 @@ impl Terminal {
             scroll_anim_cell_h: 0.0,
             scroll_view_fraction: 0.0,
             alt_grid: None,
+            alt_screen_at_attach: false,
             alt_saved_cursor: (0, 0),
             alt_saved_fg: default_fg(),
             alt_saved_bg: default_bg(),
@@ -452,6 +465,7 @@ impl Terminal {
             mouse_report_1002: false,
             mouse_report_1003: false,
             mouse_sgr: false,
+            alternate_scroll_1007: false,
             mouse_wheel_accum: 0.0,
             evicted_lines: 0,
             telemetry_pane: None,
@@ -804,6 +818,8 @@ impl Terminal {
         self.mouse_report_1003 = snapshot.mouse_modes.report_1003;
         self.mouse_sgr = snapshot.mouse_modes.sgr;
         self.focus_reporting_1004 = snapshot.focus_reporting_1004;
+        self.alternate_scroll_1007 = snapshot.alternate_scroll_1007;
+        self.alt_screen_at_attach = snapshot.alt_screen && self.alt_grid.is_none();
         self.mouse_wheel_accum = 0.0;
         self.scrollback.reserve(snapshot.scrollback.len());
         for line in &snapshot.scrollback {
@@ -1329,9 +1345,20 @@ impl Terminal {
 
     /// Whether the alternate screen buffer (DECSET 47/1047/1049) is
     /// active: a full-screen TUI owns the grid and there is no scrollback
-    /// of its content to reveal.
+    /// of its content to reveal. Also true after attaching to a daemon
+    /// session whose program was on the alternate screen, until that
+    /// program next switches screens (see `alt_screen_at_attach`).
     pub fn alt_screen_active(&self) -> bool {
-        self.alt_grid.is_some()
+        self.alt_grid.is_some() || self.alt_screen_at_attach
+    }
+
+    /// Whether wheel notches become cursor Up/Down keys (xterm alternate
+    /// scroll): the program set DECSET 1007, the alternate screen is up
+    /// and mouse reporting is off. Mouse reporting wins when both are on,
+    /// because a program capturing the mouse wants real wheel reports.
+    /// Codex uses this on its pager and onboarding screens.
+    pub fn alternate_scroll_active(&self) -> bool {
+        self.alternate_scroll_1007 && self.alt_screen_active() && !self.mouse_reporting_active()
     }
 
     /// Stamp the pane id onto this terminal's telemetry records so mode
@@ -1340,15 +1367,17 @@ impl Terminal {
         self.telemetry_pane = Some(pane);
     }
 
-    /// Toggle one mouse-reporting mode (DECSET/DECRST 1000/1002/1003/1006),
-    /// recording `terminal.mode_changed` only on an actual transition so a
-    /// TUI that re-asserts its modes on every repaint costs nothing.
+    /// Toggle one mouse or wheel mode (DECSET/DECRST 1000/1002/1003/1006,
+    /// and 1007 alternate scroll), recording `terminal.mode_changed` only
+    /// on an actual transition so a TUI that re-asserts its modes on every
+    /// repaint costs nothing.
     fn set_mouse_mode(&mut self, mode: u16, enabled: bool) {
         let slot = match mode {
             1000 => &mut self.mouse_report_1000,
             1002 => &mut self.mouse_report_1002,
             1003 => &mut self.mouse_report_1003,
             1006 => &mut self.mouse_sgr,
+            1007 => &mut self.alternate_scroll_1007,
             _ => return,
         };
         if *slot == enabled {
@@ -1401,17 +1430,11 @@ impl Terminal {
         cell_h: f32,
         cell: (usize, usize),
     ) -> Vec<u8> {
-        if !self.mouse_reporting_active() || cell_h <= 0.0 || !delta_y.is_finite() {
+        if !self.mouse_reporting_active() {
             self.mouse_wheel_accum = 0.0;
             return Vec::new();
         }
-        self.mouse_wheel_accum += delta_y / cell_h;
-        if !self.mouse_wheel_accum.is_finite() {
-            self.mouse_wheel_accum = 0.0;
-            return Vec::new();
-        }
-        let lines = self.mouse_wheel_accum.trunc() as i32;
-        self.mouse_wheel_accum -= lines as f32;
+        let lines = self.take_forwarded_wheel_lines(delta_y, cell_h);
         if lines == 0 {
             return Vec::new();
         }
@@ -1437,6 +1460,39 @@ impl Terminal {
             }
         }
         out
+    }
+
+    /// Encode vertical wheel motion as cursor Up/Down keys for a program
+    /// in alternate-scroll mode ([`Terminal::alternate_scroll_active`]),
+    /// one key per whole line of motion, so the program scrolls as far as
+    /// local scrollback would. Same units and sub-line carry as
+    /// [`Terminal::encode_wheel_reports`]; wheel up (`delta_y > 0`) sends
+    /// Up. Empty when the mode is off or less than a line has accumulated.
+    pub fn encode_alternate_scroll_keys(&mut self, delta_y: f32, cell_h: f32) -> Vec<u8> {
+        if !self.alternate_scroll_active() {
+            self.mouse_wheel_accum = 0.0;
+            return Vec::new();
+        }
+        let lines = self.take_forwarded_wheel_lines(delta_y, cell_h);
+        keys::cursor_key(lines > 0).repeat(lines.unsigned_abs() as usize)
+    }
+
+    /// Add one wheel event to the forwarded-wheel carry and return the
+    /// whole lines it completes (positive = wheel up). The sub-line
+    /// remainder stays in `mouse_wheel_accum` for the next event.
+    fn take_forwarded_wheel_lines(&mut self, delta_y: f32, cell_h: f32) -> i32 {
+        if cell_h <= 0.0 || !delta_y.is_finite() {
+            self.mouse_wheel_accum = 0.0;
+            return 0;
+        }
+        self.mouse_wheel_accum += delta_y / cell_h;
+        if !self.mouse_wheel_accum.is_finite() {
+            self.mouse_wheel_accum = 0.0;
+            return 0;
+        }
+        let lines = self.mouse_wheel_accum.trunc() as i32;
+        self.mouse_wheel_accum -= lines as f32;
+        lines
     }
 
     /// Absolute index of the virtual line currently shown at display
@@ -1771,7 +1827,7 @@ impl Terminal {
         let top = self.scroll_top;
         let bot = self.scroll_bot;
 
-        if top == 0 && self.alt_grid.is_none() {
+        if top == 0 && !self.alt_screen_active() {
             let mut row = Vec::with_capacity(self.cols);
             for col in 0..self.cols {
                 row.push(self.grid.get_cell(top, col).copied().unwrap_or_default());
@@ -1889,6 +1945,8 @@ impl Terminal {
     /// Calling this while the alt screen is already active is a no-op:
     /// the original main-screen save slot is preserved.
     fn enter_alt_screen(&mut self) {
+        // From here on the real buffer state is known again.
+        self.alt_screen_at_attach = false;
         if self.alt_grid.is_some() {
             return;
         }
@@ -1922,9 +1980,14 @@ impl Terminal {
     /// and discards everything drawn into the alt buffer (it's the
     /// *alt* buffer; that's the whole point).
     ///
-    /// No-op when the alt screen is not active.
+    /// No-op when the alt screen is not active. After attaching to a
+    /// session that was on the alternate screen there is no parked main
+    /// grid to restore, so the exit only clears `alt_screen_at_attach`.
     fn exit_alt_screen(&mut self) {
         let Some(mut main) = self.alt_grid.take() else {
+            if std::mem::take(&mut self.alt_screen_at_attach) {
+                self.record_mode_change(1049, false);
+            }
             return;
         };
         self.record_mode_change(1049, false);
@@ -2459,6 +2522,9 @@ impl<'a> Perform for Performer<'a> {
             // notches to the PTY as mouse events (see
             // `mouse_reporting_active` / `encode_wheel_reports`); without
             // it, TUIs in the alternate screen can never be scrolled.
+            // Alternate scroll (1007) rides the same setter: Codex sets it
+            // when it leaves the mouse to the terminal, and the wheel
+            // handler then sends cursor keys (`alternate_scroll_active`).
             // Other private modes (application keypad, etc.) are ignored.
             // Bracketed paste (2004) is tracked locally so `terminal.paste`
             // can wrap pasted bodies in `ESC[200~`/`ESC[201~`.
@@ -2466,7 +2532,7 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(true),
-                        1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, true),
+                        1000 | 1002 | 1003 | 1006 | 1007 => t.set_mouse_mode(mode, true),
                         1004 => t.focus_reporting_1004 = true,
                         2004 => t.bracketed_paste = true,
                         2026 => t.synchronized_output_active = true,
@@ -2479,7 +2545,7 @@ impl<'a> Perform for Performer<'a> {
                 for &mode in &pv {
                     match mode {
                         25 => t.grid.set_cursor_visible(false),
-                        1000 | 1002 | 1003 | 1006 => t.set_mouse_mode(mode, false),
+                        1000 | 1002 | 1003 | 1006 | 1007 => t.set_mouse_mode(mode, false),
                         1004 => t.focus_reporting_1004 = false,
                         2004 => t.bracketed_paste = false,
                         2026 => t.synchronized_output_active = false,
@@ -5453,6 +5519,47 @@ mod tests {
     }
 
     #[test]
+    fn alternate_scroll_needs_1007_the_alt_screen_and_no_mouse_reporting() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1007h");
+        assert!(
+            !term.alternate_scroll_active(),
+            "on the main screen the wheel keeps scrolling local scrollback"
+        );
+        term.process_bytes(b"\x1b[?1049h");
+        assert!(term.alternate_scroll_active());
+        term.process_bytes(b"\x1b[?1000h");
+        assert!(
+            !term.alternate_scroll_active(),
+            "mouse reporting takes priority over alternate scroll"
+        );
+        term.process_bytes(b"\x1b[?1000l\x1b[?1007l");
+        assert!(!term.alternate_scroll_active());
+    }
+
+    #[test]
+    fn encode_alternate_scroll_keys_send_one_cursor_key_per_line() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1049h\x1b[?1007h");
+        // Wheel up (delta_y > 0) => Up; wheel down => Down.
+        assert_eq!(term.encode_alternate_scroll_keys(20.0, 20.0), b"\x1b[A");
+        assert_eq!(
+            term.encode_alternate_scroll_keys(-40.0, 20.0),
+            b"\x1b[B\x1b[B"
+        );
+        // Sub-line motion carries over to the next event.
+        assert!(term.encode_alternate_scroll_keys(10.0, 20.0).is_empty());
+        assert_eq!(term.encode_alternate_scroll_keys(10.0, 20.0), b"\x1b[A");
+    }
+
+    #[test]
+    fn encode_alternate_scroll_keys_empty_when_inactive() {
+        let mut term = Terminal::new(3, 5);
+        term.process_bytes(b"\x1b[?1007h"); // main screen
+        assert!(term.encode_alternate_scroll_keys(40.0, 20.0).is_empty());
+    }
+
+    #[test]
     fn encode_wheel_reports_carry_the_pointer_cell() {
         // Codex drops wheel reports outside its transcript area, and its
         // top row is a prompt header, so the real cell must be reported.
@@ -5942,6 +6049,43 @@ mod tests {
             assert!(ui.encode_wheel_reports(10.0, 20.0, (0, 0)).is_empty());
             assert_eq!(ui.encode_wheel_reports(10.0, 20.0, (0, 0)), b"\x1b[M`!!");
         }
+    }
+
+    #[test]
+    fn reattached_session_preserves_alternate_scroll() {
+        // A Codex pager (alternate screen + DECSET 1007) must keep turning
+        // the wheel into cursor keys after the UI reattaches to the daemon.
+        let mut daemon = unshit_terminal_core::Terminal::new(3, 10, 100);
+        daemon.process_bytes(b"\x1b[?1049h\x1b[?1007h");
+        let encoded = serde_json::to_vec(&daemon.snapshot(100)).unwrap();
+        let snapshot = serde_json::from_slice(&encoded).unwrap();
+        let mut ui = Terminal::new(3, 10);
+        ui.apply_snapshot(&snapshot);
+        assert!(ui.alt_screen_active());
+        assert!(ui.alternate_scroll_active());
+        assert_eq!(ui.encode_alternate_scroll_keys(20.0, 20.0), b"\x1b[A");
+
+        // The program leaving the alternate screen ends the attach-time
+        // state even though the UI never held the parked main grid.
+        ui.process_bytes(b"\x1b[?1049l");
+        assert!(!ui.alt_screen_active());
+        assert!(!ui.alternate_scroll_active());
+        assert!(ui.encode_alternate_scroll_keys(20.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn reattached_alt_screen_redraws_stay_out_of_scrollback() {
+        let mut daemon = unshit_terminal_core::Terminal::new(3, 10, 100);
+        daemon.process_bytes(b"\x1b[?1049h");
+        let mut ui = Terminal::new(3, 10);
+        ui.apply_snapshot(&daemon.snapshot(100));
+        let before = ui.scrollback_len();
+        ui.process_bytes(b"a\r\nb\r\nc\r\nd\r\ne");
+        assert_eq!(
+            ui.scrollback_len(),
+            before,
+            "a full-screen program's redraws are not shell history"
+        );
     }
 
     #[test]

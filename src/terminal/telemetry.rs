@@ -30,7 +30,7 @@ pub struct TerminalEventRecord {
     pub pane: u32,
     /// DEC private mode number for `terminal.mode_changed`: `1049` for any
     /// alternate-screen alias (47/1047/1049), `1000`/`1002`/`1003` mouse
-    /// tracking, `1006` SGR mouse encoding.
+    /// tracking, `1006` SGR mouse encoding, `1007` alternate scroll.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
