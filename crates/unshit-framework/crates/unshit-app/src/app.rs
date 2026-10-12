@@ -5488,17 +5488,6 @@ impl ApplicationHandler for AppHandler {
                         (0.0, 0.0)
                     };
                     let pos = state.interaction.last_cursor_pos;
-                    let scroll_evt =
-                        unshit_core::event::Event::Scroll(unshit_core::event::ScrollEvent {
-                            delta_x,
-                            delta_y,
-                            x: pos.0,
-                            y: pos.1,
-                            animate: smooth_scroll,
-                            smooth_duration_ms,
-                            smooth_initial_slope,
-                            modifiers: modifiers_from_winit(&state.modifiers_state),
-                        });
                     let mut node = state.interaction.hovered;
                     while let Some(element) = state.arena.get(node) {
                         let handler = element
@@ -5507,6 +5496,25 @@ impl ApplicationHandler for AppHandler {
                             .find(|(et, _)| *et == unshit_core::event::EventType::Scroll)
                             .map(|(_, handler)| handler.clone());
                         if let Some(handler) = handler {
+                            // Local coordinates belong to the element that
+                            // handles the event, so they are computed here
+                            // rather than once before the walk.
+                            let (local_x, local_y) =
+                                local_pointer_coords(&state.arena, node, pos.0, pos.1);
+                            let scroll_evt = unshit_core::event::Event::Scroll(
+                                unshit_core::event::ScrollEvent {
+                                    delta_x,
+                                    delta_y,
+                                    x: pos.0,
+                                    y: pos.1,
+                                    local_x,
+                                    local_y,
+                                    animate: smooth_scroll,
+                                    smooth_duration_ms,
+                                    smooth_initial_slope,
+                                    modifiers: modifiers_from_winit(&state.modifiers_state),
+                                },
+                            );
                             match handler(&scroll_evt)
                                 .and_then(|value| value.downcast::<ScrollGridPatch>().ok())
                             {
