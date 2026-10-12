@@ -2047,6 +2047,60 @@ mod tests {
         );
     }
 
+    /// The wheel reaches a mouse-reporting program with the cell under the
+    /// pointer, through the real tree: the framework's per-element
+    /// `local_x`/`local_y` and the pane's pixel-to-cell mapping together.
+    /// Codex drops wheel reports outside its transcript area, so a report
+    /// pinned to 1;1 (its prompt header row) never scrolled it.
+    #[test]
+    fn wheel_report_names_the_hovered_cell_through_the_real_tree() {
+        use unshit::core::cell_grid::CellGrid;
+
+        CellGrid::publish_cell_metrics(10.0, 20.0);
+
+        let mut state = seed_state();
+        state.active_pane = crate::state::PaneId(1);
+        let mut term = crate::terminal::Terminal::new(24, 80);
+        // What Codex 0.162 enables through ConPTY on Windows.
+        term.process_bytes(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+        state.terminals.insert(1, Arc::new(Mutex::new(term)));
+
+        let snap = state.ui_snapshot();
+        let shared: SharedState = Arc::new(Mutex::new(state));
+        let tree_snap = snap.clone();
+        let tree_shared = shared.clone();
+        let mut grids = std::collections::HashMap::new();
+        grids.insert(1u32, CellGrid::new(24, 80));
+        let mut harness = TestHarness::new(
+            STYLES,
+            move || build_tree(&tree_snap, &tree_shared, &grids, None),
+            1280.0,
+            900.0,
+        );
+        harness.step();
+
+        let content = harness
+            .query(".terminal-content")
+            .expect("the pane renders a grid");
+        let padding = &content.computed_style.padding;
+        // Middle of zero-based cell (row 5, col 7).
+        let x = content.layout_rect.x + padding.left + 7.5 * 10.0;
+        let y = content.layout_rect.y + padding.top + 5.5 * 20.0;
+        harness.mouse_wheel(x, y, 0.0, CellGrid::global_cell_h().max(1.0));
+
+        let guard = shared.lock().unwrap();
+        let line = guard
+            .diagnostic_pty_recent_events
+            .iter()
+            .rev()
+            .find(|e| e.contains("source=wheel"))
+            .expect("the wheel must be forwarded to the mouse-reporting program");
+        assert!(
+            line.contains("row=5 col=7"),
+            "the report must name the hovered cell, got {line:?}"
+        );
+    }
+
     /// One pane over a 3x5 terminal holding `L0`..`L5`: `L0`..`L2` in
     /// scrollback, `L3`..`L5` live, so absolute line `n` shows text `Ln`.
     /// Returns the shared state, a harness over the real tree, and the

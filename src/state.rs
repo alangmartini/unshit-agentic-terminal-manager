@@ -2179,6 +2179,7 @@ pub fn mutate_add_tab(state: &mut AppState) {
     let workspace_id = active_workspace_num(state);
     let shell = pane_spawn_shell(state);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    terminal.set_telemetry_pane(id_num);
     match state.pty_manager.spawn_in(
         id_num,
         workspace_id,
@@ -2468,6 +2469,7 @@ pub fn mutate_add_agent_tab_with(state: &mut AppState, launch: AgentLaunch<'_>) 
     let workspace_id = active_workspace_num(state);
     let provider = restart.as_ref().map(|r| r.agent);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    terminal.set_telemetry_pane(id_num);
     let session_name = title.clone();
     let pane = Pane {
         id: pane_id,
@@ -2806,6 +2808,7 @@ pub fn mutate_add_worktree_tab(state: &mut AppState, worktree_path: &std::path::
     let shell = pane_spawn_shell(state);
     let title = worktree_tab_title(worktree_path);
     let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+    terminal.set_telemetry_pane(id_num);
     match state.pty_manager.spawn_in_named(
         id_num,
         workspace_id,
@@ -3722,6 +3725,7 @@ pub fn mutate_split_right(state: &mut AppState, target: PaneId) {
     let workspace_id = active_workspace_num(state);
     let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
+    terminal.set_telemetry_pane(id_num);
     match state.pty_manager.spawn_in(
         id_num,
         workspace_id,
@@ -3787,6 +3791,7 @@ pub fn mutate_split_down(state: &mut AppState, target: PaneId) {
     let workspace_id = active_workspace_num(state);
     let shell = pane_spawn_shell(state);
     let mut terminal = Terminal::new(rows as usize, cols as usize);
+    terminal.set_telemetry_pane(id_num);
     match state.pty_manager.spawn_in(
         id_num,
         workspace_id,
@@ -11297,6 +11302,7 @@ fn dispatch_agent_resume(state: &mut AppState, cmd: &str) -> bool {
     .map(|(snapshot, reader)| {
         let spawned = snapshot.is_none();
         let mut terminal = crate::terminal::Terminal::new(rows as usize, cols as usize);
+        terminal.set_telemetry_pane(pane_id);
         if let Some(snapshot) = snapshot {
             terminal.apply_snapshot(&snapshot);
         }

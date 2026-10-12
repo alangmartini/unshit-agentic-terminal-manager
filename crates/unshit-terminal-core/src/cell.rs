@@ -168,6 +168,8 @@ mod tests {
             scrollback,
             mouse_modes: Default::default(),
             focus_reporting_1004: false,
+            alternate_scroll_1007: false,
+            alt_screen: false,
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         assert!(

@@ -224,6 +224,7 @@ fn attach_one(shared: &SharedState, target: &Target, grid: &InitialGrid) -> Outc
             let cols = snapshot.grid.cols();
             let mut terminal = crate::terminal::Terminal::new(rows, cols);
             terminal.apply_snapshot(&snapshot);
+            terminal.set_telemetry_pane(pane_id);
             guard
                 .terminals
                 .insert(pane_id, Arc::new(std::sync::Mutex::new(terminal)));
@@ -246,7 +247,9 @@ fn attach_one(shared: &SharedState, target: &Target, grid: &InitialGrid) -> Outc
             Outcome::Reattached
         }
         Ok((None, reader)) => {
-            let terminal = crate::terminal::Terminal::new(grid.rows as usize, grid.cols as usize);
+            let mut terminal =
+                crate::terminal::Terminal::new(grid.rows as usize, grid.cols as usize);
+            terminal.set_telemetry_pane(pane_id);
             guard
                 .terminals
                 .insert(pane_id, Arc::new(std::sync::Mutex::new(terminal)));
