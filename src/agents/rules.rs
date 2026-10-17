@@ -1,6 +1,6 @@
 //! User rules supplement built-in detection, without executing commands.
 
-use super::process::{executable_stem, needs_command_line, next_argument};
+use super::process::{executable_stem, is_runtime, next_argument};
 use serde::Deserialize;
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -119,7 +119,7 @@ impl DetectionRules {
 }
 
 fn is_runtime_or_shell(image: &str) -> bool {
-    needs_command_line(image)
+    is_runtime(image)
         || matches!(
             executable_stem(image).as_str(),
             "pwsh"
