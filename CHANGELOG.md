@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-18
+
+### Fixed
+
+- **Codex scrolling.** Wheel reports identify the cell under the pointer so
+  Codex can scroll its transcript. Its alternate-screen pagers also support
+  DECSET 1007 wheel-to-cursor scrolling, including daemon reattachment.
+- **Desktop applications stay under Terminals.** A shell running `npm start`
+  no longer moves into Agents when the application embeds `codex app-server`
+  or `codex mcp-server`. Interactive Codex sessions remain recognized.
+- **Flicker during terminal redraws.** Keep the last complete synchronized
+  frame visible while a program clears and repaints its screen, including
+  unrelated UI rebuilds and viewport resizes between PTY reads.
+
 ## [0.8.1] - 2026-10-02
 
 ### Fixed
