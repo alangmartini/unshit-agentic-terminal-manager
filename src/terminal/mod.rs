@@ -1965,11 +1965,14 @@ impl Terminal {
     /// performs while it owns the alt screen.
     ///
     /// Calling this while the alt screen is already active is a no-op:
-    /// the original main-screen save slot is preserved.
+    /// the original main-screen save slot is preserved. This also covers
+    /// `alt_screen_at_attach`: the program reasserting the mode right
+    /// after a reattach must not be treated as a real transition, since
+    /// there is no parked main-screen content to swap in its place.
     fn enter_alt_screen(&mut self) {
-        // From here on the real buffer state is known again.
-        self.alt_screen_at_attach = false;
-        if self.alt_grid.is_some() {
+        if self.alt_grid.is_some() || self.alt_screen_at_attach {
+            // From here on the real buffer state is known again.
+            self.alt_screen_at_attach = false;
             return;
         }
         self.record_mode_change(1049, true);
