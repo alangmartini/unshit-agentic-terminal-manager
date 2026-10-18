@@ -139,6 +139,13 @@ pub(crate) fn is_os_reserved_chord(key: Key, modifiers: Modifiers) -> bool {
 /// Without modifiers: `\x1b[{letter}`.
 /// With modifier `m`: `\x1b[1;{m}{letter}`, where `m` is the xterm modifier
 /// code (2 = Shift, 3 = Alt, 5 = Ctrl, and combinations sum accordingly).
+/// Bare cursor Up (`up`) or Down key, byte-identical to what [`encode_key`]
+/// sends for an unmodified `ArrowUp`/`ArrowDown`. Alternate scroll
+/// (DECSET 1007) turns wheel notches into these keys.
+pub fn cursor_key(up: bool) -> Vec<u8> {
+    encode_modified_key(if up { b'A' } else { b'B' }, false, false, false)
+}
+
 fn encode_modified_key(letter: u8, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
     let modifier = xterm_modifier(shift, alt, ctrl);
     if modifier == 0 {
@@ -503,6 +510,18 @@ mod tests {
         assert_eq!(
             encode_key(&key_event(Key::ArrowDown, Modifiers::empty())),
             Some(vec![0x1b, b'[', b'B'])
+        );
+    }
+
+    #[test]
+    fn cursor_key_matches_the_bare_arrow_encoding() {
+        assert_eq!(
+            Some(cursor_key(true)),
+            encode_key(&key_event(Key::ArrowUp, Modifiers::empty()))
+        );
+        assert_eq!(
+            Some(cursor_key(false)),
+            encode_key(&key_event(Key::ArrowDown, Modifiers::empty()))
         );
     }
 

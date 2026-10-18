@@ -464,17 +464,6 @@ impl TestHarness {
 
         // Dispatch Scroll to element handlers, matching the app's walk.
         let pos = self.interaction.last_cursor_pos;
-        let scroll_evt = Event::Scroll(ScrollEvent {
-            delta_x,
-            delta_y,
-            x: pos.0,
-            y: pos.1,
-            animate: false,
-            smooth_duration_ms: 0.0,
-            smooth_initial_slope: 0.0,
-            modifiers: Modifiers::empty(),
-        });
-
         let mut node = self.interaction.hovered;
         while let Some(element) = self.arena.get(node) {
             let handler = element
@@ -483,6 +472,19 @@ impl TestHarness {
                 .find(|(et, _)| *et == EventType::Scroll)
                 .map(|(_, handler)| handler.clone());
             if let Some(handler) = handler {
+                let (local_x, local_y) = drag_local_coords(&self.arena, node, pos.0, pos.1);
+                let scroll_evt = Event::Scroll(ScrollEvent {
+                    delta_x,
+                    delta_y,
+                    x: pos.0,
+                    y: pos.1,
+                    local_x,
+                    local_y,
+                    animate: false,
+                    smooth_duration_ms: 0.0,
+                    smooth_initial_slope: 0.0,
+                    modifiers: Modifiers::empty(),
+                });
                 if let Some(patch) =
                     handler(&scroll_evt).and_then(|value| value.downcast::<ScrollGridPatch>().ok())
                 {
