@@ -759,6 +759,58 @@ fn wheel_bubbles_to_nearest_ancestor_scroll_handler() {
 }
 
 #[test]
+fn wheel_event_coordinates_are_local_to_the_handling_element() {
+    // A grid handler maps `local_x`/`local_y` to the cell under the pointer,
+    // so they must be relative to the element that handles the event (its
+    // padding box origin), even when the wheel bubbled up from a child.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tree_log = log.clone();
+    let css = format!("{} .framed {{ padding-left: 8px; padding-top: 12px; }}", handler_css());
+    let mut h = TestHarness::new(
+        &css,
+        move || ElementTree {
+            root: ElementDef::new(Tag::Div).with_class("root").with_child(
+                ElementDef::new(Tag::Div)
+                    .with_class("outer")
+                    .with_class("framed")
+                    .on(EventType::Scroll, {
+                        let log = tree_log.clone();
+                        move |event: &Event| -> Option<Box<dyn Any>> {
+                            if let Event::Scroll(scroll) = event {
+                                log.lock().unwrap().push((
+                                    scroll.x,
+                                    scroll.y,
+                                    scroll.local_x,
+                                    scroll.local_y,
+                                ));
+                            }
+                            None
+                        }
+                    })
+                    .with_child(ElementDef::new(Tag::Div).with_class("inner")),
+            ),
+        },
+        800.0,
+        600.0,
+    );
+    h.step();
+
+    let outer = h.query(".outer").expect("outer exists").layout_rect;
+    let (cx, cy) = center_of(&h, ".inner");
+    h.mouse_wheel(cx, cy, 0.0, -60.0);
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the ancestor handler must fire once");
+    let (x, y, local_x, local_y) = seen[0];
+    assert_eq!((x, y), (cx, cy), "x/y stay in window coordinates");
+    assert_eq!(
+        (local_x, local_y),
+        (cx - outer.x - 8.0, cy - outer.y - 12.0),
+        "local coordinates are measured from the handling element's content box, inside its padding"
+    );
+}
+
+#[test]
 fn wheel_fires_only_the_first_scroll_handler() {
     let child_log = Arc::new(Mutex::new(Vec::new()));
     let ancestor_log = Arc::new(Mutex::new(Vec::new()));

@@ -136,6 +136,7 @@ pub struct Terminal {
     mouse_modes: crate::snapshot::MouseModes,
     /// Whether the child requested focus-in/focus-out reports via DECSET 1004.
     focus_reporting_1004: bool,
+    alternate_scroll_1007: bool,
 }
 
 impl Terminal {
@@ -165,6 +166,7 @@ impl Terminal {
             synchronized_output_active: false,
             mouse_modes: crate::snapshot::MouseModes::default(),
             focus_reporting_1004: false,
+            alternate_scroll_1007: false,
         }
     }
 
@@ -284,6 +286,8 @@ impl Terminal {
             scrollback: self.scrollback.tail(scrollback_lines),
             mouse_modes: self.mouse_modes,
             focus_reporting_1004: self.focus_reporting_1004,
+            alternate_scroll_1007: self.alternate_scroll_1007,
+            alt_screen: self.alt_grid.is_some(),
         }
     }
 
@@ -537,6 +541,7 @@ impl Perform for Performer<'_> {
                             1003 => t.mouse_modes.report_1003 = on,
                             1006 => t.mouse_modes.sgr = on,
                             1004 => t.focus_reporting_1004 = on,
+                            1007 => t.alternate_scroll_1007 = on,
                             2026 => t.synchronized_output_active = on,
                             47 | 1047 | 1049 if on => t.enter_alt_screen(),
                             47 | 1047 | 1049 => t.exit_alt_screen(),
@@ -1183,6 +1188,26 @@ mod tests {
         }
         let snap = t.snapshot(2);
         assert!(snap.scrollback.len() <= 2);
+    }
+
+    #[test]
+    fn snapshot_preserves_alternate_scroll_and_alt_screen() {
+        // Codex sets 1007 on its pager screens; after a UI reattach the
+        // wheel must still turn into cursor keys there.
+        let mut t = Terminal::new(3, 5, 10);
+        let snap = t.snapshot(0);
+        assert!(!snap.alternate_scroll_1007);
+        assert!(!snap.alt_screen);
+
+        t.process_bytes(b"\x1b[?1049h\x1b[?1007h");
+        let snap = t.snapshot(0);
+        assert!(snap.alternate_scroll_1007);
+        assert!(snap.alt_screen);
+
+        t.process_bytes(b"\x1b[?1007l\x1b[?1049l");
+        let snap = t.snapshot(0);
+        assert!(!snap.alternate_scroll_1007);
+        assert!(!snap.alt_screen);
     }
 
     #[test]

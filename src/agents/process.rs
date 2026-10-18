@@ -11,9 +11,9 @@ pub(super) fn executable_stem(image: &str) -> String {
     name.strip_suffix(".exe").unwrap_or(&name).to_string()
 }
 
-/// Only these runtimes need a command-line query. Shell arguments are not
-/// proof that an agent is running: the shell may be idle or executing a script.
-pub fn needs_command_line(image: &str) -> bool {
+/// Shell arguments are not proof that an agent is running: the shell may
+/// be idle or executing a script.
+pub(super) fn is_runtime(image: &str) -> bool {
     let stem = executable_stem(image);
     matches!(stem.as_str(), "node" | "bun" | "python" | "pythonw")
         || stem.strip_prefix("python").is_some_and(|version| {
@@ -21,15 +21,43 @@ pub fn needs_command_line(image: &str) -> bool {
         })
 }
 
+/// Codex also needs its arguments checked: desktop apps embed its server
+/// modes without running an interactive agent in the terminal.
+pub fn needs_command_line(image: &str) -> bool {
+    executable_stem(image) == "codex" || is_runtime(image)
+}
+
+/// Identify Codex server modes from the subcommand, never from prompt text.
+fn codex_arguments_are_server(mut remaining: &str) -> Option<bool> {
+    while !remaining.trim().is_empty() {
+        let argument = next_argument(&mut remaining)?;
+        match argument {
+            "-c" | "--config" | "--enable" | "--disable" => {
+                next_argument(&mut remaining)?;
+            }
+            option if option.starts_with('-') => continue,
+            subcommand => return Some(matches!(subcommand, "app-server" | "mcp-server")),
+        }
+    }
+    Some(false)
+}
+
 pub fn classify_process(image: &str, command_line: Option<&str>) -> Option<&'static AgentProfile> {
     let stem = executable_stem(image);
     if let Some(agent) = profile(&stem) {
+        if stem == "codex" {
+            let mut remaining = command_line?;
+            next_argument(&mut remaining)?; // codex executable
+            if codex_arguments_are_server(remaining)? {
+                return None;
+            }
+        }
         return Some(agent);
     }
     if stem == "gh-copilot" {
         return profile("copilot");
     }
-    if !needs_command_line(image) {
+    if !is_runtime(image) {
         return None;
     }
     let mut remaining = command_line?;
@@ -64,6 +92,9 @@ pub fn classify_process(image: &str, command_line: Option<&str>) -> Option<&'sta
         ("/node_modules/opencode-ai/bin/opencode", "opencode"),
     ] {
         if script.ends_with(suffix) || script == suffix[1..] {
+            if id == "codex" && codex_arguments_are_server(remaining)? {
+                return None;
+            }
             return profile(id);
         }
     }
@@ -107,7 +138,6 @@ mod tests {
     fn native_agent_processes_are_recognized_without_window_titles() {
         for agent in [
             "claude",
-            "codex",
             "gemini",
             "opencode",
             "aider",
@@ -126,7 +156,39 @@ mod tests {
                 "Unix executable {agent}"
             );
         }
-        assert_eq!(classified_id("CODEX.EXE", None), Some("codex"));
+        assert_eq!(classified_id("CODEX.EXE", Some("CODEX.EXE")), Some("codex"));
+    }
+
+    #[test]
+    fn codex_server_modes_are_not_terminal_agents() {
+        for command in [
+            "codex app-server",
+            "codex mcp-server",
+            "codex -c model=example app-server",
+            "codex --enable feature --config model=example mcp-server",
+            "codex --config=model=example app-server",
+            r#""C:\Program Files\Codex\codex.exe" app-server"#,
+        ] {
+            assert_eq!(classified_id("codex", Some(command)), None, "{command}");
+        }
+        for command in [
+            "codex",
+            "codex resume session-id",
+            "codex --config model=example",
+            "codex 'explain app-server'",
+        ] {
+            assert_eq!(classified_id("codex", Some(command)), Some("codex"));
+        }
+        for runtime in ["node", "bun"] {
+            for mode in ["app-server", "mcp-server"] {
+                let command =
+                    format!("{runtime} /opt/node_modules/@openai/codex/bin/codex.js {mode}");
+                assert_eq!(classified_id(runtime, Some(&command)), None);
+            }
+        }
+        assert_eq!(classified_id("codex", Some("codex --config")), None);
+        assert!(super::needs_command_line("codex.exe"));
+        assert_eq!(classified_id("codex", None), None);
     }
 
     #[test]

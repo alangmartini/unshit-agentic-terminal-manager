@@ -267,8 +267,16 @@ impl fmt::Display for Modifiers {
 pub struct ScrollEvent {
     pub delta_x: f32,
     pub delta_y: f32,
+    /// Cursor position in window coordinates.
     pub x: f32,
     pub y: f32,
+    /// Cursor position relative to the content box (padding box origin) of
+    /// the element whose handler receives the event, like
+    /// [`MouseEvent::local_x`]. The bubble walk recomputes it for each
+    /// element it reaches, so a grid handler can map the wheel to the cell
+    /// under the pointer. Synthetic events usually leave it at `0.0`.
+    pub local_x: f32,
+    pub local_y: f32,
     /// `true` when the input came from a stepped wheel (`LineDelta`),
     /// whose discrete notches should be animated toward their target;
     /// `false` for precision devices (`PixelDelta` touchpads), which
