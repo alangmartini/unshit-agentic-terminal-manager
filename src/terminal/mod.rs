@@ -154,7 +154,9 @@ pub struct Terminal {
     pending_response: Vec<u8>,
     /// Terminal-originated notification signals waiting for the UI bridge.
     pending_signals: VecDeque<TerminalSignal>,
-    synchronized_output_active: bool,
+    /// Last complete display frame while DECSET 2026 holds a TUI repaint.
+    /// Every snapshot path must use it, including unrelated tree rebuilds.
+    synchronized_output_grid: Option<CellGrid>,
     /// Whether the running program enabled bracketed paste mode via
     /// DECSET 2004 (`CSI ? 2004 h`). When set, pasted text should be
     /// wrapped in `ESC[200~` / `ESC[201~` so readline/editors can tell
@@ -458,7 +460,7 @@ impl Terminal {
             scroll_bot: rows,
             pending_response: Vec::new(),
             pending_signals: VecDeque::new(),
-            synchronized_output_active: false,
+            synchronized_output_grid: None,
             bracketed_paste: false,
             focus_reporting_1004: false,
             mouse_report_1000: false,
@@ -536,7 +538,16 @@ impl Terminal {
     }
 
     pub fn synchronized_output_active(&self) -> bool {
-        self.synchronized_output_active
+        self.synchronized_output_grid.is_some()
+    }
+
+    fn begin_synchronized_output(&mut self) {
+        if self.synchronized_output_grid.is_none() {
+            // The begin marker can follow text/cursor movement in the same
+            // PTY read, before process_bytes does its final cursor sync.
+            self.grid.set_cursor(self.cursor_row, self.cursor_col);
+            self.synchronized_output_grid = Some(self.display_grid());
+        }
     }
 
     /// Feed raw bytes (from PTY output) through the VTE parser.
@@ -1206,6 +1217,17 @@ impl Terminal {
     /// scrollback lines and the upper portion of the live screen, with
     /// the cursor hidden.
     pub fn display_grid(&self) -> CellGrid {
+        if let Some(complete) = &self.synchronized_output_grid {
+            let mut view = complete.clone();
+            // A native resize can happen during a synchronized repaint.
+            // Fit the held frame to the new viewport without exposing the
+            // partially rewritten backing grid.
+            let rows = self.rows + view.overscan_rows() as usize;
+            if view.rows() != rows || view.cols() != self.cols {
+                view.resize(rows, self.cols);
+            }
+            return view;
+        }
         let (offset, fraction) = self.fractional_view_position();
         // Producer half of the renderer contract: the offset is in
         // physical pixels, and the WHOLE offset is snapped to a whole
@@ -2535,7 +2557,7 @@ impl<'a> Perform for Performer<'a> {
                         1000 | 1002 | 1003 | 1006 | 1007 => t.set_mouse_mode(mode, true),
                         1004 => t.focus_reporting_1004 = true,
                         2004 => t.bracketed_paste = true,
-                        2026 => t.synchronized_output_active = true,
+                        2026 => t.begin_synchronized_output(),
                         47 | 1047 | 1049 => t.enter_alt_screen(),
                         _ => {}
                     }
@@ -2548,7 +2570,7 @@ impl<'a> Perform for Performer<'a> {
                         1000 | 1002 | 1003 | 1006 | 1007 => t.set_mouse_mode(mode, false),
                         1004 => t.focus_reporting_1004 = false,
                         2004 => t.bracketed_paste = false,
-                        2026 => t.synchronized_output_active = false,
+                        2026 => t.synchronized_output_grid = None,
                         47 | 1047 | 1049 => t.exit_alt_screen(),
                         _ => {}
                     }
@@ -5411,6 +5433,72 @@ mod tests {
             !term.synchronized_output_active(),
             "CSI ?2026l must leave synchronized output mode"
         );
+    }
+
+    #[test]
+    fn synchronized_output_keeps_display_snapshots_on_the_complete_frame() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"complete");
+        let before = term.display_grid();
+
+        // A TUI's clear and repaint can arrive in separate PTY reads. A tree
+        // rebuild (title/resource update, resize, etc.) must not expose the
+        // intermediate blank grid even though the paint-only patch is gated.
+        term.process_bytes(b"\x1b[?2026h\x1b[2J\x1b[H");
+        assert_eq!(term.grid().get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(term.display_grid().cells(), before.cells());
+        term.process_bytes(b"updated");
+        assert_eq!(term.display_grid().cells(), before.cells());
+
+        term.process_bytes(b"\x1b[?2026l");
+        let after = term.display_grid();
+        assert_eq!(after.get_cell(1, 0).unwrap().ch, 'u');
+        assert_eq!(after.cursor_col(), 7);
+    }
+
+    #[test]
+    fn synchronized_output_repeated_begin_keeps_the_original_frame_and_cursor() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"old\x1b[?2026h\x1b[Hnew\x1b[?25l");
+        let held = term.display_grid();
+        assert_eq!(held.get_cell(1, 0).unwrap().ch, 'o');
+        assert_eq!(held.cursor_col(), 3);
+        assert!(held.cursor_visible());
+
+        term.process_bytes(b"\x1b[?2026h");
+        assert_eq!(term.display_grid().cells(), held.cells());
+        assert!(term.display_grid().cursor_visible());
+
+        term.process_bytes(b"\x1b[?2026l");
+        assert_eq!(term.display_grid().get_cell(1, 0).unwrap().ch, 'n');
+        assert!(!term.display_grid().cursor_visible());
+    }
+
+    #[test]
+    fn synchronized_output_resize_fits_the_held_frame_until_commit() {
+        let mut term = Terminal::new(3, 10);
+        term.process_bytes(b"old\x1b[?2026h\x1b[2J\x1b[Hnew");
+        term.resize_viewport_growth(4, 12);
+        let held = term.display_grid();
+        assert_eq!((held.viewport_rows(), held.cols()), (4, 12));
+        assert_eq!(held.get_cell(1, 0).unwrap().ch, 'o');
+
+        term.process_bytes(b"\x1b[?2026l");
+        assert_eq!(term.display_grid().get_cell(1, 0).unwrap().ch, 'n');
+    }
+
+    #[test]
+    fn synchronized_output_commits_each_frame_in_one_pty_read() {
+        let mut term = Terminal::new(3, 10);
+        for text in ["first", "second"] {
+            term.process_bytes(format!("\x1b[?2026h\x1b[H{text}\x1b[?2026l").as_bytes());
+            assert!(!term.synchronized_output_active());
+            assert_eq!(
+                term.display_grid().get_cell(1, 0).unwrap().ch,
+                text.chars().next().unwrap()
+            );
+            assert_eq!(term.display_grid().cursor_col(), text.len());
+        }
     }
 
     #[test]
