@@ -62,6 +62,7 @@ using System; using System.Runtime.InteropServices;
 public class IdleBenchWin {
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
 }
 "@
 
@@ -204,8 +205,15 @@ try {
         }
         $sum = { param($field) ($summaries | Measure-Object -Property $field -Sum).Sum }
         $windowMs = & $sum 'window_ms'
+        # A minimized window paints nothing, so a phase disturbed by hand
+        # (notify mode raises real desktop notifications) must not pass for
+        # an idle one.
+        $windowState = if ($app.HasExited) { 'exited' }
+            elseif ([IdleBenchWin]::IsIconic($app.MainWindowHandle)) { 'minimized' }
+            else { 'normal' }
         $row = [pscustomobject]@{
             phase              = $phase
+            window             = $windowState
             process_cores      = [math]::Round(($procAfter - $procBefore) / $elapsedMs, 3)
             hottest_thread     = [math]::Round($hottest / $elapsedMs, 3)
             daemon_cores       = [math]::Round(($daemonAfter - $daemonBefore) / $elapsedMs, 3)

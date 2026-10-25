@@ -9,7 +9,8 @@
              way the sidebar and tab labels show a working agent
     spinner  rewrites one status line with a spinner glyph and timer
     notify   sends one OSC 9 notification on entering the mode, which puts
-             a background pane into the pulsing attention state
+             a background pane into the pulsing attention state and raises
+             a real desktop notification for it
     idle     sets a static title once and prints nothing
   A mode string can combine words ("title+spinner").
 
