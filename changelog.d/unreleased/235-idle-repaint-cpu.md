@@ -9,7 +9,9 @@
   cursor blink stops requesting repaints while the window is unfocused. Idle
   CPU drops to about 0.04 of a core and a busy agent spinner to about 0.07.
   Text-input carets and CSS animations also keep animating when the window is
-  otherwise quiet instead of freezing until the next event.
+  otherwise quiet instead of freezing until the next event, and the endless
+  attention pulse on a pane that needs input runs at about 25 frames per
+  second instead of the display rate.
 
 ### Added
 

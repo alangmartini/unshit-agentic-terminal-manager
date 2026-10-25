@@ -1739,9 +1739,12 @@ fn animations_active(state: &AppState) -> bool {
     state.smooth_scroll.is_some() || !state.grid_animations.is_empty() || state.drag_autorepeat
 }
 
-/// CSS keyframe animations or transitions that sample time on every frame.
+/// CSS transitions or finite keyframe animations, which sample time on
+/// every frame. `infinite` animations are left out: their own timer wakes
+/// at `AMBIENT_FRAME_INTERVAL` pace them, and painting them on every
+/// heartbeat as well ran an attention pulse at the display rate.
 fn style_animations_active(state: &AppState) -> bool {
-    state.animation_driver.has_active() || state.active_transitions.has_active()
+    state.animation_driver.has_active_finite() || state.active_transitions.has_active()
 }
 
 /// Whether a compositor tick has anything to paint. Plain flags so the
@@ -1789,6 +1792,24 @@ impl CompositorTickWork {
             || self.work_pending
             || self.animating
             || self.paint_dirty
+    }
+}
+
+/// Control flow for `about_to_wait` while the compositor clock is running,
+/// and whether to request a redraw. A future `WaitUntil` is a timer step the
+/// paint path armed (text caret toggle, CSS animation or transition step):
+/// heartbeats skip frames with nothing pending, so replacing it with `Wait`
+/// left that step waiting for an unrelated event. A stale one becomes the
+/// redraw it was armed for.
+fn compositor_clock_control_flow(
+    flow: winit::event_loop::ControlFlow,
+    now: Instant,
+) -> (winit::event_loop::ControlFlow, bool) {
+    use winit::event_loop::ControlFlow;
+    match flow {
+        ControlFlow::WaitUntil(wake) if wake > now => (flow, false),
+        ControlFlow::WaitUntil(_) => (ControlFlow::Wait, true),
+        _ => (ControlFlow::Wait, false),
     }
 }
 
@@ -6515,7 +6536,11 @@ impl ApplicationHandler for AppHandler {
                     deadline = std::cmp::max(deadline, now + period.saturating_mul(2));
                 }
                 self.app.compositor_clock_waker.extend_until(deadline);
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                let (flow, redraw) = compositor_clock_control_flow(event_loop.control_flow(), now);
+                event_loop.set_control_flow(flow);
+                if redraw {
+                    state.window.request_redraw();
+                }
                 return;
             }
         } else if state.pacing_mode == PacingMode::Timer {
@@ -9320,6 +9345,30 @@ mod tests {
         for (case, work) in cases {
             assert!(work.needs_paint(), "{case} must paint on the next tick");
         }
+    }
+
+    #[test]
+    fn compositor_clock_keeps_a_pending_timer_step_armed() {
+        use winit::event_loop::ControlFlow;
+        let now = Instant::now();
+        let step = now + Duration::from_millis(33);
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::WaitUntil(step), now),
+            (ControlFlow::WaitUntil(step), false),
+            "an ambient animation step must not wait for an unrelated event"
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::WaitUntil(now), now),
+            (ControlFlow::Wait, true)
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::Wait, now),
+            (ControlFlow::Wait, false)
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::Poll, now),
+            (ControlFlow::Wait, false)
+        );
     }
 
     // === RebuildCoalescer (#135 Phase 1, item 1) ===
