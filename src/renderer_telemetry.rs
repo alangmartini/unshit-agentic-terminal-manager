@@ -321,6 +321,8 @@ struct FrameSummaryRecord {
     symbol_fallbacks: u64,
     nodes_visited: u64,
     nodes_skipped: u64,
+    /// Compositor heartbeats consumed without painting (nothing changed).
+    compositor_ticks_skipped: u64,
 }
 
 struct FrameSummaryWindow {
@@ -337,6 +339,7 @@ struct FrameSummaryWindow {
     symbol_fallbacks: u64,
     nodes_visited: u64,
     nodes_skipped: u64,
+    compositor_ticks_skipped: u64,
 }
 
 impl FrameSummaryWindow {
@@ -355,6 +358,7 @@ impl FrameSummaryWindow {
             symbol_fallbacks: 0,
             nodes_visited: 0,
             nodes_skipped: 0,
+            compositor_ticks_skipped: 0,
         }
     }
 
@@ -371,10 +375,13 @@ impl FrameSummaryWindow {
         self.symbol_fallbacks += metrics.glyph_symbol_fallbacks;
         self.nodes_visited += u64::from(metrics.nodes_visited);
         self.nodes_skipped += u64::from(metrics.nodes_skipped);
+        self.compositor_ticks_skipped += metrics.compositor_ticks_skipped;
     }
 
     fn into_record(self, timestamp_unix_ms: u64) -> FrameSummaryRecord {
-        let window_ms = timestamp_unix_ms.saturating_sub(self.started_unix_ms).max(1);
+        let window_ms = timestamp_unix_ms
+            .saturating_sub(self.started_unix_ms)
+            .max(1);
         FrameSummaryRecord {
             timestamp_unix_ms,
             event: "renderer.frame_summary",
@@ -395,6 +402,7 @@ impl FrameSummaryWindow {
             symbol_fallbacks: self.symbol_fallbacks,
             nodes_visited: self.nodes_visited,
             nodes_skipped: self.nodes_skipped,
+            compositor_ticks_skipped: self.compositor_ticks_skipped,
         }
     }
 }
@@ -408,7 +416,9 @@ fn frame_summary_interval_ms() -> u64 {
         std::env::var("TM_FRAME_SUMMARY_INTERVAL_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .map_or(FRAME_SUMMARY_INTERVAL_MS, |value| value.clamp(1_000, 600_000))
+            .map_or(FRAME_SUMMARY_INTERVAL_MS, |value| {
+                value.clamp(1_000, 600_000)
+            })
     })
 }
 
@@ -418,7 +428,9 @@ fn frame_summary_interval_ms() -> u64 {
 pub fn record_frame_summary(metrics: &FrameMetrics) {
     let timestamp_unix_ms = now_unix_ms();
     let finished = {
-        let mut window = FRAME_SUMMARY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut window = FRAME_SUMMARY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if window.frames == 0 {
             window.started_unix_ms = timestamp_unix_ms;
         }
@@ -428,7 +440,9 @@ pub fn record_frame_summary(metrics: &FrameMetrics) {
         }
         std::mem::replace(&mut *window, FrameSummaryWindow::empty())
     };
-    enqueue(TelemetryRecord::FrameSummary(finished.into_record(timestamp_unix_ms)));
+    enqueue(TelemetryRecord::FrameSummary(
+        finished.into_record(timestamp_unix_ms),
+    ));
 }
 
 /// Start the bounded renderer telemetry writer before entering the render loop.
@@ -916,6 +930,7 @@ mod tests {
             layout_us: 400,
             batch_build_us: 6_000,
             glyph_symbol_fallbacks: 3,
+            compositor_ticks_skipped: 40,
             ..FrameMetrics::default()
         };
         for _ in 0..9 {
@@ -935,5 +950,6 @@ mod tests {
         assert_eq!(value["max_work_us"], 9_000);
         assert_eq!(value["batch_build_us"], 8_700);
         assert_eq!(value["symbol_fallbacks"], 3);
+        assert_eq!(value["compositor_ticks_skipped"], 40);
     }
 }
