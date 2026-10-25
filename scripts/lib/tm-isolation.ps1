@@ -62,9 +62,18 @@ function Exit-TmIsolation {
             Write-Warning "failed to shut down isolated daemon on $($Isolation.PipePath): $($_.Exception.Message)"
         }
     }
-    try {
-        Remove-Item -Recurse -Force -LiteralPath $Isolation.ConfigDir -ErrorAction Stop
-    } catch {}
+    # Pane shells killed by the shutdown can still hold their working
+    # directories inside the profile for a moment.
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Isolation.ConfigDir)) { break }
+        try {
+            Remove-Item -Recurse -Force -LiteralPath $Isolation.ConfigDir -ErrorAction Stop
+            break
+        } catch {
+            if ($attempt -eq 10) { Write-Warning "isolated profile left behind: $($Isolation.ConfigDir)" }
+            Start-Sleep -Milliseconds 300
+        }
+    }
 
     $env:TM_PROFILE = $null
     $env:TM_CONFIG_DIR = $null

@@ -11,6 +11,7 @@ const MAX_LOG_BYTES: u64 = 512 * 1024;
 const SLOW_FRAME_BUDGET_US: u64 = 8_333;
 const SLOW_FRAME_SAMPLE_INTERVAL_MS: u64 = 250;
 const TELEMETRY_QUEUE_CAPACITY: usize = 64;
+const FRAME_SUMMARY_INTERVAL_MS: u64 = 60_000;
 
 static TELEMETRY_SENDER: OnceLock<Option<SyncSender<TelemetryRecord>>> = OnceLock::new();
 static FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -24,6 +25,8 @@ static SYMBOL_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// interval; folded into the next emitted record so the total is exact.
 static PENDING_SYMBOL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WARNING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FRAME_SUMMARY: Mutex<FrameSummaryWindow> = Mutex::new(FrameSummaryWindow::empty());
+static FRAME_SUMMARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Envelope for the async writer queue. `untagged` keeps each variant's own
 /// `event` field as the discriminator in the JSONL output.
@@ -35,6 +38,7 @@ enum TelemetryRecord {
     SymbolFallback(SymbolFallbackRecord),
     PtyGeometry(PtyGeometryRecord),
     CtxMenuOpen(CtxMenuOpenRecord),
+    FrameSummary(FrameSummaryRecord),
 }
 
 impl TelemetryRecord {
@@ -45,6 +49,7 @@ impl TelemetryRecord {
             Self::SymbolFallback(record) => record.event,
             Self::PtyGeometry(record) => record.event,
             Self::CtxMenuOpen(record) => record.event,
+            Self::FrameSummary(record) => record.event,
         }
     }
 
@@ -55,6 +60,7 @@ impl TelemetryRecord {
             Self::SymbolFallback(record) => &record.correlation_id,
             Self::PtyGeometry(record) => &record.correlation_id,
             Self::CtxMenuOpen(record) => &record.correlation_id,
+            Self::FrameSummary(record) => &record.correlation_id,
         }
     }
 }
@@ -283,6 +289,160 @@ impl SlowFrameRecord {
             gpu_upload_bytes: metrics.gpu_upload_bytes,
         }
     }
+}
+
+/// Aggregate of every painted frame over one summary window, fast frames
+/// included. `renderer.slow_frame` only samples over-budget frames, so on
+/// its own it cannot tell "one 20 ms frame per second" from "thirty of
+/// them": this record carries the frame rate and the summed stage work that
+/// answer "how much CPU does painting cost while nothing is happening".
+#[derive(Debug, Serialize)]
+struct FrameSummaryRecord {
+    timestamp_unix_ms: u64,
+    event: &'static str,
+    level: &'static str,
+    correlation_id: String,
+    sample_sequence: u64,
+    window_ms: u64,
+    frames: u64,
+    /// Frames that rebuilt the element tree (`tree_build_us > 0`).
+    rebuild_frames: u64,
+    /// Frames that ran layout (`layout_us > 0`).
+    layout_frames: u64,
+    /// Summed `total_us`: frame work on the UI thread, swapchain waits excluded.
+    work_us: u64,
+    /// `work_us` as thousandths of the window: 1000 is one saturated core.
+    work_permille: u64,
+    max_work_us: u64,
+    tree_build_us: u64,
+    layout_us: u64,
+    batch_build_us: u64,
+    gpu_render_us: u64,
+    symbol_fallbacks: u64,
+    nodes_visited: u64,
+    nodes_skipped: u64,
+    /// Compositor heartbeats consumed without painting (nothing changed).
+    compositor_ticks_skipped: u64,
+}
+
+struct FrameSummaryWindow {
+    started_unix_ms: u64,
+    frames: u64,
+    rebuild_frames: u64,
+    layout_frames: u64,
+    work_us: u64,
+    max_work_us: u64,
+    tree_build_us: u64,
+    layout_us: u64,
+    batch_build_us: u64,
+    gpu_render_us: u64,
+    symbol_fallbacks: u64,
+    nodes_visited: u64,
+    nodes_skipped: u64,
+    compositor_ticks_skipped: u64,
+}
+
+impl FrameSummaryWindow {
+    const fn empty() -> Self {
+        Self {
+            started_unix_ms: 0,
+            frames: 0,
+            rebuild_frames: 0,
+            layout_frames: 0,
+            work_us: 0,
+            max_work_us: 0,
+            tree_build_us: 0,
+            layout_us: 0,
+            batch_build_us: 0,
+            gpu_render_us: 0,
+            symbol_fallbacks: 0,
+            nodes_visited: 0,
+            nodes_skipped: 0,
+            compositor_ticks_skipped: 0,
+        }
+    }
+
+    fn add(&mut self, metrics: &FrameMetrics) {
+        self.frames += 1;
+        self.rebuild_frames += u64::from(metrics.tree_build_us > 0);
+        self.layout_frames += u64::from(metrics.layout_us > 0);
+        self.work_us += metrics.total_us;
+        self.max_work_us = self.max_work_us.max(metrics.total_us);
+        self.tree_build_us += metrics.tree_build_us;
+        self.layout_us += metrics.layout_us;
+        self.batch_build_us += metrics.batch_build_us;
+        self.gpu_render_us += metrics.gpu_render_us;
+        self.symbol_fallbacks += metrics.glyph_symbol_fallbacks;
+        self.nodes_visited += u64::from(metrics.nodes_visited);
+        self.nodes_skipped += u64::from(metrics.nodes_skipped);
+        self.compositor_ticks_skipped += metrics.compositor_ticks_skipped;
+    }
+
+    fn into_record(self, timestamp_unix_ms: u64) -> FrameSummaryRecord {
+        let window_ms = timestamp_unix_ms
+            .saturating_sub(self.started_unix_ms)
+            .max(1);
+        FrameSummaryRecord {
+            timestamp_unix_ms,
+            event: "renderer.frame_summary",
+            level: "info",
+            correlation_id: process_correlation_id().to_string(),
+            sample_sequence: FRAME_SUMMARY_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            window_ms,
+            frames: self.frames,
+            rebuild_frames: self.rebuild_frames,
+            layout_frames: self.layout_frames,
+            work_us: self.work_us,
+            work_permille: self.work_us / window_ms,
+            max_work_us: self.max_work_us,
+            tree_build_us: self.tree_build_us,
+            layout_us: self.layout_us,
+            batch_build_us: self.batch_build_us,
+            gpu_render_us: self.gpu_render_us,
+            symbol_fallbacks: self.symbol_fallbacks,
+            nodes_visited: self.nodes_visited,
+            nodes_skipped: self.nodes_skipped,
+            compositor_ticks_skipped: self.compositor_ticks_skipped,
+        }
+    }
+}
+
+/// Window length for `renderer.frame_summary`. `TM_FRAME_SUMMARY_INTERVAL_MS`
+/// shortens it for a measurement run; the default keeps an idle app at one
+/// line a minute.
+fn frame_summary_interval_ms() -> u64 {
+    static INTERVAL_MS: OnceLock<u64> = OnceLock::new();
+    *INTERVAL_MS.get_or_init(|| {
+        std::env::var("TM_FRAME_SUMMARY_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(FRAME_SUMMARY_INTERVAL_MS, |value| {
+                value.clamp(1_000, 600_000)
+            })
+    })
+}
+
+/// Fold one painted frame into the current summary window and emit the
+/// window once it is `frame_summary_interval_ms` old. One uncontended lock
+/// per frame; serialization and file I/O stay on the writer thread.
+pub fn record_frame_summary(metrics: &FrameMetrics) {
+    let timestamp_unix_ms = now_unix_ms();
+    let finished = {
+        let mut window = FRAME_SUMMARY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if window.frames == 0 {
+            window.started_unix_ms = timestamp_unix_ms;
+        }
+        window.add(metrics);
+        if timestamp_unix_ms.saturating_sub(window.started_unix_ms) < frame_summary_interval_ms() {
+            return;
+        }
+        std::mem::replace(&mut *window, FrameSummaryWindow::empty())
+    };
+    enqueue(TelemetryRecord::FrameSummary(
+        finished.into_record(timestamp_unix_ms),
+    ));
 }
 
 /// Start the bounded renderer telemetry writer before entering the render loop.
@@ -753,5 +913,43 @@ mod tests {
         assert!(value.get("text").is_none());
         assert!(value.get("title").is_none());
         assert!(value.get("symbol_family").is_none());
+    }
+
+    #[test]
+    fn frame_summary_counts_every_frame_and_reports_work_per_window() {
+        let mut window = FrameSummaryWindow::empty();
+        window.started_unix_ms = 1_000;
+        let replay = FrameMetrics {
+            total_us: 1_000,
+            batch_build_us: 300,
+            ..FrameMetrics::default()
+        };
+        let rebuild = FrameMetrics {
+            total_us: 9_000,
+            tree_build_us: 1_500,
+            layout_us: 400,
+            batch_build_us: 6_000,
+            glyph_symbol_fallbacks: 3,
+            compositor_ticks_skipped: 40,
+            ..FrameMetrics::default()
+        };
+        for _ in 0..9 {
+            window.add(&replay);
+        }
+        window.add(&rebuild);
+
+        let record = window.into_record(11_000);
+        let value = serde_json::to_value(&record).expect("serialize frame summary");
+        assert_eq!(value["event"], "renderer.frame_summary");
+        assert_eq!(value["window_ms"], 10_000);
+        assert_eq!(value["frames"], 10, "fast frames are counted, not sampled");
+        assert_eq!(value["rebuild_frames"], 1);
+        assert_eq!(value["layout_frames"], 1);
+        assert_eq!(value["work_us"], 18_000);
+        assert_eq!(value["work_permille"], 1, "18 ms of work in 10 s");
+        assert_eq!(value["max_work_us"], 9_000);
+        assert_eq!(value["batch_build_us"], 8_700);
+        assert_eq!(value["symbol_fallbacks"], 3);
+        assert_eq!(value["compositor_ticks_skipped"], 40);
     }
 }

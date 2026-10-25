@@ -116,9 +116,23 @@ impl AnimationState {
             return Some(now + Duration::from_nanos(wait));
         }
         // Already active: keep ticking on the next frame.
-        Some(now + Duration::from_millis(16))
+        let interval = if matches!(self.def.iteration_count, IterationCount::Infinite) {
+            AMBIENT_FRAME_INTERVAL
+        } else {
+            FRAME_INTERVAL
+        };
+        Some(now + interval)
     }
 }
+
+/// Sampling interval for an animation that will finish.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Sampling interval for an `infinite` animation. Those are ambient
+/// indicators (attention pulses, loading dots) that stay on screen for as
+/// long as the state lasts, so sampling them at the display rate kept the
+/// whole window repainting at 60-120 fps while the user was away.
+pub const AMBIENT_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// The global animation driver. Owns a side table keyed by `NodeId` so idle
 /// nodes pay zero state cost.
@@ -137,6 +151,17 @@ impl AnimationDriver {
     /// uses this to decide whether to keep requesting redraws.
     pub fn has_active(&self) -> bool {
         self.running.values().any(|states| states.iter().any(|s| !s.completed))
+    }
+
+    /// Like [`Self::has_active`], ignoring `infinite` animations, which
+    /// pace themselves at [`AMBIENT_FRAME_INTERVAL`] instead of riding
+    /// every display frame.
+    pub fn has_active_finite(&self) -> bool {
+        self.running.values().any(|states| {
+            states
+                .iter()
+                .any(|s| !s.completed && !matches!(s.def.iteration_count, IterationCount::Infinite))
+        })
     }
 
     /// Push the full set of animations for a single node, replacing any
@@ -796,6 +821,28 @@ mod tests {
         // All entries are in the active phase here so next_wake folds back
         // to the per frame budget; assert it is a sane value in the future.
         assert!(wake >= now);
+    }
+
+    #[test]
+    fn test_infinite_animation_samples_at_the_ambient_interval() {
+        let now = Instant::now();
+        let finite = AnimationState::new(Arc::<str>::from("a"), def_linear("a", 1100), now);
+        let mut pulse = def_linear("pulse", 1100);
+        pulse.iteration_count = IterationCount::Infinite;
+        let ambient = AnimationState::new(Arc::<str>::from("pulse"), pulse.clone(), now);
+
+        assert_eq!(finite.next_wake(now), Some(now + FRAME_INTERVAL));
+        assert_eq!(ambient.next_wake(now), Some(now + AMBIENT_FRAME_INTERVAL));
+
+        let mut driver = AnimationDriver::new();
+        driver.running.insert(NodeId::DANGLING, [ambient.clone()].into_iter().collect());
+        assert!(driver.has_active());
+        assert!(!driver.has_active_finite(), "an infinite pulse alone must not ride every frame");
+        assert_eq!(driver.next_wake(now), Some(now + AMBIENT_FRAME_INTERVAL));
+
+        driver.running.insert(NodeId::DANGLING, [ambient, finite].into_iter().collect());
+        assert!(driver.has_active_finite());
+        assert_eq!(driver.next_wake(now), Some(now + FRAME_INTERVAL));
     }
 
     #[test]

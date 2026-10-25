@@ -833,12 +833,15 @@ fn cursor_blink_subscription(shared: SharedState) -> Subscription {
                     }
                     if needs_rebuild {
                         yield ExternalEvent::RequestRebuild;
-                    } else {
+                    } else if unshit::core::cell_grid::CellGrid::is_window_focused() {
                         // Cursor blink alone never rebuilds the tree
                         // (#135 Phase 1 exit criterion). The renderer
                         // animates the global blink phase from elapsed
                         // time, so a cheap repaint is all we need to
                         // make the cursor visibly toggle on screen.
+                        // Unfocused, the renderer holds the cursor solid:
+                        // a repaint would change no pixel and still keep
+                        // the compositor clock awake.
                         yield ExternalEvent::RequestRedraw;
                     }
                 }

@@ -549,6 +549,11 @@ pub struct FrameMetrics {
     /// renderer can only flatten. Cache-miss work only; a steady nonzero
     /// value means a shaped-text cache is thrashing.
     pub glyph_symbol_fallbacks: u64,
+    /// Compositor heartbeats consumed without painting since the previous
+    /// painted frame because nothing had changed. High values are the
+    /// healthy idle signature; a window that repaints every heartbeat
+    /// instead shows up as frames, not as skips.
+    pub compositor_ticks_skipped: u64,
     pub atlas_fill_ratio: f32,
     pub gpu_upload_bytes: u64,
     pub damage_area_px: u64,
@@ -789,6 +794,16 @@ struct AppState {
     /// Most recent compositor tick delivered to the event loop but not yet
     /// consumed by a paint. Coalesced to one slot by [`CompositorClockWaker`].
     compositor_frame_ready: Option<Instant>,
+    /// A `request_redraw` reached `RedrawRequested` before any compositor
+    /// tick was available and bounced (timer wakes: a text caret toggle, a
+    /// CSS animation step, a wake-hygiene redraw). The next tick must paint
+    /// even when its drain saw no event, and `about_to_wait` keeps the clock
+    /// running until it does. Cleared when a tick admits a paint.
+    redraw_awaiting_tick: bool,
+    /// Compositor ticks consumed without painting since the last painted
+    /// frame (nothing changed). Folded into
+    /// [`FrameMetrics::compositor_ticks_skipped`] on the next paint.
+    compositor_ticks_skipped: u64,
     /// Timestamp of the compositor heartbeat used for the previous painted
     /// frame. Source of [`FrameMetrics::pacing_interval_us`].
     last_compositor_tick: Option<Instant>,
@@ -1724,6 +1739,80 @@ fn animations_active(state: &AppState) -> bool {
     state.smooth_scroll.is_some() || !state.grid_animations.is_empty() || state.drag_autorepeat
 }
 
+/// CSS transitions or finite keyframe animations, which sample time on
+/// every frame. `infinite` animations are left out: their own timer wakes
+/// at `AMBIENT_FRAME_INTERVAL` pace them, and painting them on every
+/// heartbeat as well ran an attention pulse at the display rate.
+fn style_animations_active(state: &AppState) -> bool {
+    state.animation_driver.has_active_finite() || state.active_transitions.has_active()
+}
+
+/// Whether a compositor tick has anything to paint. Plain flags so the
+/// decision is testable without a window; see [`Self::from_state`].
+#[derive(Clone, Copy, Debug, Default)]
+struct CompositorTickWork {
+    /// The drain that delivered the tick also delivered an external event
+    /// (PTY output, a rebuild request, a cosmetic redraw such as the
+    /// terminal cursor blink).
+    saw_event: bool,
+    /// A redraw bounced off `RedrawRequested` while no tick was available.
+    redraw_awaiting_tick: bool,
+    /// Rebuild, restyle, relayout, surface or retry work is queued.
+    work_pending: bool,
+    /// Something samples time every frame: smooth scroll, grid hooks, drag
+    /// auto-repeat, CSS animations or transitions.
+    animating: bool,
+    /// The root carries PAINT or SUBTREE_PAINT from a mutation that did not
+    /// itself request a redraw.
+    paint_dirty: bool,
+}
+
+impl CompositorTickWork {
+    fn from_state(state: &AppState, saw_event: bool) -> Self {
+        Self {
+            saw_event,
+            redraw_awaiting_tick: state.redraw_awaiting_tick,
+            work_pending: state.needs_rebuild
+                || state.needs_restyle
+                || state.needs_relayout
+                || state.pending_surface_metrics.is_some()
+                || state.pending_window_maximized_sync
+                || state.force_animation_paint
+                || state.render_retry.deadline.is_some(),
+            animating: animations_active(state) || style_animations_active(state),
+            paint_dirty: state.arena.get(state.root).is_some_and(|root| {
+                root.dirty.intersects(DirtyFlags::PAINT | DirtyFlags::SUBTREE_PAINT)
+            }),
+        }
+    }
+
+    fn needs_paint(self) -> bool {
+        self.saw_event
+            || self.redraw_awaiting_tick
+            || self.work_pending
+            || self.animating
+            || self.paint_dirty
+    }
+}
+
+/// Control flow for `about_to_wait` while the compositor clock is running,
+/// and whether to request a redraw. A future `WaitUntil` is a timer step the
+/// paint path armed (text caret toggle, CSS animation or transition step):
+/// heartbeats skip frames with nothing pending, so replacing it with `Wait`
+/// left that step waiting for an unrelated event. A stale one becomes the
+/// redraw it was armed for.
+fn compositor_clock_control_flow(
+    flow: winit::event_loop::ControlFlow,
+    now: Instant,
+) -> (winit::event_loop::ControlFlow, bool) {
+    use winit::event_loop::ControlFlow;
+    match flow {
+        ControlFlow::WaitUntil(wake) if wake > now => (flow, false),
+        ControlFlow::WaitUntil(_) => (ControlFlow::Wait, true),
+        _ => (ControlFlow::Wait, false),
+    }
+}
+
 /// Grace past each drag auto-repeat tick that the Timer-fallback waker is
 /// kept alive for, so a held-still pointer keeps the chain ticking until
 /// the next frame disarms it.
@@ -2188,6 +2277,7 @@ fn finalize_frame_metrics(
         .saturating_sub(metrics.present_call_us);
     metrics.rss_bytes = get_rss_bytes();
     metrics.pacer_min_interval_ns = state.frame_pacer.min_interval().as_nanos() as u64;
+    metrics.compositor_ticks_skipped = std::mem::take(&mut state.compositor_ticks_skipped);
 
     // Presentation cadence: one completion timestamp per painted frame,
     // taken right after total_us is finalized. The interval back to the
@@ -3685,6 +3775,8 @@ impl AppHandler {
             glyph_drop_failures_accum: 0,
             glyph_drop_bypasses_accum: 0,
             compositor_frame_ready: None,
+            redraw_awaiting_tick: false,
+            compositor_ticks_skipped: 0,
             last_compositor_tick: None,
             display_refresh_mhz: startup_refresh_mhz,
             #[cfg(feature = "input-latency-histogram")]
@@ -3994,6 +4086,18 @@ impl ApplicationHandler for AppHandler {
             // Stale waker tick after every animation settled: nothing to
             // paint, and no flag to leave armed.
             state.force_animation_paint = false;
+        } else if let Some(tick_at) = compositor_tick
+            .filter(|_| !CompositorTickWork::from_state(state, coalescer.saw_event).needs_paint())
+        {
+            // A speculative heartbeat with nothing new to show. Any event
+            // keeps the compositor clock running for ACTIVITY_WINDOW, so
+            // repainting on every tick turned a 2 Hz cursor-blink redraw and
+            // a 1 Hz stats rebuild into continuous painting at the display
+            // rate. The previous frame is still correct: consume the tick
+            // the way the fast path does when no pixels changed.
+            state.compositor_frame_ready = None;
+            state.last_compositor_tick = Some(tick_at);
+            state.compositor_ticks_skipped = state.compositor_ticks_skipped.saturating_add(1);
         } else {
             state.window.request_redraw();
         }
@@ -5637,6 +5741,7 @@ impl ApplicationHandler for AppHandler {
                     if state.pacing_mode == PacingMode::CompositorClock {
                         match state.compositor_frame_ready.take() {
                             Some(tick_at) => {
+                                state.redraw_awaiting_tick = false;
                                 let interval = cadence_present_interval_us(present_interval_us(
                                     state.last_compositor_tick,
                                     tick_at,
@@ -5645,6 +5750,10 @@ impl ApplicationHandler for AppHandler {
                             }
                             None if state.last_paint_completed_at.is_none() => (0, None),
                             None => {
+                                // Paint on the next heartbeat instead;
+                                // `about_to_wait` keeps the clock running
+                                // until it arrives.
+                                state.redraw_awaiting_tick = true;
                                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
                                 return;
                             }
@@ -6414,7 +6523,10 @@ impl ApplicationHandler for AppHandler {
         }
         if state.pacing_mode == PacingMode::CompositorClock {
             let minimized = state.window.is_minimized().unwrap_or(false);
-            let animation_active = animations_active(state);
+            // A bounced timer redraw (text caret toggle, CSS animation step)
+            // can only paint on a heartbeat. It used to get one only while
+            // some unrelated event kept the window "recently active".
+            let animation_active = animations_active(state) || state.redraw_awaiting_tick;
             let recently_active = state.is_recently_active(now);
             if !minimized && (animation_active || recently_active) {
                 let period = state.frame_pacer.min_interval();
@@ -6424,7 +6536,11 @@ impl ApplicationHandler for AppHandler {
                     deadline = std::cmp::max(deadline, now + period.saturating_mul(2));
                 }
                 self.app.compositor_clock_waker.extend_until(deadline);
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                let (flow, redraw) = compositor_clock_control_flow(event_loop.control_flow(), now);
+                event_loop.set_control_flow(flow);
+                if redraw {
+                    state.window.request_redraw();
+                }
                 return;
             }
         } else if state.pacing_mode == PacingMode::Timer {
@@ -8449,6 +8565,7 @@ mod tests {
             glyph_raster_failures: 3,
             glyph_cache_bypasses: 2,
             glyph_symbol_fallbacks: 1,
+            compositor_ticks_skipped: 7,
             atlas_fill_ratio: 0.75,
             gpu_upload_bytes: 8192,
             damage_area_px: 1920 * 1080,
@@ -9195,6 +9312,63 @@ mod tests {
         let children = arena.children(button);
 
         assert_eq!(pseudo_restyle_root_for_change(&arena, children[0], children[1], root), button);
+    }
+
+    // === Compositor tick admission ===
+
+    #[test]
+    fn lone_compositor_tick_with_nothing_pending_does_not_paint() {
+        // The idle CPU regression: the activity window keeps heartbeats
+        // flowing after a cursor-blink redraw, and each one repainted an
+        // identical frame at the display rate.
+        assert!(!CompositorTickWork::default().needs_paint());
+    }
+
+    #[test]
+    fn compositor_tick_paints_when_anything_changed() {
+        let cases = [
+            (
+                "event in the same drain",
+                CompositorTickWork { saw_event: true, ..Default::default() },
+            ),
+            (
+                "redraw bounced before the tick",
+                CompositorTickWork { redraw_awaiting_tick: true, ..Default::default() },
+            ),
+            ("queued tree work", CompositorTickWork { work_pending: true, ..Default::default() }),
+            (
+                "time-sampled animation",
+                CompositorTickWork { animating: true, ..Default::default() },
+            ),
+            ("paint-dirty root", CompositorTickWork { paint_dirty: true, ..Default::default() }),
+        ];
+        for (case, work) in cases {
+            assert!(work.needs_paint(), "{case} must paint on the next tick");
+        }
+    }
+
+    #[test]
+    fn compositor_clock_keeps_a_pending_timer_step_armed() {
+        use winit::event_loop::ControlFlow;
+        let now = Instant::now();
+        let step = now + Duration::from_millis(33);
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::WaitUntil(step), now),
+            (ControlFlow::WaitUntil(step), false),
+            "an ambient animation step must not wait for an unrelated event"
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::WaitUntil(now), now),
+            (ControlFlow::Wait, true)
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::Wait, now),
+            (ControlFlow::Wait, false)
+        );
+        assert_eq!(
+            compositor_clock_control_flow(ControlFlow::Poll, now),
+            (ControlFlow::Wait, false)
+        );
     }
 
     // === RebuildCoalescer (#135 Phase 1, item 1) ===
