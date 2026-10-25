@@ -43,6 +43,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# `powershell -File` passes "-Phases a:b,c:d" as one string, not an array.
+$Phases = @($Phases | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($phase in $Phases) {
+    if ($phase -notmatch '^[a-z+]+:[a-z+]+$') { throw "phase '$phase' is not <visible mode>:<hidden mode>" }
+}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 . (Join-Path $PSScriptRoot 'lib\tm-isolation.ps1')
 if (-not $ExeDir) { $ExeDir = Join-Path $repoRoot 'target\release' }
