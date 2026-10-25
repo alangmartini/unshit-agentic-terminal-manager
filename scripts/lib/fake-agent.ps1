@@ -8,6 +8,8 @@
     title    cycles the OSC 0 window title through half-circle frames, the
              way the sidebar and tab labels show a working agent
     spinner  rewrites one status line with a spinner glyph and timer
+    notify   sends one OSC 9 notification on entering the mode, which puts
+             a background pane into the pulsing attention state
     idle     sets a static title once and prints nothing
   A mode string can combine words ("title+spinner").
 
@@ -44,6 +46,7 @@ Write-Host "fake agent $Name"
 Set-Title "$idleMark $Name"
 $mode = 'idle'
 $titleAnimated = $false
+$notified = $false
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $tick = 0
 while ($true) {
@@ -60,6 +63,12 @@ while ($true) {
     if ($mode -match 'spinner') {
         $seconds = [int]$clock.Elapsed.TotalSeconds
         [Console]::Write("`r$($spinFrames[$tick % $spinFrames.Count]) Germinating$ellipsis (${seconds}s)   ")
+    }
+    if ($mode -match 'notify') {
+        if (-not $notified) { [Console]::Write("$esc]9;$Name needs input$bel") }
+        $notified = $true
+    } else {
+        $notified = $false
     }
     $tick++
     [Threading.Thread]::Sleep($IntervalMs)

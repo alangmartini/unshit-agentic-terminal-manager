@@ -34,7 +34,9 @@ param(
     [int]$Width = 1600,
     [int]$Height = 1000,
     [string]$JsonOut = "",
-    # Optional PNG of the window after settling (PrintWindow, no focus change).
+    # Optional PNG prefix. Each phase saves two captures 700 ms apart
+    # (<prefix>-<phase>-a.png / -b.png) before sampling, so a frozen
+    # animation shows up as two identical images. PrintWindow, no focus change.
     [string]$Screenshot = "",
     # Optional file that receives the app's stderr (env_logger output).
     [string]$StderrLog = ""
@@ -138,18 +140,17 @@ try {
     if ($app.MainWindowHandle -ne [IntPtr]::Zero) {
         # SWP_NOZORDER | SWP_NOACTIVATE: never steal focus from the user.
         [IdleBenchWin]::SetWindowPos($app.MainWindowHandle, [IntPtr]::Zero, 80, 80, $Width, $Height, 0x0014) | Out-Null
-        if ($Screenshot) {
-            Start-Sleep -Seconds 2
-            Add-Type -AssemblyName System.Drawing
-            $bitmap = New-Object System.Drawing.Bitmap $Width, $Height
-            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-            $hdc = $graphics.GetHdc()
-            [IdleBenchWin]::PrintWindow($app.MainWindowHandle, $hdc, 2) | Out-Null   # PW_RENDERFULLCONTENT
-            $graphics.ReleaseHdc($hdc)
-            $graphics.Dispose()
-            $bitmap.Save($Screenshot)
-            $bitmap.Dispose()
-        }
+    }
+    function Save-WindowShot([string]$path) {
+        Add-Type -AssemblyName System.Drawing
+        $bitmap = New-Object System.Drawing.Bitmap $Width, $Height
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $hdc = $graphics.GetHdc()
+        [IdleBenchWin]::PrintWindow($app.MainWindowHandle, $hdc, 2) | Out-Null   # PW_RENDERFULLCONTENT
+        $graphics.ReleaseHdc($hdc)
+        $graphics.Dispose()
+        $bitmap.Save($path)
+        $bitmap.Dispose()
     }
     $daemon = Get-CimInstance Win32_Process -Filter "Name = 'unshit-ptyd.exe'" |
         Where-Object { $_.CommandLine -like "*$($isolation.Token)*" -or $_.ParentProcessId -eq $app.Id } |
@@ -160,6 +161,12 @@ try {
         foreach ($file in $visibleModes) { Set-AgentMode $file $parts[0] }
         foreach ($file in $hiddenModes) { Set-AgentMode $file $parts[1] }
         Start-Sleep -Seconds $WarmSeconds
+        if ($Screenshot) {
+            $shotBase = "{0}-{1}" -f $Screenshot, ($phase -replace '[^A-Za-z0-9]+', '-')
+            Save-WindowShot "$shotBase-a.png"
+            Start-Sleep -Milliseconds 700
+            Save-WindowShot "$shotBase-b.png"
+        }
 
         $app.Refresh()
         $threadsBefore = @{}
